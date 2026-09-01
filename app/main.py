@@ -105,7 +105,13 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="Amber", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(
+    title="Amber",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+    lifespan=lifespan,
+)
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
 

@@ -12,6 +12,14 @@ def test_homepage_and_about_render():
         assert about.status_code == 200
 
 
+def test_openapi_schema_is_not_served():
+    with TestClient(app) as client:
+        schema = client.get("/openapi.json")
+        assert schema.status_code == 404
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+
+
 def test_save_rejects_localhost():
     with TestClient(app) as client:
         r = client.post("/save", data={"url": "http://127.0.0.1/secret"}, follow_redirects=False)
