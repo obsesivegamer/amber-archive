@@ -16,6 +16,7 @@
       <div>
         <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
         <span>{{ s.url | host }} · {{ s.created_at | fmtdate }} · /{{ s.id }}</span>
+        {% include "_incomplete.html" %}
         <span class="url">{{ s.url }}</span>
       </div>
       <form class="delete-form" action="/saved/{{ s.id }}/delete" method="post"

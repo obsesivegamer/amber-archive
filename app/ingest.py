@@ -153,6 +153,7 @@ def ingest_html(
             "description": article.get("description"),
             "dek": article.get("dek"),
             "word_count": article.get("word_count"),
+            "paywalled": article.get("paywalled"),
             "imported": True,
             "created_at": db.now_iso(),
         },
@@ -166,6 +167,7 @@ def ingest_html(
         published_at=article.get("published_at"),
         description=article.get("description"),
         word_count=article.get("word_count"),
+        paywalled=1 if article.get("paywalled") else 0,
         status="complete",
         error=None,
     )

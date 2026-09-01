@@ -95,4 +95,5 @@ def test_paywall_falls_back_to_lede_not_cta():
     assert "token costs" in got["article_text"]
     assert "Continue with Google" not in got["article_text"]
     assert got["word_count"] > 20
+    assert got["paywalled"] is True
     assert "beta versions of Grok" in (got.get("dek") or "")

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import DB_PATH, ID_ALPHABET, ID_LENGTH, SNAPS_DIR, DATA_DIR
+from .extract import PAYWALL_WORD_LIMIT, article_is_paywalled
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at TEXT NOT NULL,
     http_status INTEGER,
     word_count INTEGER,
+    paywalled INTEGER,
     status TEXT NOT NULL,
     error TEXT
 );
@@ -41,11 +43,40 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
+    cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
+    if "paywalled" not in cols:
+        db.execute("ALTER TABLE snapshots ADD COLUMN paywalled INTEGER")
+    db.execute(
+        """
+        UPDATE snapshots
+        SET paywalled = CASE
+            WHEN word_count IS NOT NULL AND word_count < ? THEN 1
+            ELSE 0
+        END
+        WHERE status = 'complete' AND paywalled IS NULL
+        """,
+        (PAYWALL_WORD_LIMIT,),
+    )
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SNAPS_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript(SCHEMA)
+        _ensure_paywalled_column(db)
+        db.commit()
+
+
+def _as_snap(row: sqlite3.Row) -> dict:
+    snap = dict(row)
+    flag = snap.get("paywalled")
+    if flag is None:
+        snap["paywalled"] = article_is_paywalled(snap.get("word_count"))
+    else:
+        snap["paywalled"] = bool(flag)
+    return snap
 
 
 def _new_id() -> str:
@@ -91,7 +122,7 @@ def update_snapshot(sid: str, **fields: Any) -> None:
 def get_snapshot(sid: str) -> dict | None:
     with connect() as db:
         row = db.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
-    return dict(row) if row else None
+    return _as_snap(row) if row else None
 
 
 def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
@@ -105,7 +136,7 @@ def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
             """,
             (url_normalized, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_snap(r) for r in rows]
 
 
 def search_snapshots(query: str, limit: int = 50) -> list[dict]:
@@ -123,7 +154,7 @@ def search_snapshots(query: str, limit: int = 50) -> list[dict]:
             """,
             (q, q, q, q, q, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_snap(r) for r in rows]
 
 
 def recent_snapshots(limit: int = 12) -> list[dict]:
@@ -137,7 +168,7 @@ def recent_snapshots(limit: int = 12) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_snap(r) for r in rows]
 
 
 def count_snapshots() -> int:

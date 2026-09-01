@@ -12,6 +12,14 @@ from readability import Document
 
 _WS = re.compile(r"\s+")
 
+# Soft paywalls often leave only a dek / og:description. Same bit is stored on
+# the snapshot row so lists and the viewer can stay honest.
+PAYWALL_WORD_LIMIT = 80
+
+
+def article_is_paywalled(word_count: int | None) -> bool:
+    return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
+
 
 def _text(value: Any) -> str | None:
     if value is None:
@@ -320,5 +328,5 @@ def extract_article(html: str, url: str) -> dict:
         "article_html": article_html,
         "article_text": article_text,
         "word_count": len(words),
-        "paywalled": len(words) < 80,
+        "paywalled": article_is_paywalled(len(words)),
     }

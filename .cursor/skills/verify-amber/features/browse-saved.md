@@ -4,7 +4,7 @@ Browse saved lists every complete snapshot. Delete removes that snapshot's files
 
 ## Sub-features
 
-- `browse-saved` opens `/saved` and lists titles, hosts, dates, and `/{id}`.
+- `browse-saved` opens `/saved` and lists titles, hosts, dates, and `/{id}`. Paywalled rows also say `incomplete · paywalled teaser`.
 - `browse-empty` shows `Nothing saved yet.` when the scratch archive has no complete snapshots.
 - `browse-home-recent` shows `Recently saved` on `/` after at least one complete snapshot.
 - `browse-count` shows `browse (N)` on `/` when `N` complete snapshots exist.
@@ -27,7 +27,7 @@ Preconditions:
 - For `browse-empty`, start from a freshly launched scratch dir with no imports.
 
 - **Browse entry.** Open `/` and choose the `browse` link (`href="/saved"`). Title is `Saved — Amber`. The hint mentions the count. A `.saved-row` contains `Amber Verification Bridge`, `/{id}`, and a `delete` button.
-- **Recent entry.** After a complete snapshot, `/` includes a `Recently saved` heading and a link to `/{id}`.
+- **Recent entry.** After a complete snapshot, `/` includes a `Recently saved` heading and a link to `/{id}`. A paywalled teaser also shows `incomplete · paywalled teaser`.
 - **HTTP list.** `curl.exe -sS http://127.0.0.1:18080/saved` is 200 and contains `everything you've saved` plus the fixture title.
 - **Empty archive.** On a new scratch instance with zero complete rows, `/saved` contains `Nothing saved yet.` and has no `.saved-row`.
 - **Delete from list.** On `/saved`, submit the row's `delete` form. Accept the browser confirm `Delete /{id}? This cannot be undone.` Response is `303` to `/saved`. The id is gone from the HTML.

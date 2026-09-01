@@ -10,6 +10,7 @@ View a snapshot lets a user open a short Amber link and switch between the artic
 - `view-files` serves `/{id}/reader`, `/{id}/raw`, `/{id}/image.jpg`, and `/{id}/thumb.jpg`.
 - `view-original` exposes the original URL in the toolbar.
 - `view-missing` is 404 for an unknown or incomplete id.
+- `view-paywalled` shows a note on `/{id}` (and webpage / screenshot modes) when the snapshot is a paywalled teaser, with a link to homepage Import.
 
 ## How to get to it (user POV)
 

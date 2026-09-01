@@ -194,6 +194,22 @@ button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber
   font-size: 0.8rem;
 }
 
+.recent li span.flag-incomplete,
+.results li span.flag-incomplete,
+.flag-incomplete {
+  display: inline-block;
+  margin-top: 0.28rem;
+  padding: 0.08rem 0.4rem;
+  border: 1px solid #e0c48a;
+  background: #f6ead0;
+  color: var(--amber-d);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .results .url {
   word-break: break-all;
   font-size: 0.75rem;
@@ -298,6 +314,23 @@ body.viewer {
 }
 
 .toolbar time { color: #b7a894; white-space: nowrap; }
+
+.viewer-note {
+  flex: none;
+  margin: 0;
+  padding: 0.55rem 0.9rem;
+  background: var(--paper);
+  color: var(--ink);
+  border-bottom: 1px solid var(--rule);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.viewer-note a {
+  color: var(--amber-d);
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
 
 .frame {
   flex: 1;

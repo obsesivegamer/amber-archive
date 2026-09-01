@@ -38,5 +38,5 @@ def test_paywalled_reader_explains_the_teaser():
         },
         "https://www.theinformation.com/articles/x",
     )
-    assert "only sent Amber a teaser" in html
-    assert "import" in html.lower()
+    assert "paywalled teaser" in html
+    assert "Import" in html

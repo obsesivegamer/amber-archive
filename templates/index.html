@@ -20,7 +20,7 @@
     </div>
   </form>
 
-  <form class="box" action="/import" method="post" enctype="multipart/form-data">
+  <form id="import" class="box" action="/import" method="post" enctype="multipart/form-data">
     <label for="file">I already saved the page as HTML</label>
     <div class="row">
       <input id="file" name="file" type="file" accept=".html,.htm,text/html" required>
@@ -64,6 +64,7 @@
       <li>
         <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
         <span>{{ s.url | host }} · {{ s.created_at | fmtdate }} · /{{ s.id }}</span>
+        {% include "_incomplete.html" %}
       </li>
       {% endfor %}
     </ul>
