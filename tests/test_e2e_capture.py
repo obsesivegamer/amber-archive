@@ -105,14 +105,22 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         html = raw.text
         assert "<script" not in html.lower() or "script-src" in html
         assert "alert('xss')" not in html
+        assert "<h1" in html.lower()
+        assert "style=" in html
         assert "javascript:alert" not in html
         assert "amber-removed" in html
         assert f"/{sid}/r/" in html
         assert 'disabled="disabled"' in html or "disabled" in html
 
-        css = client.get(f"/{sid}/r/" + _css_name(html, sid))
-        assert css.status_code == 200
-        assert css.headers["content-type"].startswith("text/css")
+        resource = None
+        needle = f"/{sid}/r/"
+        for token in html.replace("'", '"').split('"'):
+            if token.startswith(needle):
+                resource = token[len(needle) :].split()[0]
+                break
+        assert resource, "expected rewritten local asset"
+        asset = client.get(f"/{sid}/r/{resource}")
+        assert asset.status_code == 200
 
         shot = client.get(f"/{sid}/image.jpg")
         assert shot.status_code == 200
@@ -123,9 +131,4 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         assert text.status_code == 200
 
 
-def _css_name(html: str, sid: str) -> str:
-    needle = f"/{sid}/r/"
-    i = html.find(needle)
-    assert i != -1
-    rest = html[i + len(needle) :]
-    return rest.split('"')[0].split("'")[0]
+

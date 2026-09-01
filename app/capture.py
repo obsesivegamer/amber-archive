@@ -157,6 +157,41 @@ DISMISS_JS = """
 }
 """
 
+# archive.today freezes the rendered page by copying getComputedStyle()
+# onto every element, then dropping stylesheets. That is why their HTML
+# is a wall of inline style="" and still looks right with scripts off.
+INLINE_COMPUTED_CSS_JS = """
+() => {
+  const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'LINK', 'META', 'HEAD', 'TITLE', 'BR', 'WBR']);
+  const nodes = document.querySelectorAll('body *');
+  for (const el of nodes) {
+    if (skip.has(el.tagName)) continue;
+    const cs = getComputedStyle(el);
+    let css = '';
+    for (let i = 0; i < cs.length; i++) {
+      const prop = cs.item(i);
+      if (!prop || prop.startsWith('--')) continue;
+      css += prop + ':' + cs.getPropertyValue(prop) + ';';
+    }
+    if (css) el.setAttribute('style', css);
+  }
+  const htmlCs = getComputedStyle(document.documentElement);
+  const bodyCs = getComputedStyle(document.body);
+  const pack = (cs) => {
+    let css = '';
+    for (let i = 0; i < cs.length; i++) {
+      const prop = cs.item(i);
+      if (!prop || prop.startsWith('--')) continue;
+      css += prop + ':' + cs.getPropertyValue(prop) + ';';
+    }
+    return css;
+  };
+  document.documentElement.setAttribute('style', pack(htmlCs));
+  document.body.setAttribute('style', pack(bodyCs));
+  document.querySelectorAll('link[rel="stylesheet"], style').forEach((n) => n.remove());
+}
+"""
+
 SCROLL_JS = """
 async () => {
   await new Promise((resolve) => {
@@ -361,7 +396,12 @@ async def run_job(job_id: str) -> None:
         except Exception:
             pass
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(200)
+        try:
+            await page.evaluate(INLINE_COMPUTED_CSS_JS)
+        except Exception:
+            pass
+        await page.wait_for_timeout(100)
 
         final_url = page.url
         try:
