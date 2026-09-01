@@ -36,6 +36,13 @@
     </div>
   </form>
 
+  <div class="box">
+    <label>I want to see everything I've saved</label>
+    <div class="row">
+      <a class="btn" href="/saved">browse{% if saved_count %} ({{ saved_count }}){% endif %}</a>
+    </div>
+  </div>
+
   <section class="blurb">
     <p><strong>Amber is a time capsule for web pages.</strong>
     It takes a snapshot of a webpage that will still be here even if the original page disappears.
@@ -48,12 +55,15 @@
 
   {% if recent %}
   <section class="recent">
-    <h2>Recently saved</h2>
+    <div class="recent-head">
+      <h2>Recently saved</h2>
+      <a href="/saved">all saved</a>
+    </div>
     <ul>
       {% for s in recent %}
       <li>
         <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
-        <span>{{ s.url | host }} · {{ s.created_at | fmtdate }}</span>
+        <span>{{ s.url | host }} · {{ s.created_at | fmtdate }} · /{{ s.id }}</span>
       </li>
       {% endfor %}
     </ul>

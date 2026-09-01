@@ -30,3 +30,77 @@ def test_css_mime_is_not_octet_stream_on_windows():
     assert mime_for_filename("app.css") == "text/css"
     assert mime_for_filename("font.woff2") == "font/woff2"
     assert mime_for_filename("hero.jpg") == "image/jpeg"
+
+
+def test_import_html_creates_article_snapshot(tmp_data, monkeypatch):
+    from tests.test_extract import ARCHIVE_IS_SAVED
+
+    async def _skip_shot(sid: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.main.screenshot_reader", _skip_shot)
+    with TestClient(app) as client:
+        r = client.post(
+            "/import",
+            files={"file": ("article.html", ARCHIVE_IS_SAVED, "text/html")},
+            follow_redirects=False,
+        )
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert location.startswith("/")
+    sid = location.strip("/")
+    from app import db
+
+    snap = db.get_snapshot(sid)
+    assert snap["status"] == "complete"
+    assert "Elon Musk" in (snap.get("title") or "")
+    assert snap["author"] == "Grace Kay"
+
+
+def test_saved_page_lists_all_snapshots(tmp_data, monkeypatch):
+    from tests.test_extract import ARCHIVE_IS_SAVED
+
+    async def _skip_shot(sid: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.main.screenshot_reader", _skip_shot)
+    with TestClient(app) as client:
+        home = client.get("/")
+        assert home.status_code == 200
+        assert 'href="/saved"' in home.text
+        client.post(
+            "/import",
+            files={"file": ("article.html", ARCHIVE_IS_SAVED, "text/html")},
+            follow_redirects=False,
+        )
+        listing = client.get("/saved")
+    assert listing.status_code == 200
+    assert "Exclusive: Elon Musk" in listing.text
+    assert "everything you've saved" in listing.text.lower()
+
+
+def test_delete_snapshot_removes_row_and_files(tmp_data, monkeypatch):
+    from tests.test_extract import ARCHIVE_IS_SAVED
+
+    async def _skip_shot(sid: str) -> None:
+        return None
+
+    monkeypatch.setattr("app.main.screenshot_reader", _skip_shot)
+    with TestClient(app) as client:
+        r = client.post(
+            "/import",
+            files={"file": ("article.html", ARCHIVE_IS_SAVED, "text/html")},
+            follow_redirects=False,
+        )
+        sid = r.headers["location"].strip("/")
+        from app import db
+
+        folder = db.snap_dir(sid)
+        assert folder.exists()
+        gone = client.post(f"/saved/{sid}/delete", follow_redirects=False)
+        assert gone.status_code == 303
+        assert gone.headers["location"] == "/saved"
+        assert db.get_snapshot(sid) is None
+        assert not folder.exists()
+        listing = client.get("/saved")
+        assert sid not in listing.text

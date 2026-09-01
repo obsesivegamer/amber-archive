@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Saved — Amber{% endblock %}
+{% block body %}
+<main class="sheet">
+  <header class="masthead">
+    <a class="wordmark" href="/">Amber</a>
+    <p class="tag">everything you've saved</p>
+  </header>
+
+  <p class="hint">{% if saved_count %}{{ saved_count }} snapshot{% if saved_count != 1 %}s{% endif %}. Each one is a separate record of a visit, even if the url is the same. Delete removes the files for that snapshot.{% else %}Nothing saved yet.{% endif %}</p>
+
+  {% if snaps %}
+  <ul class="results">
+    {% for s in snaps %}
+    <li class="saved-row">
+      <div>
+        <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
+        <span>{{ s.url | host }} · {{ s.created_at | fmtdate }} · /{{ s.id }}</span>
+        <span class="url">{{ s.url }}</span>
+      </div>
+      <form class="delete-form" action="/saved/{{ s.id }}/delete" method="post"
+            onsubmit="return confirm('Delete /{{ s.id }}? This cannot be undone.')">
+        <button type="submit" class="btn ghost danger">delete</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</main>
+{% endblock %}

@@ -5,3 +5,5 @@ __pycache__/
 data/
 .playwright-browsers/
 .DS_Store
+.cursor/skills/verify-amber/.scratch/
+.cursor/skills/verify-amber/evidence/

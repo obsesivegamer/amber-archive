@@ -66,6 +66,14 @@ def build_reader_html(article: dict, url: str) -> str:
         if photo
         else f'<div class="avatar letter">{initial}</div>'
     )
+    notice = ""
+    if article.get("paywalled"):
+        notice = (
+            '<p class="notice">This site only sent Amber a teaser. The rest of the article '
+            "was not in the page a logged-out visitor received, so it could not be archived. "
+            "To keep the full piece, open it in your browser or on archive.is, save the page "
+            "as HTML, then import that file on Amber's homepage.</p>"
+        )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -115,6 +123,16 @@ def build_reader_html(article: dict, url: str) -> str:
     .body {{ font-size: 1.18rem; line-height: 1.55; }}
     .body p {{ margin: 0 0 1.25rem; }}
     .body a {{ color: #111; }}
+    .notice {{
+      background: #fff4e5;
+      border: 1px solid #e6c48a;
+      color: #5c3d0e;
+      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      font-size: 0.95rem;
+      line-height: 1.45;
+      padding: 0.85rem 1rem;
+      margin: 0 0 1.5rem;
+    }}
     @media (max-width: 720px) {{
       .grid {{ grid-template-columns: 1fr; gap: 1.2rem; }}
       h1 {{ font-size: 1.85rem; }}
@@ -134,6 +152,7 @@ def build_reader_html(article: dict, url: str) -> str:
         </div>
       </aside>
       <div class="body">
+        {notice}
         {body_html}
       </div>
     </div>

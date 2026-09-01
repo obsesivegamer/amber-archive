@@ -137,7 +137,30 @@ button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber
 .blurb .plain li { margin: 0.4rem 0; }
 
 .recent { margin-top: 2.2rem; }
-.recent h2, .results-title {
+.recent-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 0.8rem;
+}
+.recent-head h2, .results-title {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+.recent-head a {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.results-title {
   font-family: "IBM Plex Sans", system-ui, sans-serif;
   font-size: 0.75rem;
   letter-spacing: 0.14em;
@@ -173,6 +196,28 @@ button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber
 
 .results .url {
   word-break: break-all;
+  font-size: 0.75rem;
+}
+
+.saved-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.saved-row > div { min-width: 0; flex: 1; }
+.delete-form { flex: none; margin: 0; }
+.btn.danger {
+  color: var(--flash);
+  border-color: var(--flash);
+}
+.btn.danger:hover {
+  background: var(--flash);
+  color: #fffdf8;
+  border-color: var(--flash);
+}
+.toolbar .delete-form button {
+  padding: 0.15rem 0.5rem;
   font-size: 0.75rem;
 }
 

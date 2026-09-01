@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,6 +138,32 @@ def recent_snapshots(limit: int = 12) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_snapshots() -> int:
+    with connect() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS n FROM snapshots WHERE status = 'complete'"
+        ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def all_ids() -> list[str]:
+    with connect() as db:
+        rows = db.execute("SELECT id FROM snapshots").fetchall()
+    return [r["id"] for r in rows]
+
+
+def delete_snapshot(sid: str) -> bool:
+    existed = get_snapshot(sid) is not None
+    folder = snap_dir(sid)
+    folder_existed = folder.exists()
+    with connect() as db:
+        db.execute("DELETE FROM snapshots WHERE id = ?", (sid,))
+        db.commit()
+    if folder_existed:
+        shutil.rmtree(folder, ignore_errors=True)
+    return existed or folder_existed
 
 
 def snap_dir(sid: str) -> Path:

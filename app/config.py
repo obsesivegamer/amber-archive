@@ -1,12 +1,15 @@
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+
+_data = os.environ.get("AMBER_DATA_DIR")
+DATA_DIR = Path(_data).resolve() if _data else ROOT / "data"
 SNAPS_DIR = DATA_DIR / "snaps"
 DB_PATH = DATA_DIR / "amber.sqlite3"
 
-HOST = "127.0.0.1"
-PORT = 8080
+HOST = os.environ.get("AMBER_HOST", "127.0.0.1")
+PORT = int(os.environ.get("AMBER_PORT", "8080"))
 
 VIEWPORT = {"width": 1280, "height": 900}
 NAV_TIMEOUT_MS = 45_000

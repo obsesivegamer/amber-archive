@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import mimetypes
 import re
 import sys
@@ -45,8 +46,10 @@ def mime_for_filename(filename: str) -> str:
 
 from . import capture, db
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
-from .ingest import ingest_html, original_url_from_html
+from .ingest import ingest_html, original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
+
+log = logging.getLogger("amber")
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -61,6 +64,8 @@ RESERVED = {
     "static",
     "api",
     "exists",
+    "saved",
+    "delete",
     "favicon.ico",
     "robots.txt",
 }
@@ -115,7 +120,7 @@ async def home(request: Request, error: str | None = None):
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"error": error, "recent": db.recent_snapshots(8)},
+        {"error": error, "recent": db.recent_snapshots(8), "saved_count": db.count_snapshots()},
     )
 
 
@@ -137,7 +142,11 @@ async def import_html(request: Request):
     html = raw.decode("utf-8", errors="replace")
     if not url:
         url = original_url_from_html(html)
-    sid = ingest_html(html, url)
+    sid = await asyncio.to_thread(ingest_html, html, url)
+    try:
+        await screenshot_reader(sid)
+    except Exception:
+        log.exception("reader screenshot failed for %s", sid)
     return RedirectResponse(f"/{sid}", status_code=303)
 
 
@@ -223,6 +232,26 @@ async def job_status(job_id: str):
         "title": job.get("title"),
         "url": job.get("url"),
     }
+
+
+@app.get("/saved", response_class=HTMLResponse)
+async def saved(request: Request):
+    snaps = db.recent_snapshots(500)
+    return templates.TemplateResponse(
+        request,
+        "saved.html",
+        {"snaps": snaps, "saved_count": len(snaps)},
+    )
+
+
+@app.post("/saved/{sid}/delete")
+async def delete_saved(sid: str):
+    if not ID_RE.fullmatch(sid):
+        raise HTTPException(404, "Not found")
+    capture.jobs.pop(sid, None)
+    if not db.delete_snapshot(sid):
+        raise HTTPException(404, "Not found")
+    return RedirectResponse("/saved", status_code=303)
 
 
 @app.get("/search", response_class=HTMLResponse)

@@ -25,3 +25,18 @@ def test_reader_layout_has_headline_dek_byline_and_body():
     assert "The Information" in html
     assert "<strong>Tesla CEO Elon Musk</strong>" in html
     assert "token costs" in html
+
+
+def test_paywalled_reader_explains_the_teaser():
+    html = build_reader_html(
+        {
+            "title": "SpaceX Shakes Up Data Center Leadership After Aggressive Build-Out",
+            "author": "Grace Kay",
+            "site_name": "The Information",
+            "article_text": "Elon Musk has shaken up the SpaceX team ...",
+            "paywalled": True,
+        },
+        "https://www.theinformation.com/articles/x",
+    )
+    assert "only sent Amber a teaser" in html
+    assert "import" in html.lower()
