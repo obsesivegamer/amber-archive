@@ -106,25 +106,41 @@ def _from_react_on_rails(soup: BeautifulSoup) -> dict:
             data = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        briefing = data.get("briefing") if isinstance(data, dict) else None
-        if not isinstance(briefing, dict):
+        payload = None
+        if isinstance(data, dict):
+            payload = data.get("article") or data.get("briefing")
+        if not isinstance(payload, dict):
             continue
-        out.setdefault("title", _text(briefing.get("headline") or briefing.get("title")))
-        body = briefing.get("body") or briefing.get("content") or briefing.get("html")
-        dek = _text(briefing.get("dek") or briefing.get("teaser") or briefing.get("standfirst"))
+        out.setdefault("title", _text(payload.get("title") or payload.get("headline")))
+        body = (
+            payload.get("fullText")
+            or payload.get("body")
+            or payload.get("content")
+            or payload.get("html")
+            or payload.get("freeBlurb")
+        )
+        dek = _text(
+            payload.get("subTitle")
+            or payload.get("dek")
+            or payload.get("teaser")
+            or payload.get("standfirst")
+        )
         if isinstance(body, str) and body.strip():
             out.setdefault("article_html", body)
         if dek:
             out.setdefault("dek", dek)
             out.setdefault("description", dek)
-        authors = briefing.get("authors")
+        authors = payload.get("authors")
         if isinstance(authors, list) and authors:
             first = authors[0]
             out.setdefault("author", _text(first))
             if isinstance(first, dict) and first.get("picture"):
                 out.setdefault("author_image", first.get("picture"))
-        out.setdefault("published_at", _text(briefing.get("publishedAt") or briefing.get("published_at")))
-        source = briefing.get("source")
+        out.setdefault(
+            "published_at",
+            _text(payload.get("publishedAt") or payload.get("published_at")),
+        )
+        source = payload.get("source")
         if isinstance(source, dict):
             out.setdefault("site_name", _text(source.get("name")))
     return out
