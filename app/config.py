@@ -8,10 +8,17 @@ DB_PATH = DATA_DIR / "amber.sqlite3"
 HOST = "127.0.0.1"
 PORT = 8080
 
-VIEWPORT = {"width": 1024, "height": 768}
+VIEWPORT = {"width": 1280, "height": 900}
 NAV_TIMEOUT_MS = 45_000
 NETWORK_IDLE_MS = 8_000
-RENDER_WAIT_MS = 1_800
+RENDER_WAIT_MS = 2_200
+EXTRA_HEADERS = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.google.com/",
+}
+GOOGLEBOT_UA = (
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+)
 
 MAX_RESOURCE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_RESOURCE_BYTES = 80 * 1024 * 1024

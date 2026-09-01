@@ -5,9 +5,9 @@
 <header class="toolbar">
   <a class="wordmark sm" href="/">Amber</a>
   <nav class="modes">
-    <a href="/{{ snap.id }}" class="{% if mode == 'webpage' %}on{% endif %}">webpage</a>
+    <a href="/{{ snap.id }}" class="{% if mode == 'article' %}on{% endif %}">article</a>
+    <a href="/{{ snap.id }}/webpage" class="{% if mode == 'webpage' %}on{% endif %}">webpage</a>
     <a href="/{{ snap.id }}/screenshot" class="{% if mode == 'screenshot' %}on{% endif %}">screenshot</a>
-    <a href="/{{ snap.id }}/text" class="{% if mode == 'text' %}on{% endif %}">text</a>
   </nav>
   <div class="meta">
     <a class="orig" href="{{ snap.final_url or snap.url }}" target="_blank" rel="noopener">{{ snap.final_url or snap.url }}</a>
@@ -15,26 +15,13 @@
   </div>
 </header>
 
-{% if mode == 'webpage' %}
+{% if mode == 'article' %}
+<iframe class="frame" src="/{{ snap.id }}/reader" sandbox="allow-same-origin" title="Archived article"></iframe>
+{% elif mode == 'webpage' %}
 <iframe class="frame" src="/{{ snap.id }}/raw" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation" title="Archived webpage"></iframe>
 {% elif mode == 'screenshot' %}
 <div class="shot">
   <img src="/{{ snap.id }}/image.jpg" alt="Graphical copy of {{ snap.title or snap.url }}">
 </div>
-{% else %}
-<article class="readable">
-  <p class="kicker">{{ snap.site_name }}</p>
-  <h1>{{ snap.title }}</h1>
-  <p class="byline">
-    {% if snap.author %}{{ snap.author }} · {% endif %}
-    {% if snap.published_at %}{{ snap.published_at }} · {% endif %}
-    {{ snap.word_count or 0 }} words
-  </p>
-  {% if article_html %}
-  <div class="body">{{ article_html | safe }}</div>
-  {% else %}
-  <pre class="body plain-text">{{ article_text }}</pre>
-  {% endif %}
-</article>
 {% endif %}
 {% endblock %}

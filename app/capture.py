@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import io
 import mimetypes
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,6 +16,8 @@ from playwright.async_api import async_playwright
 
 from .config import (
     BLOCKED_HOST_SNIPPETS,
+    EXTRA_HEADERS,
+    GOOGLEBOT_UA,
     MAX_RESOURCE_BYTES,
     MAX_TOTAL_RESOURCE_BYTES,
     NAV_TIMEOUT_MS,
@@ -26,6 +29,7 @@ from .config import (
 from . import db
 from .extract import extract_article
 from .freeze import freeze_html, rewrite_css
+from .reader import build_reader_html
 from .security import validate_public_http_url
 
 jobs: dict[str, dict] = {}
@@ -83,15 +87,21 @@ CLEAN_PAGE_JS = """
     '[data-testid="paywall"]', '#gateway-content',
     '[class*="regwall" i]', '[class*="subscribe-wall" i]',
     '[class*="subscription-wall" i]',
-    '#onetrust-banner-sdk', '#onetrust-consent-sdk',
+    '#onetrust-banner-sdk', '#onetrust-consent-sdk', '#onetrust-pc-sdk',
     '.cc-window', '#cookie-banner', '[id*="sp_message_container"]',
     '.fc-consent-root', '.zephr-overlay', '[class*="zephr-"]',
     '.pelcro-prefix-modal', '[class*="gdpr-banner" i]',
-    '.modal-scrollable', '[class*="fancybox-overlay"]'
+    '.modal-scrollable', '[class*="fancybox-overlay"]',
+    '.top-sticky-banner', '.awareness-bar',
+    '[id^="StickyBannerTop"]', '[id^="MarketingModal"]',
+    '[id^="BannerAdvertisement"]',
+    '#onetrust-consent-sdk'
   ];
   for (const sel of selectors) {
     document.querySelectorAll(sel).forEach((el) => el.remove());
   }
+  document.documentElement.style.setProperty('--nav-awareness-bar-height', '0px');
+  document.documentElement.style.setProperty('--nav-ad-banner-height', '0px');
   document.documentElement.style.overflow = 'auto';
   document.body.style.overflow = 'auto';
   document.body.style.position = 'static';
@@ -105,6 +115,31 @@ CLEAN_PAGE_JS = """
   document.querySelectorAll('[style*="blur"]').forEach((el) => {
     el.style.filter = 'none';
   });
+}
+"""
+
+REVEAL_LEDE_JS = """
+() => {
+  const desc = document.querySelector('meta[property="og:description"], meta[name="description"]');
+  const text = (desc && desc.getAttribute('content') || '').trim();
+  if (text.length < 80) return false;
+  if (document.getElementById('amber-extracted-lede')) return true;
+  const host = document.querySelector('#ti-content h1, article h1, h1');
+  if (!host) return false;
+  const box = document.createElement('div');
+  box.id = 'amber-extracted-lede';
+  box.setAttribute('data-amber', 'lede');
+  box.style.cssText = 'max-width:42rem;margin:1.25rem 0 2rem;font-size:1.12rem;line-height:1.65;color:inherit;';
+  text.split(/\\n+/).forEach((para) => {
+    const t = para.trim();
+    if (!t) return;
+    const p = document.createElement('p');
+    p.textContent = t;
+    box.appendChild(p);
+  });
+  const header = host.closest('header') || host;
+  header.after(box);
+  return true;
 }
 """
 
@@ -169,6 +204,31 @@ def log_resource(job: dict, **entry) -> None:
     job.setdefault("resources", []).append(entry)
 
 
+def _http_get(url: str, user_agent: str) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+async def fetch_crawler_html(url: str) -> str | None:
+    for ua in (GOOGLEBOT_UA, USER_AGENT):
+        try:
+            html = await asyncio.to_thread(_http_get, url, ua)
+        except Exception:
+            continue
+        if html and len(html) > 2000 and "Attention Required" not in html:
+            return html
+    return None
+
+
 async def worker() -> None:
     assert job_queue is not None
     while True:
@@ -212,7 +272,7 @@ async def run_job(job_id: str) -> None:
             locale="en-US",
             java_script_enabled=True,
             bypass_csp=True,
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            extra_http_headers=EXTRA_HEADERS,
         )
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -296,6 +356,10 @@ async def run_job(job_id: str) -> None:
             await page.evaluate(CLEAN_PAGE_JS)
         except Exception:
             pass
+        try:
+            await page.evaluate(REVEAL_LEDE_JS)
+        except Exception:
+            pass
         await page.evaluate("window.scrollTo(0, 0)")
         await page.wait_for_timeout(300)
 
@@ -308,6 +372,23 @@ async def run_job(job_id: str) -> None:
 
         title = await page.title()
         html = await page.content()
+        article = extract_article(html, final_url)
+        crawler_html = await fetch_crawler_html(final_url or url)
+        if crawler_html:
+            crawler_article = extract_article(crawler_html, final_url or url)
+            if (crawler_article.get("word_count") or 0) > (article.get("word_count") or 0):
+                for key in ("dek", "author", "author_image", "published_at", "site_name", "title"):
+                    if article.get(key) and not crawler_article.get(key):
+                        crawler_article[key] = article[key]
+                article = crawler_article
+            else:
+                for key in ("dek", "author", "author_image", "published_at"):
+                    if not article.get(key) and crawler_article.get(key):
+                        article[key] = crawler_article[key]
+        reader = build_reader_html(article, url)
+        if article.get("paywalled"):
+            await page.set_content(reader, wait_until="domcontentloaded")
+            await page.wait_for_timeout(250)
         try:
             screenshot = await page.screenshot(full_page=True, type="jpeg", quality=82)
         except Exception:
@@ -328,9 +409,9 @@ async def run_job(job_id: str) -> None:
         (res_dir / filename).write_bytes(body)
 
     frozen = freeze_html(html, final_url, resource_map, sid)
-    article = extract_article(html, final_url)
 
     (folder / "page.html").write_text(frozen, encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
     (folder / "article.html").write_text(article.get("article_html") or "", encoding="utf-8")
     (folder / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
     (folder / "screenshot.jpg").write_bytes(screenshot)
@@ -353,6 +434,9 @@ async def run_job(job_id: str) -> None:
         "published_at": article.get("published_at"),
         "description": article.get("description"),
         "word_count": article.get("word_count"),
+        "dek": article.get("dek"),
+        "author_image": article.get("author_image"),
+        "paywalled": article.get("paywalled"),
         "resources": resource_map,
         "created_at": db.now_iso(),
     }

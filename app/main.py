@@ -14,6 +14,35 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+MIME_BY_EXT = {
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".svg": "image/svg+xml",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain",
+}
+
+
+def mime_for_filename(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in MIME_BY_EXT:
+        return MIME_BY_EXT[ext]
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
 from . import capture, db
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
 from .security import normalize_url, validate_public_http_url
@@ -211,6 +240,18 @@ async def snapshot(request: Request, sid: str):
     return templates.TemplateResponse(
         request,
         "snapshot.html",
+        {"snap": snap, "mode": "article"},
+    )
+
+
+@app.get("/{sid}/webpage", response_class=HTMLResponse)
+async def snapshot_webpage(request: Request, sid: str):
+    snap = _require_complete(sid)
+    if isinstance(snap, RedirectResponse):
+        return snap
+    return templates.TemplateResponse(
+        request,
+        "snapshot.html",
         {"snap": snap, "mode": "webpage"},
     )
 
@@ -232,24 +273,21 @@ async def snapshot_text(request: Request, sid: str):
     snap = _require_complete(sid)
     if isinstance(snap, RedirectResponse):
         return snap
-    folder = db.snap_dir(sid)
-    article_html = ""
-    article_text = ""
-    html_path = folder / "article.html"
-    text_path = folder / "article.txt"
-    if html_path.exists():
-        article_html = html_path.read_text(encoding="utf-8")
-    if text_path.exists():
-        article_text = text_path.read_text(encoding="utf-8")
-    return templates.TemplateResponse(
-        request,
-        "snapshot.html",
-        {
-            "snap": snap,
-            "mode": "text",
-            "article_html": article_html,
-            "article_text": article_text,
-        },
+    return RedirectResponse(f"/{sid}", status_code=303)
+
+
+@app.get("/{sid}/reader")
+async def snapshot_reader(sid: str):
+    snap = _require_complete(sid)
+    if isinstance(snap, RedirectResponse):
+        return snap
+    path = db.snap_dir(sid) / "reader.html"
+    if not path.exists():
+        raise HTTPException(404, "No article extract")
+    return FileResponse(
+        path,
+        media_type="text/html; charset=utf-8",
+        headers={"X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -266,7 +304,8 @@ async def snapshot_raw(sid: str):
         media_type="text/html; charset=utf-8",
         headers={
             "Content-Security-Policy": (
-                "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                "default-src 'none'; img-src 'self' data:; "
+                "style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; "
                 "font-src 'self' data:; media-src 'self' data:; frame-src 'none'; script-src 'none';"
             ),
             "X-Content-Type-Options": "nosniff",
@@ -309,10 +348,9 @@ async def snapshot_resource(sid: str, filename: str):
     path = db.snap_dir(sid) / "res" / filename
     if not path.exists():
         raise HTTPException(404, "Missing resource")
-    mime, _ = mimetypes.guess_type(filename)
     return FileResponse(
         path,
-        media_type=mime or "application/octet-stream",
+        media_type=mime_for_filename(filename),
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
 
