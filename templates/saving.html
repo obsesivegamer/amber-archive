@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Saving… — Amber{% endblock %}
+{% block body %}
+<main class="sheet">
+  <header class="masthead">
+    <a class="wordmark" href="/">Amber</a>
+    <p class="tag">taking a snapshot</p>
+  </header>
+  <p class="lede" id="status-line">Loading {{ job.url }}</p>
+  <p class="hint">Text copy + graphical copy. Scripts will be stripped from the saved page.</p>
+  <ol class="log" id="log"></ol>
+  <p class="flash hidden" id="err"></p>
+</main>
+<script>
+  const JOB = {{ job_id | tojson }};
+  const logEl = document.getElementById('log');
+  const errEl = document.getElementById('err');
+  const statusEl = document.getElementById('status-line');
+  function prettySize(n) {
+    if (!n) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+  async function poll() {
+    try {
+      const r = await fetch('/api/jobs/' + JOB);
+      if (!r.ok) throw new Error('job missing');
+      const j = await r.json();
+      statusEl.textContent = (j.status === 'complete' ? 'Saved' : 'Loading') + ' ' + (j.url || '');
+      logEl.innerHTML = '';
+      (j.resources || []).forEach((row) => {
+        const li = document.createElement('li');
+        const mime = row.mime || '';
+        const size = prettySize(row.size);
+        li.innerHTML = '<code>' + (row.status || '') + '</code> <span class="mime">' + mime + '</span> ' +
+          '<span class="sz">' + size + '</span> <span class="u"></span>';
+        li.querySelector('.u').textContent = row.url || '';
+        logEl.appendChild(li);
+      });
+      logEl.scrollTop = logEl.scrollHeight;
+      if (j.status === 'complete') {
+        location.replace('/' + j.snapshot_id);
+        return;
+      }
+      if (j.status === 'failed') {
+        errEl.textContent = j.error || 'Capture failed.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+    } catch (e) {
+      errEl.textContent = String(e);
+      errEl.classList.remove('hidden');
+    }
+    setTimeout(poll, 450);
+  }
+  poll();
+</script>
+{% endblock %}

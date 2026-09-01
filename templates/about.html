@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}About — Amber{% endblock %}
+{% block body %}
+<main class="sheet">
+  <header class="masthead">
+    <a class="wordmark" href="/">Amber</a>
+    <p class="tag">how it works</p>
+  </header>
+
+  <section class="blurb">
+    <p>Paste a public URL. Amber opens it in a real Chromium browser, waits for the page to render, then stores three things:</p>
+    <ul class="plain">
+      <li><strong>Webpage</strong> — the HTML after JavaScript has run, with scripts and forms stripped. Images and CSS are saved locally so the copy still works if the original site goes away.</li>
+      <li><strong>Screenshot</strong> — a graphical copy of what the page looked like.</li>
+      <li><strong>Text</strong> — a readable article extract (title, byline, body) for news and blogs.</li>
+    </ul>
+    <p>Each snapshot gets a short id such as <code>/K7mQp</code>. That record is not edited later.</p>
+    <p>Amber loads the page as a first-time visitor (fresh browser, no cookies). Many news sites show a couple of articles this way. Overlays that hide text already on the page are removed so the snapshot shows what was actually loaded. Pages that never send their content without a login cannot be archived.</p>
+    <p>Only http(s) URLs on the public internet are accepted. Private/local addresses are blocked. Tracker and ad hosts are skipped during capture so snapshots stay smaller and quieter.</p>
+    <p>This is a self-hosted personal archive. Snapshots live in <code>data/snaps/</code> on the machine that runs Amber.</p>
+    <p><a href="/">← back</a></p>
+  </section>
+</main>
+{% endblock %}

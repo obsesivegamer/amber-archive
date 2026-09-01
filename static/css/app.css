@@ -1,0 +1,330 @@
+:root {
+  --paper: #f4ecd8;
+  --paper-2: #efe4cc;
+  --ink: #1c1410;
+  --muted: #6b5c4c;
+  --amber: #c47a22;
+  --amber-d: #8b5314;
+  --rule: #d4c4a8;
+  --flash: #8b1e1e;
+  --toolbar: #241e1a;
+  --toolbar-ink: #f4ecd8;
+  --shadow: 0 1px 0 rgba(28, 20, 16, 0.06);
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Source Serif 4", "Georgia", serif;
+  font-size: 18px;
+  line-height: 1.5;
+}
+
+a { color: var(--amber-d); }
+a:hover { color: var(--amber); }
+
+.sheet {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 4rem;
+}
+
+.masthead {
+  text-align: center;
+  border-bottom: 3px double var(--ink);
+  padding-bottom: 1.1rem;
+  margin-bottom: 1.6rem;
+}
+
+.wordmark {
+  font-family: Fraunces, "Times New Roman", serif;
+  font-weight: 700;
+  font-size: 3.1rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--ink);
+  display: inline-block;
+  line-height: 1;
+}
+
+.wordmark.sm {
+  font-size: 1rem;
+  letter-spacing: 0.22em;
+  color: var(--toolbar-ink);
+}
+
+.tag {
+  margin: 0.55rem 0 0;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.82rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.box {
+  background: var(--paper-2);
+  border: 1px solid var(--rule);
+  padding: 0.9rem 0.95rem 1rem;
+  margin: 0 0 1rem;
+}
+
+.box label {
+  display: block;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.92rem;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+input[type="url"],
+input[type="search"] {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 1rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--ink);
+  background: #fffdf8;
+  color: var(--ink);
+}
+
+button, .btn {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.92rem;
+  font-weight: 600;
+  padding: 0.45rem 0.85rem;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber-d); }
+
+.btn.ghost {
+  background: transparent;
+  color: var(--ink);
+}
+
+.flash {
+  background: #f3d8d2;
+  color: var(--flash);
+  border: 1px solid #d9a398;
+  padding: 0.6rem 0.75rem;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.92rem;
+}
+
+.hidden { display: none; }
+
+.blurb { margin-top: 1.75rem; color: var(--ink); }
+.blurb p { margin: 0 0 1rem; }
+.blurb .plain { padding-left: 1.2rem; }
+.blurb .plain li { margin: 0.4rem 0; }
+
+.recent { margin-top: 2.2rem; }
+.recent h2, .results-title {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  border-top: 1px solid var(--rule);
+  padding-top: 0.8rem;
+}
+
+.recent ul, .results {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.recent li, .results li {
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.recent li a, .results li a {
+  display: block;
+  text-decoration: none;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.recent li span, .results li span {
+  display: block;
+  color: var(--muted);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.8rem;
+}
+
+.results .url {
+  word-break: break-all;
+  font-size: 0.75rem;
+}
+
+.lede {
+  word-break: break-all;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.92rem;
+}
+
+.hint { color: var(--muted); font-size: 0.95rem; }
+
+.log {
+  list-style: none;
+  padding: 0.6rem 0.7rem;
+  margin: 1rem 0 0;
+  max-height: 22rem;
+  overflow: auto;
+  background: #1c1410;
+  color: #efe4cc;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.log li { white-space: nowrap; }
+.log .mime { color: #c47a22; }
+.log .sz { color: #9ad0a0; }
+.log .u { color: #d9cbb0; }
+
+body.viewer {
+  background: #111;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  background: var(--toolbar);
+  color: var(--toolbar-ink);
+  padding: 0.45rem 0.8rem;
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.82rem;
+}
+
+.toolbar a { color: var(--toolbar-ink); text-decoration: none; }
+.toolbar a:hover { color: #e2b56a; }
+
+.modes { display: flex; gap: 0.35rem; }
+.modes a {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid transparent;
+}
+.modes a.on {
+  border-color: var(--amber);
+  color: #e2b56a;
+}
+
+.toolbar .meta {
+  flex: 1;
+  min-width: 12rem;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+  align-items: baseline;
+}
+
+.toolbar .orig {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 42vw;
+  opacity: 0.85;
+}
+
+.toolbar time { color: #b7a894; white-space: nowrap; }
+
+.frame {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+.shot {
+  flex: 1;
+  overflow: auto;
+  background: #111;
+  text-align: center;
+}
+
+.shot img {
+  max-width: 1024px;
+  width: 100%;
+  height: auto;
+  vertical-align: top;
+}
+
+.readable {
+  flex: 1;
+  overflow: auto;
+  background: var(--paper);
+  color: var(--ink);
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+  width: 100%;
+}
+
+.readable .kicker {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber-d);
+  margin: 0 0 0.4rem;
+}
+
+.readable h1 {
+  font-family: Fraunces, Georgia, serif;
+  font-size: 2rem;
+  line-height: 1.2;
+  margin: 0 0 0.5rem;
+}
+
+.byline {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-size: 0.85rem;
+  color: var(--muted);
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.8rem;
+}
+
+.readable .body { font-size: 1.05rem; }
+.readable .body img { max-width: 100%; height: auto; }
+.plain-text {
+  white-space: pre-wrap;
+  font: inherit;
+}
+
+code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+@media (max-width: 640px) {
+  .wordmark { font-size: 2.2rem; letter-spacing: 0.12em; }
+  .row { flex-direction: column; }
+  .toolbar .meta { justify-content: flex-start; }
+  .toolbar .orig { max-width: 100%; }
+}

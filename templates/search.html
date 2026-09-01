@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Search — Amber{% endblock %}
+{% block body %}
+<main class="sheet">
+  <header class="masthead">
+    <a class="wordmark" href="/">Amber</a>
+    <p class="tag">search the archive</p>
+  </header>
+  <form class="box" action="/search" method="get">
+    <label for="q">I want to search the archive</label>
+    <div class="row">
+      <input id="q" name="q" type="search" value="{{ q }}" placeholder="url, title, or site">
+      <button type="submit">search</button>
+    </div>
+  </form>
+  {% if q %}
+    {% if results %}
+    <ul class="results">
+      {% for s in results %}
+      <li>
+        <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
+        <span>{{ s.url | host }} · {{ s.created_at | fmtdate }}</span>
+        <span class="url">{{ s.url }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No snapshots matched “{{ q }}”.</p>
+    {% endif %}
+  {% endif %}
+</main>
+{% endblock %}

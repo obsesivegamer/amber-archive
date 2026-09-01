@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block body_class %}home{% endblock %}
+{% block body %}
+<main class="sheet">
+  <header class="masthead">
+    <a class="wordmark" href="/">Amber</a>
+    <p class="tag">a time capsule for web pages</p>
+  </header>
+
+  {% if error %}
+  <p class="flash">{{ error }}</p>
+  {% endif %}
+
+  <form class="box" action="/save" method="post">
+    <label for="url">My url is alive and I want to archive its content</label>
+    <div class="row">
+      <input id="url" name="url" type="url" inputmode="url" autocomplete="url"
+             placeholder="https://example.com/article" required>
+      <button type="submit">save</button>
+    </div>
+  </form>
+
+  <form class="box" action="/search" method="get">
+    <label for="q">I want to search the archive</label>
+    <div class="row">
+      <input id="q" name="q" type="search" placeholder="url, title, or site">
+      <button type="submit">search</button>
+    </div>
+  </form>
+
+  <section class="blurb">
+    <p><strong>Amber is a time capsule for web pages.</strong>
+    It takes a snapshot of a webpage that will still be here even if the original page disappears.
+    It saves a text copy and a graphical copy of the page for better accuracy,
+    and gives you a short, reliable link to an unalterable record — including pages from modern JavaScript sites.</p>
+    <p>Useful when a page might change soon: a price list, a job offer, a real-estate listing, a blog post.
+    Saved pages have no active elements and no scripts, so they cannot pop up or run malware.</p>
+    <p><a href="/about">How it works</a></p>
+  </section>
+
+  {% if recent %}
+  <section class="recent">
+    <h2>Recently saved</h2>
+    <ul>
+      {% for s in recent %}
+      <li>
+        <a href="/{{ s.id }}">{{ s.title or s.url }}</a>
+        <span>{{ s.url | host }} · {{ s.created_at | fmtdate }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+</main>
+{% endblock %}
