@@ -45,6 +45,7 @@ def mime_for_filename(filename: str) -> str:
 
 from . import capture, db
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
+from .ingest import ingest_html, original_url_from_html
 from .security import normalize_url, validate_public_http_url
 
 if sys.platform == "win32":
@@ -121,6 +122,23 @@ async def home(request: Request, error: str | None = None):
 @app.get("/about", response_class=HTMLResponse)
 async def about(request: Request):
     return templates.TemplateResponse(request, "about.html", {})
+
+
+@app.post("/import")
+async def import_html(request: Request):
+    form = await request.form()
+    upload = form.get("file")
+    url = str(form.get("url") or "").strip()
+    if upload is None or not getattr(upload, "read", None):
+        return RedirectResponse("/?error=" + quote("Choose an HTML file to import."), status_code=303)
+    raw = await upload.read()
+    if not raw:
+        return RedirectResponse("/?error=" + quote("That file was empty."), status_code=303)
+    html = raw.decode("utf-8", errors="replace")
+    if not url:
+        url = original_url_from_html(html)
+    sid = ingest_html(html, url)
+    return RedirectResponse(f"/{sid}", status_code=303)
 
 
 @app.api_route("/save", methods=["GET", "POST"])

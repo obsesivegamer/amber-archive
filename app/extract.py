@@ -151,14 +151,43 @@ def _paragraphs_to_html(text: str) -> str:
     return "".join(f"<p>{p}</p>" for p in parts)
 
 
+def _first_h1(soup: BeautifulSoup) -> tuple[str | None, Any]:
+    for h in soup.find_all("h1"):
+        t = _text(h.get_text(" ", strip=True))
+        if t and 12 <= len(t) <= 240:
+            return t, h
+    return None, None
+
+
+def _dek_near_h1(h1) -> str | None:
+    if h1 is None:
+        return None
+    nxt = h1.find_next(["div", "p", "h2"])
+    if not nxt:
+        return None
+    t = _text(nxt.get_text(" ", strip=True))
+    if not t or not (24 <= len(t) <= 240):
+        return None
+    if t.lower().startswith("by "):
+        return None
+    if "subscribe" in t.lower():
+        return None
+    return t
+
+
 def extract_article(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
     ld = _from_ld(soup)
     rails = _from_react_on_rails(soup)
     nxt = _from_next_data(soup)
+    h1_text, h1_tag = _first_h1(soup)
+    og_title = _meta(soup, "og:title", "twitter:title")
+    if og_title and (og_title.endswith("…") or og_title.endswith("...")):
+        og_title = None
 
     title = (
-        _meta(soup, "og:title", "twitter:title")
+        h1_text
+        or og_title
         or rails.get("title")
         or nxt.get("title")
         or ld.get("title")
@@ -195,6 +224,44 @@ def extract_article(html: str, url: str) -> dict:
         or ld.get("site_name")
         or _meta(soup, "og:site_name")
     )
+    if site_name and "archive." in site_name.lower():
+        site_name = None
+    for div in soup.find_all("div"):
+        bits = [b.strip() for b in div.stripped_strings if b.strip()]
+        if not bits:
+            continue
+        if bits[0] == "By" and len(bits) >= 2:
+            if not author:
+                author = bits[1]
+            if "Source:" in bits:
+                i = bits.index("Source:")
+                if i + 1 < len(bits) and not site_name:
+                    site_name = bits[i + 1]
+            break
+        if bits[0].startswith("By "):
+            if not author:
+                author = _text(bits[0][3:])
+            break
+    if not author:
+        by = soup.find(string=re.compile(r"^\s*By\s+\S"))
+        if by:
+            author = _text(re.sub(r"^\s*By\s+", "", str(by), count=1))
+            if author and "@" in author:
+                author = _text(re.sub(r"\s+\S+@\S+.*$", "", author))
+    if not site_name:
+        for raw in soup.stripped_strings:
+            if raw.lower().startswith("source:"):
+                site_name = _text(re.sub(r"^source:\s*", "", raw, flags=re.I))
+                break
+    for time_tag in soup.find_all("time"):
+        visible = _text(time_tag.get_text(" ", strip=True))
+        if not visible:
+            continue
+        if re.search(r"\b(PDT|PST|EST|EDT|CT|PT|am|pm)\b", visible, re.I):
+            published_at = visible
+            break
+        if not published_at:
+            published_at = visible
     if not site_name:
         from urllib.parse import urlparse
 
@@ -222,7 +289,8 @@ def extract_article(html: str, url: str) -> dict:
             for attr in list(tag.attrs):
                 if attr.lower().startswith("on"):
                     del tag.attrs[attr]
-        article_html = str(art)
+        inner = art.body
+        article_html = inner.decode_contents() if inner else str(art)
 
     if article_html:
         article_text = BeautifulSoup(article_html, "lxml").get_text("\n", strip=True)
@@ -244,7 +312,7 @@ def extract_article(html: str, url: str) -> dict:
     return {
         "title": title or url,
         "description": description,
-        "dek": rails.get("dek") or nxt.get("description"),
+        "dek": rails.get("dek") or _dek_near_h1(h1_tag) or nxt.get("description"),
         "author": author,
         "author_image": rails.get("author_image"),
         "published_at": published_at,
