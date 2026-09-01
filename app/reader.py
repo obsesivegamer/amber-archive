@@ -69,10 +69,10 @@ def build_reader_html(article: dict, url: str) -> str:
     notice = ""
     if article.get("paywalled"):
         notice = (
-            '<p class="notice">This site only sent Amber a teaser. The rest of the article '
-            "was not in the page a logged-out visitor received, so it could not be archived. "
-            "To keep the full piece, open it in your browser or on archive.is, save the page "
-            "as HTML, then import that file on Amber's homepage.</p>"
+            '<p class="notice">Incomplete — this visit only kept a paywalled teaser. '
+            "The rest of the article was not in the page a logged-out visitor received. "
+            "To keep the full piece, save the page as HTML from a logged-in browser, then "
+            "Import that file on Amber's homepage.</p>"
         )
 
     return f"""<!doctype html>

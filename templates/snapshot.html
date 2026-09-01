@@ -19,6 +19,13 @@
   </div>
 </header>
 
+{% if snap.paywalled %}
+<p class="viewer-note" role="status">
+  Incomplete — this visit only kept a paywalled teaser, not the full article.
+  <a href="/#import">Import</a> a saved HTML file from a logged-in browser to keep the rest.
+</p>
+{% endif %}
+
 {% if mode == 'article' %}
 <iframe class="frame" src="/{{ snap.id }}/reader" sandbox="allow-same-origin" title="Archived article"></iframe>
 {% elif mode == 'webpage' %}

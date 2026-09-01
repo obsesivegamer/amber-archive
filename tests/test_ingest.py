@@ -30,3 +30,6 @@ def test_ingest_saved_archive_is_article(tmp_data):
     assert "Exclusive: Elon Musk Tells Tesla Staff" in reader
     assert "By Grace Kay" in reader
     assert "Andrew Milich" in reader
+    meta = db.read_json(db.snap_dir(sid) / "meta.json")
+    assert meta.get("paywalled") is True
+    assert snap["paywalled"] is True

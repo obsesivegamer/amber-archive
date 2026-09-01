@@ -15,6 +15,7 @@
     <li>
       <a href="/{{ s.id }}">{{ s.created_at | fmtdate }}</a>
       <span>{{ s.title }}</span>
+      {% include "_incomplete.html" %}
     </li>
     {% endfor %}
   </ul>

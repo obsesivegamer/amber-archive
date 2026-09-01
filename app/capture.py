@@ -491,6 +491,7 @@ async def run_job(job_id: str) -> None:
         description=meta["description"],
         http_status=http_status,
         word_count=meta["word_count"],
+        paywalled=1 if meta.get("paywalled") else 0,
         status="complete",
         error=None,
     )
