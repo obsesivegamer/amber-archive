@@ -40,3 +40,21 @@ def test_paywalled_reader_explains_the_teaser():
     )
     assert "paywalled teaser" in html
     assert "Import" in html
+    assert "retried as a Google referrer" not in html
+
+
+def test_paywalled_reader_mentions_referrer_retry_when_it_happened():
+    html = build_reader_html(
+        {
+            "title": "Inside Kallas’ fightback",
+            "author": "Nicholas Vinocur",
+            "site_name": "POLITICO",
+            "article_text": "A logged-out teaser sentence.",
+            "paywalled": True,
+            "referrer_retried": True,
+        },
+        "https://www.politico.eu/article/example",
+    )
+    assert "retried as a Google referrer visit" in html
+    assert "paywalled teaser" in html
+    assert "Import" in html

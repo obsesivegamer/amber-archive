@@ -7,7 +7,9 @@ import hashlib
 import io
 import mimetypes
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from PIL import Image
@@ -22,6 +24,8 @@ from .config import (
     MAX_TOTAL_RESOURCE_BYTES,
     NAV_TIMEOUT_MS,
     NETWORK_IDLE_MS,
+    REFERRER_BOUNCE_ORIGINS,
+    REFERRER_BOUNCE_RETRY_ORIGINS,
     RENDER_WAIT_MS,
     USER_AGENT,
     VIEWPORT,
@@ -264,6 +268,292 @@ async def fetch_crawler_html(url: str) -> str | None:
     return None
 
 
+def require_bounce_origin(origin: str) -> str:
+    if origin not in REFERRER_BOUNCE_ORIGINS:
+        raise ValueError("bounce origin is not allowlisted")
+    return origin
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
+
+
+def extra_headers_for_visit(*, bounce: bool) -> dict[str, str]:
+    """Pin Google Referer only on the first (direct) visit.
+
+    Playwright extra_http_headers override the click-through Referer, so a
+    bounce context that still carries EXTRA_HEADERS would send Google on
+    every retry — including x.com.
+    """
+    if not bounce:
+        return dict(EXTRA_HEADERS)
+    return {k: v for k, v in EXTRA_HEADERS.items() if k.lower() != "referer"}
+
+
+def bounce_origins_for(*urls: str) -> tuple[str, ...]:
+    """Retry origins whose host is not the article. You cannot bounce a site off itself."""
+    skip = {_host(u) for u in urls if u}
+    skip.discard("")
+    return tuple(origin for origin in REFERRER_BOUNCE_RETRY_ORIGINS if _host(origin) not in skip)
+
+
+def intercept_bounce_host(req_url: str, bounce_origin: str | None, *, landed: bool) -> bool:
+    """Stub/abort the bounce host only until the click-through starts."""
+    if not bounce_origin or landed:
+        return False
+    return _host(req_url) == _host(bounce_origin)
+
+
+def _richer_article(candidate: dict, current: dict) -> bool:
+    # Word-count-only win is safe only while paywalled ⇔ word_count < 80
+    # (article_is_paywalled). Prefer not-paywalled if that invariant diverges.
+    if candidate.get("paywalled") is False and current.get("paywalled") is True:
+        return True
+    if candidate.get("paywalled") is True and current.get("paywalled") is False:
+        return False
+    return (candidate.get("word_count") or 0) > (current.get("word_count") or 0)
+
+
+def _merge_crawler_article(article: dict, crawler_article: dict) -> dict:
+    if _richer_article(crawler_article, article):
+        for key in ("dek", "author", "author_image", "published_at", "site_name", "title"):
+            if article.get(key) and not crawler_article.get(key):
+                crawler_article[key] = article[key]
+        return crawler_article
+    for key in ("dek", "author", "author_image", "published_at"):
+        if not article.get(key) and crawler_article.get(key):
+            article[key] = crawler_article[key]
+    return article
+
+
+BOUNCE_STUB_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="origin">
+  <title>Amber</title>
+</head>
+<body><p>Amber referrer bounce</p></body>
+</html>
+"""
+
+
+@dataclass
+class _Visit:
+    html: str
+    article: dict
+    final_url: str
+    title: str
+    http_status: int | None
+    resource_map: dict[str, str]
+    resource_bodies: dict[str, tuple[bytes, str]]
+    page: Any
+    context: Any
+    bounce_origin: str | None = None
+
+    async def close(self) -> None:
+        try:
+            await self.context.close()
+        except Exception:
+            pass
+
+
+async def _settle_page(page) -> None:
+    try:
+        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
+    except PlaywrightTimeout:
+        pass
+    try:
+        await page.evaluate(DISMISS_JS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(400)
+    try:
+        await page.evaluate(CLEAN_PAGE_JS)
+    except Exception:
+        pass
+    try:
+        await page.evaluate(SCROLL_JS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(RENDER_WAIT_MS)
+    try:
+        await page.evaluate(CLEAN_PAGE_JS)
+    except Exception:
+        pass
+    try:
+        await page.evaluate(REVEAL_LEDE_JS)
+    except Exception:
+        pass
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(200)
+    try:
+        await page.evaluate(INLINE_COMPUTED_CSS_JS)
+    except Exception:
+        pass
+    await page.wait_for_timeout(100)
+
+
+async def _goto_article(page, url: str, bounce_origin: str | None, *, on_bounce_landed=None):
+    """Land on the article.
+
+    A direct ``page.goto`` is an address-bar navigation (``Sec-Fetch-Site:
+    none``). Chromium may still attach EXTRA_HEADERS Referer and fill
+    ``document.referrer``, but Piano-style meters treat that as a typed URL.
+    A bounce lands on an allowlisted origin, then clicks through so the
+    article request is a real cross-site navigation with that referrer.
+    """
+    if bounce_origin is None:
+        return await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    origin = require_bounce_origin(bounce_origin)
+    await page.goto(origin, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    if on_bounce_landed is not None:
+        on_bounce_landed()
+    await page.evaluate(
+        """(href) => {
+          let a = document.getElementById('amber-bounce');
+          if (!a) {
+            a = document.createElement('a');
+            a.id = 'amber-bounce';
+            document.body.appendChild(a);
+          }
+          a.setAttribute('href', href);
+          a.textContent = 'continue';
+        }""",
+        url,
+    )
+    async with page.expect_navigation(
+        wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+    ) as info:
+        await page.click("#amber-bounce")
+    return await info.value
+
+
+async def _capture_visit(
+    browser,
+    job: dict,
+    url: str,
+    *,
+    bounce_origin: str | None = None,
+) -> _Visit:
+    if bounce_origin is not None:
+        bounce_origin = require_bounce_origin(bounce_origin)
+
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport=VIEWPORT,
+        locale="en-US",
+        java_script_enabled=True,
+        bypass_csp=True,
+        extra_http_headers=extra_headers_for_visit(bounce=bounce_origin is not None),
+    )
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    page = await context.new_page()
+
+    resource_map: dict[str, str] = {}
+    resource_bodies: dict[str, tuple[bytes, str]] = {}
+    total_bytes = 0
+    bounce_landed = False
+
+    def _mark_bounce_landed() -> None:
+        nonlocal bounce_landed
+        bounce_landed = True
+
+    async def on_route(route):
+        req_url = route.request.url
+        if intercept_bounce_host(req_url, bounce_origin, landed=bounce_landed):
+            if route.request.resource_type == "document":
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=BOUNCE_STUB_HTML,
+                    headers={"Referrer-Policy": "origin"},
+                )
+                return
+            await route.abort()
+            return
+        if _should_block(req_url):
+            await route.abort()
+            return
+        await route.continue_()
+
+    async def on_response(response):
+        nonlocal total_bytes
+        req_url = response.url
+        status = response.status
+        ctype = response.headers.get("content-type", "")
+        try:
+            body = await response.body()
+        except Exception:
+            body = b""
+        size = len(body)
+        log_resource(
+            job,
+            url=req_url,
+            status=status,
+            mime=(ctype or "").split(";")[0],
+            size=size,
+        )
+        if status >= 400 or not body:
+            return
+        if not _should_save(ctype):
+            return
+        if size > MAX_RESOURCE_BYTES or total_bytes + size > MAX_TOTAL_RESOURCE_BYTES:
+            return
+        digest = hashlib.sha256(body).hexdigest()[:16]
+        filename = digest + _ext_for(ctype, req_url)
+        if filename not in resource_bodies:
+            resource_bodies[filename] = (body, (ctype or "application/octet-stream").split(";")[0])
+            total_bytes += size
+        resource_map[req_url] = filename
+        try:
+            request_url = response.request.url
+            if request_url != req_url:
+                resource_map[request_url] = filename
+        except Exception:
+            pass
+
+    await page.route("**/*", on_route)
+    page.on("response", on_response)
+
+    log_resource(job, url=url, status=0, mime="navigation", size=0)
+    try:
+        response = await _goto_article(
+            page, url, bounce_origin, on_bounce_landed=_mark_bounce_landed
+        )
+    except PlaywrightTimeout as exc:
+        await context.close()
+        raise RuntimeError(f"Timed out loading {url}") from exc
+
+    http_status = response.status if response else None
+    await _settle_page(page)
+
+    final_url = page.url
+    try:
+        validate_public_http_url(final_url)
+    except ValueError as exc:
+        await context.close()
+        raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
+
+    title = await page.title()
+    html = await page.content()
+    article = extract_article(html, final_url)
+    return _Visit(
+        html=html,
+        article=article,
+        final_url=final_url,
+        title=title,
+        http_status=http_status,
+        resource_map=resource_map,
+        resource_bodies=resource_bodies,
+        page=page,
+        context=context,
+        bounce_origin=bounce_origin,
+    )
+
+
 async def worker() -> None:
     assert job_queue is not None
     while True:
@@ -292,149 +582,72 @@ async def run_job(job_id: str) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     res_dir.mkdir(parents=True, exist_ok=True)
 
+    visit: _Visit | None = None
+    html = ""
+    final_url = url
+    title = ""
+    http_status = None
+    article: dict = {}
     resource_map: dict[str, str] = {}
     resource_bodies: dict[str, tuple[bytes, str]] = {}
-    total_bytes = 0
+    screenshot = b""
+    bounce_used: str | None = None
+    retried = False
+    reader = ""
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport=VIEWPORT,
-            locale="en-US",
-            java_script_enabled=True,
-            bypass_csp=True,
-            extra_http_headers=EXTRA_HEADERS,
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page = await context.new_page()
+        try:
+            visit = await _capture_visit(browser, job, url)
+            article = visit.article
+            crawler_html = await fetch_crawler_html(visit.final_url or url)
+            if crawler_html:
+                crawler_article = extract_article(crawler_html, visit.final_url or url)
+                article = _merge_crawler_article(article, crawler_article)
+                visit.article = article
 
-        async def on_route(route):
-            req_url = route.request.url
-            if _should_block(req_url):
-                await route.abort()
-                return
-            await route.continue_()
+            if article.get("paywalled"):
+                for origin in bounce_origins_for(url, visit.final_url):
+                    retried = True
+                    try:
+                        attempt = await _capture_visit(
+                            browser, job, url, bounce_origin=origin
+                        )
+                    except Exception:
+                        continue
+                    if _richer_article(attempt.article, visit.article):
+                        await visit.close()
+                        visit = attempt
+                    else:
+                        await attempt.close()
+                    if not visit.article.get("paywalled"):
+                        break
 
-        async def on_response(response):
-            nonlocal total_bytes
-            req_url = response.url
-            status = response.status
-            ctype = response.headers.get("content-type", "")
+            article = visit.article
+            if retried:
+                article["referrer_retried"] = True
+            html = visit.html
+            final_url = visit.final_url
+            title = visit.title
+            http_status = visit.http_status
+            resource_map = visit.resource_map
+            resource_bodies = visit.resource_bodies
+            bounce_used = visit.bounce_origin
+            reader = build_reader_html(article, url)
+            if article.get("paywalled"):
+                await visit.page.set_content(reader, wait_until="domcontentloaded")
+                await visit.page.wait_for_timeout(250)
             try:
-                body = await response.body()
+                screenshot = await visit.page.screenshot(full_page=True, type="jpeg", quality=82)
             except Exception:
-                body = b""
-            size = len(body)
-            log_resource(
-                job,
-                url=req_url,
-                status=status,
-                mime=(ctype or "").split(";")[0],
-                size=size,
-            )
-            if status >= 400 or not body:
-                return
-            if not _should_save(ctype):
-                return
-            if size > MAX_RESOURCE_BYTES or total_bytes + size > MAX_TOTAL_RESOURCE_BYTES:
-                return
-            digest = hashlib.sha256(body).hexdigest()[:16]
-            filename = digest + _ext_for(ctype, req_url)
-            if filename not in resource_bodies:
-                resource_bodies[filename] = (body, (ctype or "application/octet-stream").split(";")[0])
-                total_bytes += size
-            resource_map[req_url] = filename
-            try:
-                request_url = response.request.url
-                if request_url != req_url:
-                    resource_map[request_url] = filename
-            except Exception:
-                pass
-
-        await page.route("**/*", on_route)
-        page.on("response", on_response)
-
-        log_resource(job, url=url, status=0, mime="navigation", size=0)
-        try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        except PlaywrightTimeout as exc:
+                screenshot = await visit.page.screenshot(full_page=False, type="jpeg", quality=82)
+        finally:
+            if visit is not None:
+                await visit.close()
             await browser.close()
-            raise RuntimeError(f"Timed out loading {url}") from exc
-
-        http_status = response.status if response else None
-        try:
-            await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
-        except PlaywrightTimeout:
-            pass
-
-        try:
-            await page.evaluate(DISMISS_JS)
-        except Exception:
-            pass
-        await page.wait_for_timeout(400)
-        try:
-            await page.evaluate(CLEAN_PAGE_JS)
-        except Exception:
-            pass
-        try:
-            await page.evaluate(SCROLL_JS)
-        except Exception:
-            pass
-        await page.wait_for_timeout(RENDER_WAIT_MS)
-        try:
-            await page.evaluate(CLEAN_PAGE_JS)
-        except Exception:
-            pass
-        try:
-            await page.evaluate(REVEAL_LEDE_JS)
-        except Exception:
-            pass
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(200)
-        try:
-            await page.evaluate(INLINE_COMPUTED_CSS_JS)
-        except Exception:
-            pass
-        await page.wait_for_timeout(100)
-
-        final_url = page.url
-        try:
-            validate_public_http_url(final_url)
-        except ValueError as exc:
-            await browser.close()
-            raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
-
-        title = await page.title()
-        html = await page.content()
-        article = extract_article(html, final_url)
-        crawler_html = await fetch_crawler_html(final_url or url)
-        if crawler_html:
-            crawler_article = extract_article(crawler_html, final_url or url)
-            if (crawler_article.get("word_count") or 0) > (article.get("word_count") or 0):
-                for key in ("dek", "author", "author_image", "published_at", "site_name", "title"):
-                    if article.get(key) and not crawler_article.get(key):
-                        crawler_article[key] = article[key]
-                article = crawler_article
-            else:
-                for key in ("dek", "author", "author_image", "published_at"):
-                    if not article.get(key) and crawler_article.get(key):
-                        article[key] = crawler_article[key]
-        reader = build_reader_html(article, url)
-        if article.get("paywalled"):
-            await page.set_content(reader, wait_until="domcontentloaded")
-            await page.wait_for_timeout(250)
-        try:
-            screenshot = await page.screenshot(full_page=True, type="jpeg", quality=82)
-        except Exception:
-            screenshot = await page.screenshot(full_page=False, type="jpeg", quality=82)
-
-        await browser.close()
 
     for filename, (body, _ctype) in resource_bodies.items():
         if filename.endswith(".css"):
@@ -477,6 +690,8 @@ async def run_job(job_id: str) -> None:
         "dek": article.get("dek"),
         "author_image": article.get("author_image"),
         "paywalled": article.get("paywalled"),
+        "referrer_retried": bool(retried),
+        "referrer_bounce": bounce_used,
         "resources": resource_map,
         "created_at": db.now_iso(),
     }

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -19,6 +20,33 @@ EXTRA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.google.com/",
 }
+
+# EXTRA_HEADERS Referer is not enough: Chromium page.goto is an address-bar
+# navigation (Sec-Fetch-Site: none). Soft/metered paywalls that grant a
+# free read to Google or X traffic are retried from these origins only —
+# never a user-supplied Referer — by landing on a stub and clicking through.
+REFERRER_BOUNCE_ORIGINS = (
+    "https://www.google.com/",
+    "https://news.google.com/",
+    "https://x.com/",
+    "https://t.co/",
+)
+# One attempt per family. news.google.com and t.co stay on the allowlist
+# (require_bounce_origin) but are not extra Playwright visits.
+REFERRER_BOUNCE_RETRY_ORIGINS = (
+    "https://www.google.com/",
+    "https://x.com/",
+)
+REFERRER_BOUNCE_HOSTS = frozenset(
+    (urlparse(origin).hostname or "").lower() for origin in REFERRER_BOUNCE_ORIGINS
+)
+
+
+def referrer_is_allowlisted(referrer: str | None) -> bool:
+    host = (urlparse(referrer or "").hostname or "").lower()
+    return bool(host) and host in REFERRER_BOUNCE_HOSTS
+
+
 GOOGLEBOT_UA = (
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 )
