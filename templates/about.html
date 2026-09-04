@@ -15,7 +15,7 @@
       <li><strong>Text</strong> — a readable article extract (title, byline, body) for news and blogs.</li>
     </ul>
     <p>Each snapshot gets a short id such as <code>/K7mQp</code>. That record is not edited later.</p>
-    <p>Amber loads the page as a first-time visitor (fresh browser, no cookies). Many news sites show a couple of articles this way. Overlays that hide text already on the page are removed so the snapshot shows what was actually loaded. Pages that never send their content without a login cannot be archived.</p>
+    <p>Amber loads the page as a first-time visitor (fresh browser, no cookies). If that visit only gets a metered teaser, it retries in a new browser from a Google or X referrer — the same free-read path those publishers already grant. Overlays that hide text already on the page are removed so the snapshot shows what was actually loaded. Login-only pages stay incomplete; import a saved HTML file to keep those.</p>
     <p>Only http(s) URLs on the public internet are accepted. Private/local addresses are blocked. Tracker and ad hosts are skipped during capture so snapshots stay smaller and quieter.</p>
     <p>This is a self-hosted personal archive. Snapshots live in <code>data/snaps/</code> on the machine that runs Amber.</p>
     <p><a href="/">← back</a></p>

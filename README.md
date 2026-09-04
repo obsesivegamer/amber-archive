@@ -43,7 +43,7 @@ javascript:void(location.href='http://127.0.0.1:8080/save?url='+encodeURICompone
 
 ## What it is for
 
-Pages that may change or disappear: news articles, blog posts, price lists, job offers, listings. Amber loads the page as a first-time visitor (fresh browser, no cookies). Soft overlays that hide already-loaded text are removed. Login-only pages cannot be archived.
+Pages that may change or disappear: news articles, blog posts, price lists, job offers, listings. Amber loads the page as a first-time visitor (fresh browser, no cookies). Soft overlays that hide already-loaded text are removed. Metered paywalls that already grant a free read to Google or X visitors are retried that way in a fresh browser. Login-only pages stay incomplete; import saved HTML for those.
 
 Saved pages have no scripts and no active forms.
 
