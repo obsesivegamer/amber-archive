@@ -11,8 +11,13 @@ import pytest
 from fastapi.testclient import TestClient
 from playwright.async_api import async_playwright
 
-from app.capture import BOUNCE_STUB_HTML, _goto_article
-from app.config import EXTRA_HEADERS, referrer_is_allowlisted
+from app.capture import (
+    BOUNCE_STUB_HTML,
+    _capture_visit,
+    _goto_article,
+    extra_headers_for_visit,
+)
+from app.config import EXTRA_HEADERS, REFERRER_BOUNCE_ORIGINS, referrer_is_allowlisted
 from app.extract import PAYWALL_WORD_LIMIT
 
 METERED_FULL_TOKEN = "METERED_FULL_TOKEN_AMBER"
@@ -158,6 +163,7 @@ class _State:
     last_cookie = ""
     last_fetch_site = ""
     hits = 0
+    article_navs: list[tuple[str, str]] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -169,6 +175,8 @@ class Handler(BaseHTTPRequestHandler):
         _State.last_cookie = self.headers.get("Cookie", "")
         _State.last_fetch_site = self.headers.get("Sec-Fetch-Site", "")
         _State.hits += 1
+        if not self.path.startswith("/style"):
+            _State.article_navs.append((_State.last_referer, _State.last_fetch_site))
         locked = self.path.startswith("/locked")
         cookie_used = "meter=used" in (_State.last_cookie or "")
         cross_site = _State.last_fetch_site == "cross-site"
@@ -204,6 +212,7 @@ def metered_site():
     _State.last_cookie = ""
     _State.last_fetch_site = ""
     _State.hits = 0
+    _State.article_navs = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -224,9 +233,9 @@ def _wait_complete(client: TestClient, sid: str, seconds: int = 180) -> dict:
     pytest.fail("capture timed out")
 
 
-async def _fulfill_google_bounce(page) -> None:
+async def _fulfill_bounce(page, host: str) -> None:
     async def on_route(route):
-        if "www.google.com" in route.request.url:
+        if host in route.request.url:
             if route.request.resource_type == "document":
                 await route.fulfill(
                     status=200,
@@ -243,20 +252,31 @@ async def _fulfill_google_bounce(page) -> None:
 
 
 async def _playwright_referrer(
-    url: str, *, bounce: bool, reuse_after_direct: bool = False
+    url: str,
+    *,
+    bounce: bool,
+    reuse_after_direct: bool = False,
+    bounce_origin: str = "https://www.google.com/",
 ) -> tuple[str, str]:
+    headers = extra_headers_for_visit(bounce=bounce and not reuse_after_direct)
+    if reuse_after_direct:
+        headers = dict(EXTRA_HEADERS)
+    host = {
+        "https://www.google.com/": "www.google.com",
+        "https://x.com/": "x.com",
+    }[bounce_origin]
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(extra_http_headers=EXTRA_HEADERS)
+        context = await browser.new_context(extra_http_headers=headers)
         page = await context.new_page()
         try:
             if reuse_after_direct:
                 await page.goto(url, wait_until="domcontentloaded")
-                await _fulfill_google_bounce(page)
-                await _goto_article(page, url, "https://www.google.com/")
+                await _fulfill_bounce(page, host)
+                await _goto_article(page, url, bounce_origin)
             elif bounce:
-                await _fulfill_google_bounce(page)
-                await _goto_article(page, url, "https://www.google.com/")
+                await _fulfill_bounce(page, host)
+                await _goto_article(page, url, bounce_origin)
             else:
                 await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_selector("#amber-referrer")
@@ -265,6 +285,21 @@ async def _playwright_referrer(
         finally:
             await browser.close()
         return text, story
+
+
+async def _one_capture_visit(url: str, bounce_origin: str | None):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            visit = await _capture_visit(
+                browser, {"resources": []}, url, bounce_origin=bounce_origin
+            )
+            try:
+                return visit.html, visit.article, visit.final_url, visit.title
+            finally:
+                await visit.close()
+        finally:
+            await browser.close()
 
 
 def test_extra_http_headers_referer_does_not_unlock_metered_article(metered_site):
@@ -280,6 +315,22 @@ def test_bounce_click_unlocks_metered_article(metered_site):
     referrer, story = asyncio.run(_playwright_referrer(f"{metered_site}/article", bounce=True))
     assert referrer.startswith("https://www.google.com")
     assert METERED_FULL_TOKEN in story
+
+
+def test_x_bounce_sends_x_referer_not_google(metered_site):
+    referrer, story = asyncio.run(
+        _playwright_referrer(
+            f"{metered_site}/article",
+            bounce=True,
+            bounce_origin="https://x.com/",
+        )
+    )
+    assert referrer.startswith("https://x.com")
+    assert "google.com" not in referrer
+    assert METERED_FULL_TOKEN in story
+    assert _State.last_referer.startswith("https://x.com")
+    assert _State.last_fetch_site == "cross-site"
+    assert not _State.last_referer.startswith("https://www.google.com")
 
 
 def test_reused_context_keeps_meter_cookie_so_bounce_stays_teaser(metered_site):
@@ -358,3 +409,52 @@ def test_capture_hard_paywall_stays_incomplete(tmp_data, allow_private, metered_
         assert "paywalled teaser" in reader.text
         assert "retried as a Google referrer visit" in reader.text
         assert "Import" in reader.text
+
+
+def test_same_host_bounce_does_not_stub_article(allow_private, metered_site, monkeypatch):
+    origin = metered_site.rstrip("/") + "/"
+    monkeypatch.setattr(
+        "app.capture.REFERRER_BOUNCE_ORIGINS",
+        REFERRER_BOUNCE_ORIGINS + (origin,),
+    )
+    html, article, final_url, title = asyncio.run(
+        _one_capture_visit(f"{metered_site}/article", origin)
+    )
+    assert "Amber referrer bounce" not in html
+    assert title != "Amber"
+    assert "Kallas" in (article.get("title") or title)
+    assert final_url.startswith(metered_site)
+    assert article.get("word_count", 0) > 3
+
+
+def test_capture_x_retry_sends_x_referer(
+    tmp_data, allow_private, metered_site, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.capture.REFERRER_BOUNCE_RETRY_ORIGINS",
+        ("https://x.com/",),
+    )
+    from app.main import app
+    from app import db
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/save",
+            data={"url": f"{metered_site}/article"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        sid = r.headers["location"].rsplit("/", 1)[-1]
+        _wait_complete(client, sid)
+
+        snap = db.get_snapshot(sid)
+        assert snap["paywalled"] is False
+        meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta["referrer_bounce"] == "https://x.com/"
+        text = (db.snap_dir(sid) / "article.txt").read_text(encoding="utf-8")
+        assert METERED_FULL_TOKEN in text
+
+        cross = [(ref, site) for ref, site in _State.article_navs if site == "cross-site"]
+        assert cross, _State.article_navs
+        assert all(ref.startswith("https://x.com") for ref, _ in cross)
+        assert not any(ref.startswith("https://www.google.com") for ref, _ in cross)

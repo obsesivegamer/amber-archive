@@ -278,7 +278,39 @@ def _host(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
 
 
+def extra_headers_for_visit(*, bounce: bool) -> dict[str, str]:
+    """Pin Google Referer only on the first (direct) visit.
+
+    Playwright extra_http_headers override the click-through Referer, so a
+    bounce context that still carries EXTRA_HEADERS would send Google on
+    every retry — including x.com.
+    """
+    if not bounce:
+        return dict(EXTRA_HEADERS)
+    return {k: v for k, v in EXTRA_HEADERS.items() if k.lower() != "referer"}
+
+
+def bounce_origins_for(*urls: str) -> tuple[str, ...]:
+    """Retry origins whose host is not the article. You cannot bounce a site off itself."""
+    skip = {_host(u) for u in urls if u}
+    skip.discard("")
+    return tuple(origin for origin in REFERRER_BOUNCE_RETRY_ORIGINS if _host(origin) not in skip)
+
+
+def intercept_bounce_host(req_url: str, bounce_origin: str | None, *, landed: bool) -> bool:
+    """Stub/abort the bounce host only until the click-through starts."""
+    if not bounce_origin or landed:
+        return False
+    return _host(req_url) == _host(bounce_origin)
+
+
 def _richer_article(candidate: dict, current: dict) -> bool:
+    # Word-count-only win is safe only while paywalled ⇔ word_count < 80
+    # (article_is_paywalled). Prefer not-paywalled if that invariant diverges.
+    if candidate.get("paywalled") is False and current.get("paywalled") is True:
+        return True
+    if candidate.get("paywalled") is True and current.get("paywalled") is False:
+        return False
     return (candidate.get("word_count") or 0) > (current.get("word_count") or 0)
 
 
@@ -362,7 +394,7 @@ async def _settle_page(page) -> None:
     await page.wait_for_timeout(100)
 
 
-async def _goto_article(page, url: str, bounce_origin: str | None):
+async def _goto_article(page, url: str, bounce_origin: str | None, *, on_bounce_landed=None):
     """Land on the article.
 
     A direct ``page.goto`` is an address-bar navigation (``Sec-Fetch-Site:
@@ -375,6 +407,8 @@ async def _goto_article(page, url: str, bounce_origin: str | None):
         return await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     origin = require_bounce_origin(bounce_origin)
     await page.goto(origin, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    if on_bounce_landed is not None:
+        on_bounce_landed()
     await page.evaluate(
         """(href) => {
           let a = document.getElementById('amber-bounce');
@@ -411,7 +445,7 @@ async def _capture_visit(
         locale="en-US",
         java_script_enabled=True,
         bypass_csp=True,
-        extra_http_headers=EXTRA_HEADERS,
+        extra_http_headers=extra_headers_for_visit(bounce=bounce_origin is not None),
     )
     await context.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -421,10 +455,15 @@ async def _capture_visit(
     resource_map: dict[str, str] = {}
     resource_bodies: dict[str, tuple[bytes, str]] = {}
     total_bytes = 0
+    bounce_landed = False
+
+    def _mark_bounce_landed() -> None:
+        nonlocal bounce_landed
+        bounce_landed = True
 
     async def on_route(route):
         req_url = route.request.url
-        if bounce_origin and _host(req_url) == _host(bounce_origin):
+        if intercept_bounce_host(req_url, bounce_origin, landed=bounce_landed):
             if route.request.resource_type == "document":
                 await route.fulfill(
                     status=200,
@@ -481,7 +520,9 @@ async def _capture_visit(
 
     log_resource(job, url=url, status=0, mime="navigation", size=0)
     try:
-        response = await _goto_article(page, url, bounce_origin)
+        response = await _goto_article(
+            page, url, bounce_origin, on_bounce_landed=_mark_bounce_landed
+        )
     except PlaywrightTimeout as exc:
         await context.close()
         raise RuntimeError(f"Timed out loading {url}") from exc
@@ -569,7 +610,7 @@ async def run_job(job_id: str) -> None:
                 visit.article = article
 
             if article.get("paywalled"):
-                for origin in REFERRER_BOUNCE_RETRY_ORIGINS:
+                for origin in bounce_origins_for(url, visit.final_url):
                     retried = True
                     try:
                         attempt = await _capture_visit(
