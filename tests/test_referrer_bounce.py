@@ -7,7 +7,11 @@ from app.capture import (
     _richer_article,
     require_bounce_origin,
 )
-from app.config import REFERRER_BOUNCE_ORIGINS, referrer_is_allowlisted
+from app.config import (
+    REFERRER_BOUNCE_ORIGINS,
+    REFERRER_BOUNCE_RETRY_ORIGINS,
+    referrer_is_allowlisted,
+)
 from app.extract import PAYWALL_WORD_LIMIT, extract_article
 
 from tests.test_e2e_metered_paywall import FULL_ARTICLE_HTML, TEASER_ARTICLE_HTML
@@ -24,6 +28,12 @@ def test_allowlist_accepts_google_news_and_x():
         "https://x.com/",
         "https://t.co/",
     }
+    assert REFERRER_BOUNCE_RETRY_ORIGINS == (
+        "https://www.google.com/",
+        "https://x.com/",
+    )
+    for origin in REFERRER_BOUNCE_RETRY_ORIGINS:
+        assert origin in REFERRER_BOUNCE_ORIGINS
 
 
 def test_allowlist_rejects_lookalikes_and_user_urls():

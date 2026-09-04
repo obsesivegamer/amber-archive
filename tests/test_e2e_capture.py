@@ -29,10 +29,17 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div id="paywall" class="paywall">Subscribe to continue</div>
-  <article>
+    <article>
     <h1>City Council Approves Bridge</h1>
     <p>The city council voted last night to fund a new bridge over the river.</p>
     <p>Construction starts in May after a decade of debate among residents.</p>
+    <p>Opponents said the money should have gone to buses and safer crossings
+    near the school. Supporters answered that freight already clogs the old
+    span every morning, and that another winter of patching the deck would
+    cost more than starting over. The mayor called the vote a compromise.</p>
+    <p>Work crews will close one lane of River Street while they set the
+    piers. Local shops asked for weekend access and a printed map of detours.
+    The council promised both, plus a public meeting before the first pour.</p>
     <img src="/hero.png" alt="bridge">
     <a href="javascript:alert(1)">bad</a>
     <form action="/login"><input name="password"><button>send</button></form>
@@ -129,6 +136,12 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
 
         text = client.get(f"/{sid}/text", follow_redirects=True)
         assert text.status_code == 200
+
+        from app import db
+
+        meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta.get("referrer_retried") is False
+        assert meta.get("referrer_bounce") is None
 
 
 

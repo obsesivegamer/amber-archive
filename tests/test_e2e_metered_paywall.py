@@ -88,11 +88,11 @@ FULL_STORY_INNER = """
       would speed sanctions and make crisis statements less muddled.</p>
 """
 
-# Piano-like: static HTML is always the teaser. JS unlocks the full copy
-# only when document.referrer is an allowlisted Google/X origin and the
-# meter cookie is unset. Server-side, a Google/X Referer unlocks the same
-# full copy only on a cross-site navigation (a real bounce). extra_http_headers
-# Referer plus a direct goto stays a teaser — that is the Chromium bug.
+# Piano-like: the full copy is only in the response when the request is a
+# real cross-site navigation (Sec-Fetch-Site: cross-site) with a Google/X
+# Referer and no meter cookie. extra_http_headers / page.goto(referer=)
+# can fill document.referrer here, but those stay Sec-Fetch-Site: none
+# (typed URL) and still get the teaser.
 _PAGE = """<!doctype html>
 <html>
 <head>
@@ -103,6 +103,7 @@ _PAGE = """<!doctype html>
   <meta property="og:description" content="Commission diplomats said the plan would strip the service of its role.">
   <meta name="author" content="Nicholas Vinocur">
   <meta name="amber-http-referer" content="{referer}">
+  <meta name="amber-fetch-site" content="{fetch_site}">
 </head>
 <body>
   <article>
@@ -111,28 +112,20 @@ _PAGE = """<!doctype html>
   </article>
   <script>
   (function () {{
-    var granted = false;
-    try {{
-      var host = (new URL(document.referrer)).hostname;
-      granted = (
-        host === 'www.google.com' ||
-        host === 'news.google.com' ||
-        host === 'x.com' ||
-        host === 't.co'
-      );
-    }} catch (e) {{
-      granted = false;
-    }}
     var used = /(?:^|;\\s*)meter=used(?:;|$)/.test(document.cookie);
-    if ({js_unlock} && granted && !used) {{
+    if ({js_unlock} && {granted} && !used) {{
       document.getElementById('story').innerHTML = {full_js};
-    }} else {{
+    }} else if (!{granted}) {{
       document.cookie = 'meter=used; path=/';
     }}
     var marker = document.createElement('p');
     marker.id = 'amber-referrer';
     marker.textContent = document.referrer || 'EMPTY';
     document.body.appendChild(marker);
+    var site = document.createElement('p');
+    site.id = 'amber-fetch-site';
+    site.textContent = {fetch_site_js};
+    document.body.appendChild(site);
   }})();
   </script>
 </body>
@@ -140,7 +133,7 @@ _PAGE = """<!doctype html>
 """
 
 
-def _page(referer: str, *, locked: bool, grant_server: bool) -> bytes:
+def _page(referer: str, fetch_site: str, *, locked: bool, grant_server: bool) -> bytes:
     if grant_server and not locked:
         story = FULL_STORY_INNER
     else:
@@ -150,9 +143,12 @@ def _page(referer: str, *, locked: bool, grant_server: bool) -> bytes:
         )
     html = _PAGE.format(
         referer=referer.replace('"', ""),
+        fetch_site=fetch_site.replace('"', ""),
         story=story,
         js_unlock="false" if locked else "true",
+        granted="true" if grant_server and not locked else "false",
         full_js=repr(FULL_STORY_INNER),
+        fetch_site_js=repr(fetch_site or "EMPTY"),
     )
     return html.encode()
 
@@ -189,7 +185,12 @@ class Handler(BaseHTTPRequestHandler):
                 "document.referrer||'EMPTY';</script></body></html>"
             ).encode()
         else:
-            body = _page(_State.last_referer, locked=locked, grant_server=grant_server)
+            body = _page(
+                _State.last_referer,
+                _State.last_fetch_site,
+                locked=locked,
+                grant_server=grant_server,
+            )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -225,13 +226,16 @@ def _wait_complete(client: TestClient, sid: str, seconds: int = 180) -> dict:
 
 async def _fulfill_google_bounce(page) -> None:
     async def on_route(route):
-        if "www.google.com" in route.request.url and route.request.resource_type == "document":
-            await route.fulfill(
-                status=200,
-                content_type="text/html; charset=utf-8",
-                body=BOUNCE_STUB_HTML,
-                headers={"Referrer-Policy": "origin"},
-            )
+        if "www.google.com" in route.request.url:
+            if route.request.resource_type == "document":
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html; charset=utf-8",
+                    body=BOUNCE_STUB_HTML,
+                    headers={"Referrer-Policy": "origin"},
+                )
+                return
+            await route.abort()
             return
         await route.continue_()
 
@@ -263,13 +267,16 @@ async def _playwright_referrer(
         return text, story
 
 
-def test_extra_http_headers_referer_leaves_document_referrer_empty(metered_site):
+def test_extra_http_headers_referer_does_not_unlock_metered_article(metered_site):
+    """Direct goto may carry EXTRA_HEADERS Referer; Piano still wants a bounce."""
     referrer, story = asyncio.run(_playwright_referrer(f"{metered_site}/article", bounce=False))
-    assert referrer == "EMPTY"
     assert METERED_FULL_TOKEN not in story
+    # This Chromium copies extra_http_headers into document.referrer; that
+    # alone must not be enough (the capture retry is the bounce click).
+    assert referrer in {"EMPTY", "https://www.google.com/"}
 
 
-def test_bounce_plus_goto_referer_sets_document_referrer(metered_site):
+def test_bounce_click_unlocks_metered_article(metered_site):
     referrer, story = asyncio.run(_playwright_referrer(f"{metered_site}/article", bounce=True))
     assert referrer.startswith("https://www.google.com")
     assert METERED_FULL_TOKEN in story
@@ -320,7 +327,7 @@ def test_capture_retries_metered_paywall_and_keeps_full_article(
 
 def test_capture_hard_paywall_stays_incomplete(tmp_data, allow_private, metered_site, monkeypatch):
     monkeypatch.setattr(
-        "app.capture.REFERRER_BOUNCE_ORIGINS",
+        "app.capture.REFERRER_BOUNCE_RETRY_ORIGINS",
         ("https://www.google.com/",),
     )
     from app.main import app

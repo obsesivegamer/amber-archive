@@ -25,6 +25,7 @@ from .config import (
     NAV_TIMEOUT_MS,
     NETWORK_IDLE_MS,
     REFERRER_BOUNCE_ORIGINS,
+    REFERRER_BOUNCE_RETRY_ORIGINS,
     RENDER_WAIT_MS,
     USER_AGENT,
     VIEWPORT,
@@ -317,7 +318,6 @@ class _Visit:
     page: Any
     context: Any
     bounce_origin: str | None = None
-    document_referrer: str = ""
 
     async def close(self) -> None:
         try:
@@ -363,17 +363,36 @@ async def _settle_page(page) -> None:
 
 
 async def _goto_article(page, url: str, bounce_origin: str | None):
-    """Land on the article. Bounce visits set document.referrer; direct visits do not."""
+    """Land on the article.
+
+    A direct ``page.goto`` is an address-bar navigation (``Sec-Fetch-Site:
+    none``). Chromium may still attach EXTRA_HEADERS Referer and fill
+    ``document.referrer``, but Piano-style meters treat that as a typed URL.
+    A bounce lands on an allowlisted origin, then clicks through so the
+    article request is a real cross-site navigation with that referrer.
+    """
     if bounce_origin is None:
         return await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     origin = require_bounce_origin(bounce_origin)
     await page.goto(origin, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    return await page.goto(
+    await page.evaluate(
+        """(href) => {
+          let a = document.getElementById('amber-bounce');
+          if (!a) {
+            a = document.createElement('a');
+            a.id = 'amber-bounce';
+            document.body.appendChild(a);
+          }
+          a.setAttribute('href', href);
+          a.textContent = 'continue';
+        }""",
         url,
-        wait_until="domcontentloaded",
-        timeout=NAV_TIMEOUT_MS,
-        referer=origin,
     )
+    async with page.expect_navigation(
+        wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+    ) as info:
+        await page.click("#amber-bounce")
+    return await info.value
 
 
 async def _capture_visit(
@@ -479,10 +498,6 @@ async def _capture_visit(
 
     title = await page.title()
     html = await page.content()
-    try:
-        document_referrer = await page.evaluate("() => document.referrer || ''")
-    except Exception:
-        document_referrer = ""
     article = extract_article(html, final_url)
     return _Visit(
         html=html,
@@ -495,7 +510,6 @@ async def _capture_visit(
         page=page,
         context=context,
         bounce_origin=bounce_origin,
-        document_referrer=document_referrer,
     )
 
 
@@ -555,7 +569,7 @@ async def run_job(job_id: str) -> None:
                 visit.article = article
 
             if article.get("paywalled"):
-                for origin in REFERRER_BOUNCE_ORIGINS:
+                for origin in REFERRER_BOUNCE_RETRY_ORIGINS:
                     retried = True
                     try:
                         attempt = await _capture_visit(
