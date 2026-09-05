@@ -27,6 +27,19 @@ _RECIRC_SELECTORS = (
     "aside",
 )
 
+# Non-body modules inside <article>. Used only on the article-dump fallback
+# so comments / promo / footer cannot inflate the score past PAYWALL_WORD_LIMIT
+# and suppress the bounce retry. Not added to _RECIRC_SELECTORS (readability
+# already drops most of these; widening that list is a separate, tested change).
+_ARTICLE_CHROME_SELECTORS = (
+    ".comments",
+    ".reader-comments",
+    ".promo",
+    "footer",
+    ".footer",
+    ".related-stories",
+)
+
 
 def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
@@ -51,11 +64,30 @@ def _without_recirc(soup: BeautifulSoup) -> BeautifulSoup:
     return clone
 
 
+def _strip_selectors(soup: BeautifulSoup, selectors: tuple[str, ...]) -> None:
+    for sel in selectors:
+        for el in soup.select(sel):
+            el.decompose()
+
+
+def _outer_article_content(host: BeautifulSoup) -> list:
+    """`.article__content` roots that are not nested in another match.
+
+    ``select`` returns parent and child; joining both double-counts the same
+    prose (a 52-word teaser becomes 104 and looks complete).
+    """
+    nodes = host.select(".article__content")
+    chosen = set(nodes)
+    return [node for node in nodes if not any(parent in chosen for parent in node.parents)]
+
+
 def _from_article_dom(soup: BeautifulSoup) -> str:
-    """The page's own article body, after recirc cards are gone.
+    """The page's own article body, after recirc and non-body modules are gone.
 
     Score by non-anchor words so a link-dense ``<article>`` shell (Most read,
-    related headlines) cannot out-count readability's filtered pick.
+    related headlines) cannot out-count readability's filtered pick. Comments,
+    promo, footer, and related-stories are stripped before that score so they
+    cannot make a teaser look complete.
     """
     hosts: list = []
     hosts.extend(soup.find_all(attrs={"itemprop": "articleBody"}))
@@ -69,8 +101,9 @@ def _from_article_dom(soup: BeautifulSoup) -> str:
             continue
         seen.add(marker)
         clone = BeautifulSoup(str(host), "lxml")
-        chunks = clone.select(".article__content")
-        html = "".join(str(c) for c in chunks) if chunks else str(clone.body or clone)
+        _strip_selectors(clone, _ARTICLE_CHROME_SELECTORS)
+        roots = _outer_article_content(clone)
+        html = "".join(str(c) for c in roots) if roots else str(clone.body or clone)
         n = _html_word_count(html, exclude_anchors=True)
         if n > best_n:
             best, best_n = html, n

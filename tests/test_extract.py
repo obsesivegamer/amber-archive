@@ -237,3 +237,92 @@ def test_teaser_plus_link_dense_list_stays_paywalled():
     assert got["word_count"] < 80
     assert FULL_ARTICLE_TOKEN not in got["article_text"]
     assert "Most read headline number 0" not in got["article_text"]
+
+
+COMMENT_BODY = (
+    "Reader comment {i} about the diplomats and the reform plan that should "
+    "not count as article body copy at all."
+)
+
+
+def _teaser_plus_module(class_name: str) -> str:
+    comments = " ".join(COMMENT_BODY.format(i=i) for i in range(8))
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>Subscribe to continue reading this piece about the diplomatic service overhaul.</p>
+    <div class="{class_name}">
+      <h2>Comments</h2>
+      <p>{comments}</p>
+    </div>
+  </article>
+</body>
+</html>
+"""
+
+
+def test_teaser_plus_reader_comments_stays_paywalled():
+    """Whole-`<article>` fallback must not count comments as body copy.
+
+    On main, readability keeps the teaser (~56 words) so bounce can fire.
+    Counting every non-anchor word in `<article>` stored the comments and
+    skipped the bounce (Astra: 155 words / not paywalled).
+    """
+    for class_name in (
+        "comments",
+        "reader-comments",
+        "promo",
+        "footer",
+        "related-stories",
+    ):
+        got = extract_article(
+            _teaser_plus_module(class_name), "https://daily.test/locked"
+        )
+        assert got["paywalled"] is True, class_name
+        assert got["word_count"] < 80, (class_name, got["word_count"])
+        assert "Reader comment 0" not in got["article_text"], class_name
+        assert FULL_ARTICLE_TOKEN not in got["article_text"]
+
+
+NESTED_TEASER = (
+    "Subscribe to continue reading this piece about the diplomatic service "
+    "overhaul after capitals pushed back on the draft this autumn. Officials "
+    "said the rewrite would move desk officers into the Commission and leave "
+    "only a thin coordination layer across from the roundabout this week after "
+    "the ambassadors met in the building near the square."
+)
+
+
+def test_nested_article_content_does_not_double_count():
+    """Parent + child `.article__content` must not join the same prose twice."""
+    assert 50 <= len(NESTED_TEASER.split()) < 80
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <div class="article__content">
+      <div class="article__content">
+        <p>{NESTED_TEASER}</p>
+      </div>
+    </div>
+  </article>
+</body>
+</html>
+"""
+    got = extract_article(html, "https://daily.test/locked")
+    text = got["article_text"] or ""
+    assert text.count("Subscribe to continue") <= 1
+    assert got["paywalled"] is True
+    assert got["word_count"] < 80
+    assert got["word_count"] < 2 * len(NESTED_TEASER.split())
