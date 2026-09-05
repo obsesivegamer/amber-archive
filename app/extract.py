@@ -77,7 +77,8 @@ def _is_unlikely_chrome(elem) -> bool:
     Exact-token `_ARTICLE_CHROME_SELECTORS` miss `id="comments"`,
     `comment-list`, `sponsored`, `sidebar`. Those stay in the dump, beat
     the teaser, and skip bounce. Keep nodes readability would keep
-    (`okMaybeItsACandidateRe`, or they wrap ``article`` / ``main``).
+    (`okMaybeItsACandidateRe`). Do not spare wrappers just because they
+    contain ``article`` / ``main`` — WordPress comments use that shape.
     """
     name = getattr(elem, "name", None)
     if not name or name in {"html", "body", "[document]", "article"}:
@@ -91,8 +92,6 @@ def _is_unlikely_chrome(elem) -> bool:
     if not _READABILITY_REGEXES["unlikelyCandidatesRe"].search(s):
         return False
     if _READABILITY_REGEXES["okMaybeItsACandidateRe"].search(s):
-        return False
-    if elem.find(["article", "main"]):
         return False
     return True
 

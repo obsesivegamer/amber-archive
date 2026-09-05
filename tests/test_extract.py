@@ -510,3 +510,62 @@ def test_id_comments_and_substring_chrome_stay_paywalled():
         assert got["paywalled"] is True, open_tag
         assert got["word_count"] < 80, (open_tag, got["word_count"])
         assert "Sponsor blurb 0" not in got["article_text"], open_tag
+
+
+def _wp_comment_articles() -> str:
+    """WordPress wraps each comment in `<article class="comment-body">`."""
+    return (
+        '<ol class="comment-list">'
+        f'<li class="comment"><article class="comment-body"><p>{SPONSOR_FILLER}</p></article></li>'
+        "</ol>"
+    )
+
+
+def _teaser_page(body: str) -> str:
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def test_wp_comment_articles_inside_unlikely_chrome_stay_paywalled():
+    """Unlikely chrome that wraps `<article>` / `<main>` must still be dropped.
+
+    `_is_unlikely_chrome` used to spare those wrappers (an escape
+    readability-lxml does not have). WordPress comments then survived,
+    beat the teaser, and skipped bounce (Fable: Complete with junk;
+    main ~57 / paywalled).
+    """
+    comments = _wp_comment_articles()
+    promo = f'<article class="promo-card"><p>{SPONSOR_FILLER}</p></article>'
+    shapes = {
+        "nested": _teaser_page(
+            f"<article><h1>Locked teaser only</h1><p>{NESTED_TEASER}</p>"
+            f'<div id="comments">{comments}</div></article>'
+        ),
+        "sibling": _teaser_page(
+            f"<article><h1>Locked teaser only</h1><p>{NESTED_TEASER}</p></article>"
+            f'<div id="comments">{comments}</div>'
+        ),
+        "sidebar": _teaser_page(
+            f"<article><h1>Locked teaser only</h1><p>{NESTED_TEASER}</p></article>"
+            f'<div class="sidebar">{promo}{promo}</div>'
+        ),
+        "wraps-main": _teaser_page(
+            f"<article><h1>Locked teaser only</h1><p>{NESTED_TEASER}</p>"
+            f'<div id="comments"><main><p>{SPONSOR_FILLER}</p></main></div></article>'
+        ),
+    }
+    for name, html in shapes.items():
+        got = extract_article(html, "https://daily.test/locked")
+        assert got["paywalled"] is True, name
+        assert got["word_count"] < 80, (name, got["word_count"])
+        assert "Sponsor blurb 0" not in got["article_text"], name
+        assert FULL_ARTICLE_TOKEN not in got["article_text"], name
