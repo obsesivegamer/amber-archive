@@ -101,8 +101,15 @@ def _from_article_dom(soup: BeautifulSoup) -> str:
             continue
         seen.add(marker)
         clone = BeautifulSoup(str(host), "lxml")
+        had_content_roots = bool(_outer_article_content(clone))
         _strip_selectors(clone, _ARTICLE_CHROME_SELECTORS)
         roots = _outer_article_content(clone)
+        if had_content_roots and not roots:
+            # Chrome strip ate every content root (nested in <footer>, or
+            # classed "article__content comments"). Do not widen to the
+            # whole <article> — that reintroduces off-list junk the roots
+            # had excluded and can flip a teaser to Complete.
+            continue
         html = "".join(str(c) for c in roots) if roots else str(clone.body or clone)
         n = _html_word_count(html, exclude_anchors=True)
         if n > best_n:

@@ -326,3 +326,86 @@ def test_nested_article_content_does_not_double_count():
     assert got["paywalled"] is True
     assert got["word_count"] < 80
     assert got["word_count"] < 2 * len(NESTED_TEASER.split())
+
+
+SPONSOR_FILLER = " ".join(
+    f"Sponsor blurb {i} promoting an unrelated product that is not the article "
+    f"body and must not count toward the extract word count at all today."
+    for i in range(12)
+)
+
+
+def _teaser_content_root_then_sponsor(*, wrap_in_footer: bool, extra_class: str = "") -> str:
+    cls = "article__content" + (f" {extra_class}" if extra_class else "")
+    content = f'<div class="{cls}"><p>{NESTED_TEASER}</p></div>'
+    if wrap_in_footer:
+        content = f"<footer>{content}</footer>"
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>Subscribe to continue reading this piece.</p>
+    {content}
+    <div class="sponsor-rail">{SPONSOR_FILLER}</div>
+  </article>
+</body>
+</html>
+"""
+
+
+def test_stripped_content_root_does_not_widen_to_whole_article():
+    """If chrome strip removes every `.article__content`, do not dump `<article>`.
+
+    At 9a85147 a 52-word teaser nested in `<footer>` (or classed
+    `article__content comments`) left `roots` empty, so the fallback counted
+    off-list sponsor filler and flipped Complete (~282 words). Main and
+    703e71e stayed paywalled because they scoped to the content root.
+    """
+    assert len(SPONSOR_FILLER.split()) >= 200
+    for html in (
+        _teaser_content_root_then_sponsor(wrap_in_footer=True),
+        _teaser_content_root_then_sponsor(wrap_in_footer=False, extra_class="comments"),
+    ):
+        got = extract_article(html, "https://daily.test/locked")
+        assert got["paywalled"] is True
+        assert got["word_count"] < 80
+        assert "Sponsor blurb 0" not in got["article_text"]
+        assert FULL_ARTICLE_TOKEN not in got["article_text"]
+
+
+def test_surviving_content_root_still_beats_stripped_sibling():
+    """A live `.article__content` sibling must still win after footer chrome dies."""
+    body = (
+        f"<p>{FULL_ARTICLE_TOKEN} The chief diplomat is leading a fierce "
+        "behind-the-scenes push against plans to overhaul the diplomatic "
+        "service, courting capitals and using a new secretary-general to "
+        "develop alternative reform plans that keep the service intact for "
+        "smaller member states that depend on a shared desk for every joint "
+        "statement on foreign policy this autumn after the ambassadors met.</p>"
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Inside the fightback">
+  <meta property="og:site_name" content="Daily Test">
+</head>
+<body>
+  <article>
+    <h1>Inside the fightback</h1>
+    <div class="article__content">{body}</div>
+    <footer>
+      <div class="article__content"><p>{NESTED_TEASER}</p></div>
+    </footer>
+  </article>
+</body>
+</html>
+"""
+    got = extract_article(html, "https://daily.test/kallas")
+    assert FULL_ARTICLE_TOKEN in got["article_text"]
+    assert got["paywalled"] is False
+    assert got["word_count"] >= 80
