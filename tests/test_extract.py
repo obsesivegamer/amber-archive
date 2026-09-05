@@ -409,3 +409,61 @@ def test_surviving_content_root_still_beats_stripped_sibling():
     assert FULL_ARTICLE_TOKEN in got["article_text"]
     assert got["paywalled"] is False
     assert got["word_count"] >= 80
+
+
+def _outer_teaser_plus_nested_article(wrapper_open: str, wrapper_close: str, inner: str) -> str:
+    """Fable P4 shape: teaser on the outer article; filler only in a nested `<article>`."""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>{NESTED_TEASER}</p>
+    {wrapper_open}
+      <article>{inner}</article>
+    {wrapper_close}
+  </article>
+</body>
+</html>
+"""
+
+
+def test_nested_article_in_footer_or_comments_stays_paywalled():
+    """An inner `<article>` inside chrome must not re-enter as its own host.
+
+    P3 drops that chrome from the outer host, then `find_all("article")`
+    clones the inner node in isolation — nothing left to strip — so
+    sponsor filler becomes the extract (Fable: ~300 / Complete; main ~54).
+    """
+    inner = f"<p>{SPONSOR_FILLER}</p>"
+    for html in (
+        _outer_teaser_plus_nested_article("<footer>", "</footer>", inner),
+        _outer_teaser_plus_nested_article('<div class="comments">', "</div>", inner),
+    ):
+        got = extract_article(html, "https://daily.test/locked")
+        assert got["paywalled"] is True
+        assert got["word_count"] < 80
+        assert "Sponsor blurb 0" not in got["article_text"]
+        assert FULL_ARTICLE_TOKEN not in got["article_text"]
+
+
+def test_comment_article_inside_comments_section_stays_paywalled():
+    """`<section class="comments"><article>` with an 80+ word comment stays a teaser."""
+    comment = " ".join(
+        f"Reader remark {i} about an unrelated diplomatic fight that is not the story."
+        for i in range(10)
+    )
+    assert len(comment.split()) >= 80
+    html = _outer_teaser_plus_nested_article(
+        '<section class="comments">',
+        "</section>",
+        f"<p>{comment}</p>",
+    )
+    got = extract_article(html, "https://daily.test/locked")
+    assert got["paywalled"] is True
+    assert got["word_count"] < 80
+    assert "Reader remark 0" not in got["article_text"]

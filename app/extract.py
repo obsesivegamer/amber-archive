@@ -81,21 +81,44 @@ def _outer_article_content(host: BeautifulSoup) -> list:
     return [node for node in nodes if not any(parent in chosen for parent in node.parents)]
 
 
+def _outer_hosts(nodes: list) -> list:
+    """Keep outermost article hosts so a nested chrome `<article>` cannot re-enter."""
+    chosen = set(nodes)
+    return [node for node in nodes if not any(parent in chosen for parent in node.parents)]
+
+
+def _chrome_boxes(soup: BeautifulSoup) -> set:
+    boxes: set = set()
+    for sel in _ARTICLE_CHROME_SELECTORS + _RECIRC_SELECTORS:
+        boxes.update(soup.select(sel))
+    return boxes
+
+
+def _host_inside_chrome(host, boxes: set) -> bool:
+    return any(parent in boxes for parent in host.parents)
+
+
 def _from_article_dom(soup: BeautifulSoup) -> str:
     """The page's own article body, after recirc and non-body modules are gone.
 
     Score by non-anchor words so a link-dense ``<article>`` shell (Most read,
     related headlines) cannot out-count readability's filtered pick. Comments,
     promo, footer, and related-stories are stripped before that score so they
-    cannot make a teaser look complete.
+    cannot make a teaser look complete. Nested ``<article>`` hosts inside that
+    chrome are skipped — P3 already drops them from the outer clone, but
+    ``find_all("article")`` would otherwise clone them in isolation.
     """
     hosts: list = []
     hosts.extend(soup.find_all(attrs={"itemprop": "articleBody"}))
     hosts.extend(soup.find_all("article"))
+    hosts = _outer_hosts(hosts)
+    chrome = _chrome_boxes(soup)
     best = ""
     best_n = 0
     seen: set[int] = set()
     for host in hosts:
+        if _host_inside_chrome(host, chrome):
+            continue
         marker = id(host)
         if marker in seen:
             continue
