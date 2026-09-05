@@ -1,4 +1,14 @@
+from pathlib import Path
+
+from readability import Document
+from bs4 import BeautifulSoup
+
 from app.extract import extract_article
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+POLITICO_RELATED_CARD = (FIXTURES / "politico_related_card.html").read_text(encoding="utf-8")
+FULL_ARTICLE_TOKEN = "TOKEN_FULL_ARTICLE"
+CARD_TEASER_TOKEN = "CARD_TEASER_TOKEN"
 
 NEWS = """
 <!doctype html>
@@ -130,3 +140,57 @@ def test_react_article_uses_free_blurb_not_short_og():
         "Elon Musk has shaken up the SpaceX team building data centers.".split()
     )
     assert got["paywalled"] is False
+
+
+def test_readability_prefers_related_card_on_politico_shaped_html():
+    """Bounce cannot fix this: the full copy is already in `.article__content`.
+
+    readability-lxml picks a recirc card teaser on Politico-shaped chrome
+    (sidebar-grid + article-card). Live Politico.eu snapshot qHFCB stored that
+    30-word card as Incomplete even after a Google bounce retry. A second
+    visit with an allowlisted Referer yields the same HTML and the same miss.
+    """
+    summary = Document(POLITICO_RELATED_CARD).summary(html_partial=True) or ""
+    read = BeautifulSoup(summary, "lxml").get_text(" ", strip=True)
+    assert CARD_TEASER_TOKEN in read
+    assert FULL_ARTICLE_TOKEN not in read
+
+
+def test_extract_uses_article_body_not_related_card():
+    got = extract_article(POLITICO_RELATED_CARD, "https://daily.test/kallas")
+    assert FULL_ARTICLE_TOKEN in got["article_text"]
+    assert got["paywalled"] is False
+    assert got["word_count"] >= 80
+    assert got["title"].startswith("Inside the fightback")
+    assert got["site_name"] == "Daily Test"
+    assert got["author"] == "Jane Reporter"
+
+
+def test_teaser_plus_related_cards_stays_paywalled():
+    """Safety: recirc cards must not inflate a true teaser past the paywall bit."""
+    cards = "\n".join(
+        f'<div class="article-card"><div class="card__excerpt">'
+        f"<p>{CARD_TEASER_TOKEN} Related blurb {i} about a different story "
+        f"that is long enough to look like body copy if cards are counted.</p>"
+        f"</div></div>"
+        for i in range(8)
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>Subscribe to continue reading this piece.</p>
+    <div class="content-listing">{cards}</div>
+  </article>
+</body>
+</html>
+"""
+    got = extract_article(html, "https://daily.test/locked")
+    assert got["paywalled"] is True
+    assert FULL_ARTICLE_TOKEN not in got["article_text"]
+    assert got["word_count"] < 80

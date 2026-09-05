@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -142,6 +143,67 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         meta = db.read_json(db.snap_dir(sid) / "meta.json")
         assert meta.get("referrer_retried") is False
         assert meta.get("referrer_bounce") is None
+
+
+POLITICO_SHAPED = (
+    Path(__file__).resolve().parent / "fixtures" / "politico_related_card.html"
+).read_text(encoding="utf-8")
+
+
+class PoliticoHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body, ctype = POLITICO_SHAPED.encode(), "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def politico_shaped_site():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PoliticoHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    yield f"http://{host}:{port}/article"
+    server.shutdown()
+
+
+def test_capture_keeps_article_body_not_related_card(
+    tmp_data, allow_private, politico_shaped_site
+):
+    """PR #3 bounce is not the unlock: this HTML is already the full article.
+
+    readability prefers the recirc card. Capture must store the article body
+    anyway, without a bounce retry, and must not mark that card as complete.
+    """
+    from app.main import app
+    from app import db
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/save", data={"url": politico_shaped_site}, follow_redirects=False
+        )
+        assert r.status_code == 303
+        sid = r.headers["location"].rsplit("/", 1)[-1]
+        _wait_complete(client, sid)
+
+        text = (db.snap_dir(sid) / "article.txt").read_text(encoding="utf-8")
+        assert "TOKEN_FULL_ARTICLE" in text
+        snap = db.get_snapshot(sid)
+        assert snap["paywalled"] is False
+        assert snap["word_count"] >= 80
+        meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta.get("referrer_retried") is False
+        assert meta.get("referrer_bounce") is None
+        reader = client.get(f"/{sid}/reader")
+        assert reader.status_code == 200
+        assert "TOKEN_FULL_ARTICLE" in reader.text
+        assert "paywalled teaser" not in reader.text
 
 
 

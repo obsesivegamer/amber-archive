@@ -16,9 +16,67 @@ _WS = re.compile(r"\s+")
 # the snapshot row so lists and the viewer can stay honest.
 PAYWALL_WORD_LIMIT = 80
 
+# Recirc / related-story chrome. readability-lxml will pick a single
+# article-card excerpt (live Politico: 30 words, then Incomplete) or the
+# whole "readers read next" listing. Bounce cannot fix that — the full
+# copy is already in the article body. Strip these before scoring.
+_RECIRC_SELECTORS = (
+    ".article-card",
+    "[class*='article-card']",
+    ".content-listing",
+    "aside",
+)
+
 
 def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
+
+
+def _html_word_count(html: str) -> int:
+    if not html:
+        return 0
+    text = _WS.sub(" ", BeautifulSoup(html, "lxml").get_text(" ", strip=True)).strip()
+    return len([w for w in re.split(r"\s+", text) if w])
+
+
+def _without_recirc(soup: BeautifulSoup) -> BeautifulSoup:
+    clone = BeautifulSoup(str(soup), "lxml")
+    for sel in _RECIRC_SELECTORS:
+        for el in clone.select(sel):
+            el.decompose()
+    return clone
+
+
+def _from_article_dom(soup: BeautifulSoup) -> str:
+    """The page's own article body, after recirc cards are gone."""
+    hosts: list = []
+    hosts.extend(soup.find_all(attrs={"itemprop": "articleBody"}))
+    hosts.extend(soup.find_all("article"))
+    best = ""
+    best_n = 0
+    seen: set[int] = set()
+    for host in hosts:
+        marker = id(host)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        clone = BeautifulSoup(str(host), "lxml")
+        chunks = clone.select(".article__content")
+        html = "".join(str(c) for c in chunks) if chunks else str(clone.body or clone)
+        n = _html_word_count(html)
+        if n > best_n:
+            best, best_n = html, n
+    return best
+
+
+def _prefer_richer_html(*candidates: str) -> str:
+    best = ""
+    best_n = 0
+    for html in candidates:
+        n = _html_word_count(html)
+        if n > best_n:
+            best, best_n = html, n
+    return best
 
 
 def _text(value: Any) -> str | None:
@@ -295,15 +353,18 @@ def extract_article(html: str, url: str) -> dict:
     article_html = rails.get("article_html") or nxt.get("article_html") or ""
     article_text = ""
     if not article_html:
+        body_soup = _without_recirc(soup)
+        readability_html = ""
         try:
-            doc = Document(html)
-            article_html = doc.summary(html_partial=True) or ""
+            doc = Document(str(body_soup))
+            readability_html = doc.summary(html_partial=True) or ""
             if not title:
                 title = _text(doc.short_title() or doc.title())
         except Exception:
-            article = soup.find("article") or soup.find(attrs={"itemprop": "articleBody"})
-            if article:
-                article_html = str(article)
+            readability_html = ""
+        article_html = _prefer_richer_html(
+            readability_html, _from_article_dom(body_soup)
+        )
 
     if article_html:
         art = BeautifulSoup(article_html, "lxml")

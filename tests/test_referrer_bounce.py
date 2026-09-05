@@ -58,6 +58,29 @@ def test_require_bounce_origin_rejects_arbitrary_referer():
         require_bounce_origin("https://www.politico.eu/")
 
 
+def test_bounce_alone_does_not_unlock_related_card_extract():
+    """Politico-class: bounce retry of the same HTML cannot beat a bad extract.
+
+    tests/test_extract.py::test_extract_uses_article_body_not_related_card is
+    the paired unlock. If that extract test is deleted, bounce fixtures can
+    still pass while live Politico-shaped pages store a recirc card.
+    """
+    from pathlib import Path
+    from bs4 import BeautifulSoup
+    from readability import Document
+
+    html = (
+        Path(__file__).resolve().parent / "fixtures" / "politico_related_card.html"
+    ).read_text(encoding="utf-8")
+    bounced = extract_article(html, "https://daily.test/kallas")
+    read = BeautifulSoup(
+        Document(html).summary(html_partial=True) or "", "lxml"
+    ).get_text(" ", strip=True)
+    assert "TOKEN_FULL_ARTICLE" not in read
+    assert "TOKEN_FULL_ARTICLE" in bounced["article_text"]
+    assert bounced["paywalled"] is False
+
+
 def test_extract_teaser_is_paywalled_full_is_not():
     teaser = extract_article(TEASER_ARTICLE_HTML, "https://daily.test/kallas")
     full = extract_article(FULL_ARTICLE_HTML, "https://daily.test/kallas")
