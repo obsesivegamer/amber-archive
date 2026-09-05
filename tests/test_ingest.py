@@ -1,5 +1,5 @@
 from app.ingest import ingest_html, original_url_from_html
-from tests.test_extract import ARCHIVE_IS_SAVED
+from tests.test_extract import ARCHIVE_IS_SAVED, POLITICO_RELATED_CARD
 
 
 def test_original_url_skips_archive_is_saved_from_comment():
@@ -33,3 +33,17 @@ def test_ingest_saved_archive_is_article(tmp_data):
     meta = db.read_json(db.snap_dir(sid) / "meta.json")
     assert meta.get("paywalled") is True
     assert snap["paywalled"] is True
+
+
+def test_ingest_politico_shaped_keeps_article_body(tmp_data):
+    sid = ingest_html(POLITICO_RELATED_CARD, url="https://daily.test/kallas")
+    from app import db
+
+    snap = db.get_snapshot(sid)
+    text = (db.snap_dir(sid) / "article.txt").read_text(encoding="utf-8")
+    assert snap["paywalled"] is False
+    assert "TOKEN_FULL_ARTICLE" in text
+    assert snap["word_count"] >= 80
+    meta = db.read_json(db.snap_dir(sid) / "meta.json")
+    assert meta.get("imported") is True
+    assert meta.get("paywalled") is False

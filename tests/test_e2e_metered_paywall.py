@@ -138,7 +138,20 @@ _PAGE = """<!doctype html>
 """
 
 
-def _page(referer: str, fetch_site: str, *, locked: bool, grant_server: bool) -> bytes:
+_COMMENT_CHROME = (
+    '<div class="comments"><h2>Comments</h2><p>'
+    + " ".join(
+        "Reader comment {i} about the diplomats and the reform plan that should "
+        "not count as article body copy at all.".format(i=i)
+        for i in range(8)
+    )
+    + "</p></div>"
+)
+
+
+def _page(
+    referer: str, fetch_site: str, *, locked: bool, grant_server: bool, comments: bool = False
+) -> bytes:
     if grant_server and not locked:
         story = FULL_STORY_INNER
     else:
@@ -146,6 +159,8 @@ def _page(referer: str, fetch_site: str, *, locked: bool, grant_server: bool) ->
             "<p>Commission diplomats said the plan would strip the service of its role.</p>"
             "<p>Subscribe to continue reading.</p>"
         )
+        if comments:
+            story += _COMMENT_CHROME
     html = _PAGE.format(
         referer=referer.replace('"', ""),
         fetch_site=fetch_site.replace('"', ""),
@@ -198,6 +213,7 @@ class Handler(BaseHTTPRequestHandler):
                 _State.last_fetch_site,
                 locked=locked,
                 grant_server=grant_server,
+                comments=self.path.startswith("/comments"),
             )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -374,6 +390,33 @@ def test_capture_retries_metered_paywall_and_keeps_full_article(
         assert reader.status_code == 200
         assert METERED_FULL_TOKEN in reader.text
         assert "paywalled teaser" not in reader.text
+
+
+def test_capture_retries_when_teaser_has_reader_comments(
+    tmp_data, allow_private, metered_site
+):
+    """Comments inside <article> must not look complete and skip the bounce."""
+    from app.main import app
+    from app import db
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/save",
+            data={"url": f"{metered_site}/comments"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        sid = r.headers["location"].rsplit("/", 1)[-1]
+        _wait_complete(client, sid)
+
+        snap = db.get_snapshot(sid)
+        assert snap["paywalled"] is False
+        text = (db.snap_dir(sid) / "article.txt").read_text(encoding="utf-8")
+        assert METERED_FULL_TOKEN in text
+        assert "Reader comment 0" not in text
+        meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta["referrer_bounce"] == "https://www.google.com/"
+        assert meta["referrer_retried"] is True
 
 
 def test_capture_hard_paywall_stays_incomplete(tmp_data, allow_private, metered_site, monkeypatch):
