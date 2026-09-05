@@ -9,6 +9,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 from readability import Document
+from readability.readability import REGEXES as _READABILITY_REGEXES
 
 _WS = re.compile(r"\s+")
 
@@ -70,6 +71,38 @@ def _strip_selectors(soup: BeautifulSoup, selectors: tuple[str, ...]) -> None:
             el.decompose()
 
 
+def _is_unlikely_chrome(elem) -> bool:
+    """Same class+id unlikely filter readability uses before scoring.
+
+    Exact-token `_ARTICLE_CHROME_SELECTORS` miss `id="comments"`,
+    `comment-list`, `sponsored`, `sidebar`. Those stay in the dump, beat
+    the teaser, and skip bounce. Keep nodes readability would keep
+    (`okMaybeItsACandidateRe`, or they wrap ``article`` / ``main``).
+    """
+    name = getattr(elem, "name", None)
+    if not name or name in {"html", "body", "[document]", "article"}:
+        return False
+    classes = elem.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    s = "{} {}".format(" ".join(classes), elem.get("id") or "")
+    if len(s) < 2:
+        return False
+    if not _READABILITY_REGEXES["unlikelyCandidatesRe"].search(s):
+        return False
+    if _READABILITY_REGEXES["okMaybeItsACandidateRe"].search(s):
+        return False
+    if elem.find(["article", "main"]):
+        return False
+    return True
+
+
+def _strip_unlikely_chrome(soup: BeautifulSoup) -> None:
+    for el in list(soup.find_all(True)):
+        if _is_unlikely_chrome(el):
+            el.decompose()
+
+
 def _outer_article_content(host: BeautifulSoup) -> list:
     """`.article__content` roots that are not nested in another match.
 
@@ -91,6 +124,9 @@ def _chrome_boxes(soup: BeautifulSoup) -> set:
     boxes: set = set()
     for sel in _ARTICLE_CHROME_SELECTORS + _RECIRC_SELECTORS:
         boxes.update(soup.select(sel))
+    for el in soup.find_all(True):
+        if _is_unlikely_chrome(el):
+            boxes.add(el)
     return boxes
 
 
@@ -126,6 +162,7 @@ def _from_article_dom(soup: BeautifulSoup) -> str:
         clone = BeautifulSoup(str(host), "lxml")
         had_content_roots = bool(_outer_article_content(clone))
         _strip_selectors(clone, _ARTICLE_CHROME_SELECTORS)
+        _strip_unlikely_chrome(clone)
         roots = _outer_article_content(clone)
         if had_content_roots and not roots:
             # Chrome strip ate every content root (nested in <footer>, or

@@ -467,3 +467,46 @@ def test_comment_article_inside_comments_section_stays_paywalled():
     assert got["paywalled"] is True
     assert got["word_count"] < 80
     assert "Reader remark 0" not in got["article_text"]
+
+
+def _teaser_plus_unlikely_chrome(open_tag: str, close_tag: str) -> str:
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>{NESTED_TEASER}</p>
+    {open_tag}<p>{SPONSOR_FILLER}</p>{close_tag}
+  </article>
+</body>
+</html>
+"""
+
+
+def test_id_comments_and_substring_chrome_stay_paywalled():
+    """Dump path must drop chrome readability already rejects by class+id.
+
+    Exact-token `_ARTICLE_CHROME_SELECTORS` miss `id="comments"`,
+    `comment-list`, `id="footer"`, `sponsored`, `sidebar`, `commentbox`.
+    Those score ~257+ and beat the teaser (main stays ~57 / paywalled).
+    """
+    shapes = (
+        ('<div id="comments">', "</div>"),
+        ('<ol class="comment-list">', "</ol>"),
+        ('<div id="footer">', "</div>"),
+        ('<div class="sponsored">', "</div>"),
+        ('<div class="sidebar">', "</div>"),
+        ('<div class="commentbox">', "</div>"),
+    )
+    for open_tag, close_tag in shapes:
+        got = extract_article(
+            _teaser_plus_unlikely_chrome(open_tag, close_tag),
+            "https://daily.test/locked",
+        )
+        assert got["paywalled"] is True, open_tag
+        assert got["word_count"] < 80, (open_tag, got["word_count"])
+        assert "Sponsor blurb 0" not in got["article_text"], open_tag
