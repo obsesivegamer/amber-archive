@@ -167,7 +167,12 @@ def test_extract_uses_article_body_not_related_card():
 
 
 def test_teaser_plus_related_cards_stays_paywalled():
-    """Safety: recirc cards must not inflate a true teaser past the paywall bit."""
+    """Safety for the enumerated strip list only (`.article-card`, `.content-listing`).
+
+    Off-list names like `story-card` / `related-stories` can still inflate —
+    that limit is pre-existing on main (readability picks those cards too).
+    Do not widen `_RECIRC_SELECTORS` without a tight, tested reason.
+    """
     cards = "\n".join(
         f'<div class="article-card"><div class="card__excerpt">'
         f"<p>{CARD_TEASER_TOKEN} Related blurb {i} about a different story "
@@ -194,3 +199,41 @@ def test_teaser_plus_related_cards_stays_paywalled():
     assert got["paywalled"] is True
     assert FULL_ARTICLE_TOKEN not in got["article_text"]
     assert got["word_count"] < 80
+
+
+def test_teaser_plus_link_dense_list_stays_paywalled():
+    """Regression: a whole-`<article>` dump must not beat readability on link chrome.
+
+    A teaser plus a "Most read" `<a>` list and a newsletter blurb (no classes
+    on `_RECIRC_SELECTORS`) stayed paywalled on main (~35 words) so the PR #3
+    bounce could fire. Raw-word-count `_prefer_richer_html` flipped it to a
+    complete 142-word chrome dump and skipped the bounce.
+    """
+    chrome = "".join(
+        f"<li><a href='/x{i}'>Most read headline number {i} covering an unrelated "
+        f"political development in some member state this particular week</a></li>"
+        for i in range(6)
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="Locked teaser only">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>Locked teaser only</h1>
+    <p>Subscribe to continue reading this piece.</p>
+    <div class="most-read"><h2>Most read</h2><ul>{chrome}</ul></div>
+    <div class="newsletter-signup"><p>Sign up for our daily newsletter to get the most
+    important stories delivered straight to your inbox every morning, curated by our
+    editors across every bureau in the world.</p></div>
+  </article>
+</body>
+</html>
+"""
+    got = extract_article(html, "https://daily.test/locked")
+    assert got["paywalled"] is True
+    assert got["word_count"] < 80
+    assert FULL_ARTICLE_TOKEN not in got["article_text"]
+    assert "Most read headline number 0" not in got["article_text"]

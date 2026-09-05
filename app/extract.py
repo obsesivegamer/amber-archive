@@ -32,10 +32,14 @@ def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
 
 
-def _html_word_count(html: str) -> int:
+def _html_word_count(html: str, *, exclude_anchors: bool = False) -> int:
     if not html:
         return 0
-    text = _WS.sub(" ", BeautifulSoup(html, "lxml").get_text(" ", strip=True)).strip()
+    soup = BeautifulSoup(html, "lxml")
+    if exclude_anchors:
+        for tag in soup.find_all("a"):
+            tag.decompose()
+    text = _WS.sub(" ", soup.get_text(" ", strip=True)).strip()
     return len([w for w in re.split(r"\s+", text) if w])
 
 
@@ -48,7 +52,11 @@ def _without_recirc(soup: BeautifulSoup) -> BeautifulSoup:
 
 
 def _from_article_dom(soup: BeautifulSoup) -> str:
-    """The page's own article body, after recirc cards are gone."""
+    """The page's own article body, after recirc cards are gone.
+
+    Score by non-anchor words so a link-dense ``<article>`` shell (Most read,
+    related headlines) cannot out-count readability's filtered pick.
+    """
     hosts: list = []
     hosts.extend(soup.find_all(attrs={"itemprop": "articleBody"}))
     hosts.extend(soup.find_all("article"))
@@ -63,7 +71,7 @@ def _from_article_dom(soup: BeautifulSoup) -> str:
         clone = BeautifulSoup(str(host), "lxml")
         chunks = clone.select(".article__content")
         html = "".join(str(c) for c in chunks) if chunks else str(clone.body or clone)
-        n = _html_word_count(html)
+        n = _html_word_count(html, exclude_anchors=True)
         if n > best_n:
             best, best_n = html, n
     return best
@@ -73,10 +81,24 @@ def _prefer_richer_html(*candidates: str) -> str:
     best = ""
     best_n = 0
     for html in candidates:
-        n = _html_word_count(html)
+        n = _html_word_count(html, exclude_anchors=True)
         if n > best_n:
             best, best_n = html, n
     return best
+
+
+def _article_dom_if_substantial(soup: BeautifulSoup) -> str:
+    """Offer the article dump only when it looks like a real body.
+
+    A Most-read list plus a newsletter blurb is ~40 non-anchor words. If that
+    dump still competes on raw (or even non-anchor) count, it beats
+    readability's ~35-word teaser, stores chrome, and skips the bounce retry.
+    Require at least PAYWALL_WORD_LIMIT non-anchor words before it can win.
+    """
+    html = _from_article_dom(soup)
+    if _html_word_count(html, exclude_anchors=True) < PAYWALL_WORD_LIMIT:
+        return ""
+    return html
 
 
 def _text(value: Any) -> str | None:
@@ -363,7 +385,7 @@ def extract_article(html: str, url: str) -> dict:
         except Exception:
             readability_html = ""
         article_html = _prefer_richer_html(
-            readability_html, _from_article_dom(body_soup)
+            readability_html, _article_dom_if_substantial(body_soup)
         )
 
     if article_html:
