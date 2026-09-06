@@ -46,158 +46,72 @@ def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
 
 
-def _html_word_count(html: str, *, exclude_anchors: bool = False) -> int:
-    if not html:
-        return 0
+def _prose_word_count(html: str) -> int:
+    """Count non-link text without changing the candidate stored for the reader."""
     soup = BeautifulSoup(html, "lxml")
-    if exclude_anchors:
-        for tag in soup.find_all("a"):
-            tag.decompose()
-    text = _WS.sub(" ", soup.get_text(" ", strip=True)).strip()
-    return len([w for w in re.split(r"\s+", text) if w])
+    for tag in soup.find_all("a"):
+        tag.decompose()
+    return len(soup.get_text(" ", strip=True).split())
+
+
+def _outermost(nodes: list) -> list:
+    """Keep distinct outer nodes by identity, not BeautifulSoup markup equality."""
+    by_id = {id(node): node for node in nodes}
+    return [
+        node for node in by_id.values()
+        if not any(id(parent) in by_id for parent in node.parents)
+    ]
 
 
 def _without_recirc(soup: BeautifulSoup) -> BeautifulSoup:
     clone = BeautifulSoup(str(soup), "lxml")
-    for sel in _RECIRC_SELECTORS:
-        for el in clone.select(sel):
-            el.decompose()
+    for node in _outermost(clone.select(", ".join(_RECIRC_SELECTORS))):
+        node.decompose()
     return clone
 
 
-def _strip_selectors(soup: BeautifulSoup, selectors: tuple[str, ...]) -> None:
-    for sel in selectors:
-        for el in soup.select(sel):
-            el.decompose()
-
-
 def _is_unlikely_chrome(elem) -> bool:
-    """Same class+id unlikely filter readability uses before scoring.
-
-    Exact-token `_ARTICLE_CHROME_SELECTORS` miss `id="comments"`,
-    `comment-list`, `sponsored`, `sidebar`. Those stay in the dump, beat
-    the teaser, and skip bounce. Keep nodes readability would keep
-    (`okMaybeItsACandidateRe`). Do not spare wrappers just because they
-    contain ``article`` / ``main`` — WordPress comments use that shape.
-    """
-    name = getattr(elem, "name", None)
-    if not name or name in {"html", "body", "[document]", "article"}:
+    """Apply readability's class/id filter; retain its candidate exceptions."""
+    if elem.name in {None, "html", "body", "[document]", "article"}:
         return False
     classes = elem.get("class") or []
     if isinstance(classes, str):
         classes = classes.split()
-    s = "{} {}".format(" ".join(classes), elem.get("id") or "")
-    if len(s) < 2:
-        return False
-    if not _READABILITY_REGEXES["unlikelyCandidatesRe"].search(s):
-        return False
-    if _READABILITY_REGEXES["okMaybeItsACandidateRe"].search(s):
-        return False
-    return True
+    label = " ".join(classes) + " " + (elem.get("id") or "")
+    return bool(
+        _READABILITY_REGEXES["unlikelyCandidatesRe"].search(label)
+        and not _READABILITY_REGEXES["okMaybeItsACandidateRe"].search(label)
+    )
 
 
-def _strip_unlikely_chrome(soup: BeautifulSoup) -> None:
-    for el in list(soup.find_all(True)):
-        if _is_unlikely_chrome(el):
-            el.decompose()
-
-
-def _outer_article_content(host: BeautifulSoup) -> list:
-    """`.article__content` roots that are not nested in another match.
-
-    ``select`` returns parent and child; joining both double-counts the same
-    prose (a 52-word teaser becomes 104 and looks complete).
-    """
-    nodes = host.select(".article__content")
-    chosen = set(nodes)
-    return [node for node in nodes if not any(parent in chosen for parent in node.parents)]
-
-
-def _outer_hosts(nodes: list) -> list:
-    """Keep outermost article hosts so a nested chrome `<article>` cannot re-enter."""
-    chosen = set(nodes)
-    return [node for node in nodes if not any(parent in chosen for parent in node.parents)]
-
-
-def _chrome_boxes(soup: BeautifulSoup) -> set:
-    boxes: set = set()
-    for sel in _ARTICLE_CHROME_SELECTORS + _RECIRC_SELECTORS:
-        boxes.update(soup.select(sel))
-    for el in soup.find_all(True):
-        if _is_unlikely_chrome(el):
-            boxes.add(el)
-    return boxes
-
-
-def _host_inside_chrome(host, boxes: set) -> bool:
-    return any(parent in boxes for parent in host.parents)
-
-
-def _from_article_dom(soup: BeautifulSoup) -> str:
-    """The page's own article body, after recirc and non-body modules are gone.
-
-    Score by non-anchor words so a link-dense ``<article>`` shell (Most read,
-    related headlines) cannot out-count readability's filtered pick. Comments,
-    promo, footer, and related-stories are stripped before that score so they
-    cannot make a teaser look complete. Nested ``<article>`` hosts inside that
-    chrome are skipped — P3 already drops them from the outer clone, but
-    ``find_all("article")`` would otherwise clone them in isolation.
-    """
-    hosts: list = []
-    hosts.extend(soup.find_all(attrs={"itemprop": "articleBody"}))
-    hosts.extend(soup.find_all("article"))
-    hosts = _outer_hosts(hosts)
-    chrome = _chrome_boxes(soup)
-    best = ""
-    best_n = 0
-    seen: set[int] = set()
+def _article_body_candidate(soup: BeautifulSoup) -> str:
+    """Select body roots before stripping chrome, so scope can only shrink."""
+    clone = BeautifulSoup(str(soup), "lxml")
+    hosts = _outermost(
+        clone.find_all(attrs={"itemprop": "articleBody"}) + clone.find_all("article")
+    )
+    groups = []
     for host in hosts:
-        if _host_inside_chrome(host, chrome):
-            continue
-        marker = id(host)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        clone = BeautifulSoup(str(host), "lxml")
-        had_content_roots = bool(_outer_article_content(clone))
-        _strip_selectors(clone, _ARTICLE_CHROME_SELECTORS)
-        _strip_unlikely_chrome(clone)
-        roots = _outer_article_content(clone)
-        if had_content_roots and not roots:
-            # Chrome strip ate every content root (nested in <footer>, or
-            # classed "article__content comments"). Do not widen to the
-            # whole <article> — that reintroduces off-list junk the roots
-            # had excluded and can flip a teaser to Complete.
-            continue
-        html = "".join(str(c) for c in roots) if roots else str(clone.body or clone)
-        n = _html_word_count(html, exclude_anchors=True)
-        if n > best_n:
-            best, best_n = html, n
+        roots = (
+            [host] if "article__content" in (host.get("class") or [])
+            else _outermost(host.select(".article__content"))
+        )
+        groups.append(roots or [host])
+
+    chrome = clone.select(", ".join(_ARTICLE_CHROME_SELECTORS))
+    chrome.extend(node for node in clone.find_all(True) if _is_unlikely_chrome(node))
+    for node in _outermost(chrome):
+        node.decompose()
+
+    best, best_count = "", PAYWALL_WORD_LIMIT - 1
+    for roots in groups:
+        # decompose() clears removed roots and their descendants. Never replace
+        # a removed body with its wider article shell or a nested comment host.
+        html = "".join(str(node) for node in roots if node.name is not None)
+        count = _prose_word_count(html)
+        if count > best_count:
+            best, best_count = html, count
     return best
-
-
-def _prefer_richer_html(*candidates: str) -> str:
-    best = ""
-    best_n = 0
-    for html in candidates:
-        n = _html_word_count(html, exclude_anchors=True)
-        if n > best_n:
-            best, best_n = html, n
-    return best
-
-
-def _article_dom_if_substantial(soup: BeautifulSoup) -> str:
-    """Offer the article dump only when it looks like a real body.
-
-    A Most-read list plus a newsletter blurb is ~40 non-anchor words. If that
-    dump still competes on raw (or even non-anchor) count, it beats
-    readability's ~35-word teaser, stores chrome, and skips the bounce retry.
-    Require at least PAYWALL_WORD_LIMIT non-anchor words before it can win.
-    """
-    html = _from_article_dom(soup)
-    if _html_word_count(html, exclude_anchors=True) < PAYWALL_WORD_LIMIT:
-        return ""
-    return html
 
 
 def _text(value: Any) -> str | None:
@@ -483,8 +397,9 @@ def extract_article(html: str, url: str) -> dict:
                 title = _text(doc.short_title() or doc.title())
         except Exception:
             readability_html = ""
-        article_html = _prefer_richer_html(
-            readability_html, _article_dom_if_substantial(body_soup)
+        article_html = max(
+            ("", readability_html, _article_body_candidate(body_soup)),
+            key=_prose_word_count,
         )
 
     if article_html:

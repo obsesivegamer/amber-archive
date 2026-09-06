@@ -1,8 +1,5 @@
 from pathlib import Path
 
-from readability import Document
-from bs4 import BeautifulSoup
-
 from app.extract import extract_article
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -142,18 +139,6 @@ def test_react_article_uses_free_blurb_not_short_og():
     assert got["paywalled"] is False
 
 
-def test_readability_prefers_related_card_on_politico_shaped_html():
-    """Bounce cannot fix this: the full copy is already in `.article__content`.
-
-    readability-lxml picks a recirc card teaser on Politico-shaped chrome
-    (sidebar-grid + article-card). Live Politico.eu snapshot qHFCB stored that
-    30-word card as Incomplete even after a Google bounce retry. A second
-    visit with an allowlisted Referer yields the same HTML and the same miss.
-    """
-    summary = Document(POLITICO_RELATED_CARD).summary(html_partial=True) or ""
-    read = BeautifulSoup(summary, "lxml").get_text(" ", strip=True)
-    assert CARD_TEASER_TOKEN in read
-    assert FULL_ARTICLE_TOKEN not in read
 
 
 def test_extract_uses_article_body_not_related_card():
