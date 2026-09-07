@@ -1,6 +1,6 @@
 # Capture network boundaries
 
-Amber accepts public HTTP(S) URLs without embedded credentials. The validator rejects local, private, reserved, multicast, and unresolved addresses, including hostnames with any non-public DNS result.
+Amber accepts public HTTP(S) URLs without embedded credentials. The validator rejects local, private, reserved, multicast, unspecified, and unresolved addresses, including hostnames with any non-public DNS result. It also rejects addresses that are not globally routable, including CGNAT / RFC 6598 shared space (`100.64.0.0/10`, used by Tailscale). That range is not covered by Python's `is_reserved` flag.
 
 In `app/capture.py`, `_capture_visit` checks the initial URL before creating a browser context. The initial, user-submitted URL has a 2048-character intake limit. Its context-wide route checks the scheme, credentials, host, and resolved addresses of requests before continuing them, including subresources and popup navigation, without applying the intake length limit to those browser-generated URLs. Service workers are blocked so they cannot take requests outside that routing. Allowlisted Google/X bounce documents are fulfilled locally; subsequent article navigation uses Chromium's native click and referrer behavior. The final page URL is checked before extraction.
 
