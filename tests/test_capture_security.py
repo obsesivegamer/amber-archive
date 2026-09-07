@@ -78,7 +78,10 @@ def guarded_site(monkeypatch):
             elif path == "/private.png":
                 body, ctype = PRIVATE_IMAGE, "image/png"
             elif path == "/private-document":
-                body = b"<!doctype html><title>Private document</title>"
+                body = b"""<!doctype html><title>Private document</title>
+                <script>
+                  setTimeout(function () { fetch('/settle-only'); }, 3000);
+                </script>"""
                 ctype = "text/html"
             else:
                 body = b"PUBLIC_RESPONSE"
@@ -153,8 +156,9 @@ def test_browser_closes_context_when_setup_fails():
 
 
 @pytest.mark.browser
-def test_browser_blocks_private_subresources_and_popups(guarded_site):
+def test_browser_blocks_private_subresources_and_popups(guarded_site, monkeypatch):
     url, hits = guarded_site
+    monkeypatch.setattr(capture, "_is_public_ip", lambda ip: True, raising=False)
 
     async def run():
         async with async_playwright() as playwright:
@@ -209,8 +213,12 @@ def test_browser_archives_long_public_image_url(guarded_site, monkeypatch):
 
 
 @pytest.mark.browser
-def test_browser_does_not_archive_private_redirected_subresources(guarded_site):
+def test_browser_does_not_archive_private_redirected_subresources(guarded_site, monkeypatch):
     url, hits = guarded_site
+    # The fixture document is also served from loopback via host-resolver-rules.
+    # Skip the new document-peer gate so this test still covers public→private
+    # CSS/PNG 302 archival; the document-redirect test covers that gate.
+    monkeypatch.setattr(capture, "_reject_private_navigation_peer", AsyncMock())
 
     async def run():
         async with async_playwright() as playwright:
@@ -241,11 +249,14 @@ def test_browser_does_not_archive_private_redirected_subresources(guarded_site):
 @pytest.mark.browser
 def test_browser_reports_private_document_redirect(guarded_site, monkeypatch):
     url, hits = guarded_site
+    settle_calls = []
+    real_settle = capture._settle_page
 
-    async def skip_settle(page):
-        pass
+    async def tracking_settle(page):
+        settle_calls.append(True)
+        await real_settle(page)
 
-    monkeypatch.setattr(capture, "_settle_page", skip_settle)
+    monkeypatch.setattr(capture, "_settle_page", tracking_settle)
 
     async def run():
         async with async_playwright() as playwright:
@@ -259,8 +270,36 @@ def test_browser_reports_private_document_redirect(guarded_site, monkeypatch):
                     match="Redirected to a blocked address: Private or local",
                 ):
                     await capture._capture_visit(browser, {}, url + "/document-redirect")
+                assert browser.contexts == []
             finally:
                 await browser.close()
 
     asyncio.run(run())
-    assert "/private-document" in [path for path, _ in hits]
+    paths = [path for path, _ in hits]
+    assert "/private-document" in paths
+    assert "/settle-only" not in paths
+    assert settle_calls == []
+
+
+@pytest.mark.browser
+def test_browser_rejects_private_document_peer(guarded_site):
+    url, hits = guarded_site
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(args=[
+                "--host-resolver-rules=MAP public.amber.test 127.0.0.1",
+                "--no-proxy-server",
+            ])
+            try:
+                with pytest.raises(
+                    RuntimeError,
+                    match="Redirected to a blocked address: Private or local",
+                ):
+                    await capture._capture_visit(browser, {}, url + "/article")
+                assert browser.contexts == []
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+    assert "/article" in [path for path, _ in hits]

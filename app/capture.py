@@ -429,6 +429,36 @@ async def _goto_article(page, url: str, bounce_origin: str | None, *, on_bounce_
     return await info.value
 
 
+async def _require_public_page_url(page) -> None:
+    try:
+        await asyncio.to_thread(validate_public_http_url, page.url)
+    except ValueError as exc:
+        raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
+
+
+async def _reject_private_navigation_peer(response) -> None:
+    """Fail closed when a real network document came from a non-public peer.
+
+    Skip when ``response`` is missing. Call this on the navigation
+    ``_goto_article`` returns: a direct ``page.goto``, or the post-click
+    article response after a bounce. Do not apply it to the bounce stub.
+    That document is ``route.fulfill``'d locally and often has no
+    ``server_addr``; failing closed there would break metered paywall retries.
+    """
+    if response is None:
+        return
+    try:
+        server_addr = await response.server_addr()
+        peer_ip = server_addr.get("ipAddress") if server_addr else None
+        if peer_ip and _is_public_ip(peer_ip):
+            return
+    except Exception:
+        pass
+    raise RuntimeError(
+        "Redirected to a blocked address: Private or local network URLs cannot be archived."
+    )
+
+
 async def _capture_visit(
     browser,
     job: dict,
@@ -538,12 +568,11 @@ async def _capture_visit(
             page, url, bounce_origin, on_bounce_landed=_mark_bounce_landed
         )
         http_status = response.status if response else None
+        await _require_public_page_url(page)
+        await _reject_private_navigation_peer(response)
         await _settle_page(page)
         final_url = page.url
-        try:
-            await asyncio.to_thread(validate_public_http_url, final_url)
-        except ValueError as exc:
-            raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
+        await _require_public_page_url(page)
         title = await page.title()
         html = await page.content()
         article = extract_article(html, final_url)
