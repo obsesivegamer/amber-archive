@@ -37,8 +37,8 @@ FULL_ARTICLE = """
 </html>
 """
 
-INCOMPLETE_COPY = "incomplete · paywalled teaser"
-VIEWER_NOTE = "this visit only kept a paywalled teaser"
+INCOMPLETE_COPY = "incomplete · short extract"
+VIEWER_NOTE = "Amber extracted only a short preview"
 
 
 def _skip_screenshot(monkeypatch) -> None:
@@ -84,7 +84,7 @@ def test_paywalled_snapshot_renders_incomplete_on_viewer_and_lists(tmp_data, mon
 
         reader = client.get(f"/{sid}/reader")
         assert reader.status_code == 200
-        assert "paywalled teaser" in reader.text
+        assert "short preview" in reader.text
         assert "Import" in reader.text
 
         home = client.get("/")

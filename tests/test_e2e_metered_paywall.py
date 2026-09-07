@@ -385,11 +385,11 @@ def test_capture_retries_metered_paywall_and_keeps_full_article(
 
         page = client.get(f"/{sid}")
         assert page.status_code == 200
-        assert "paywalled teaser" not in page.text
+        assert "short preview" not in page.text
         reader = client.get(f"/{sid}/reader")
         assert reader.status_code == 200
         assert METERED_FULL_TOKEN in reader.text
-        assert "paywalled teaser" not in reader.text
+        assert "short preview" not in reader.text
 
 
 def test_capture_retries_when_teaser_has_reader_comments(
@@ -446,11 +446,11 @@ def test_capture_hard_paywall_stays_incomplete(tmp_data, allow_private, metered_
         assert meta["referrer_retried"] is True
 
         article = client.get(f"/{sid}")
-        assert "this visit only kept a paywalled teaser" in article.text
+        assert "Amber extracted only a short preview" in article.text
         assert 'href="/#import"' in article.text
         reader = client.get(f"/{sid}/reader")
-        assert "paywalled teaser" in reader.text
-        assert "retried as a Google referrer visit" in reader.text
+        assert "short preview" in reader.text
+        assert "retried Google/X referrer visits" in reader.text
         assert "Import" in reader.text
 
 
