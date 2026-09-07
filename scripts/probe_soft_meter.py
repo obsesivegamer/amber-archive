@@ -34,7 +34,7 @@ def _report(html: str, url: str) -> int:
     ).get_text(" ", strip=True)
     got = extract_article(html, url)
     print("url", url)
-    print("readability_words", len(read.split()), "has_full_lead", "Kaja Kallas, the EU" in read or "TOKEN_FULL_ARTICLE" in read)
+    print("readability_words", len(read.split()))
     print("readability_text", read[:220].replace("\n", " "))
     print("extract_words", got.get("word_count"), "paywalled", got.get("paywalled"))
     print("extract_text", (got.get("article_text") or "")[:220])
@@ -75,8 +75,10 @@ def main(argv: list[str] | None = None) -> int:
         html = args.html.read_text(encoding="utf-8", errors="replace")
         url = "https://daily.test/probe"
     else:
-        html = asyncio.run(_live(args.live))
-        url = args.live
+        from app.security import validate_public_http_url
+
+        url = validate_public_http_url(args.live)
+        html = asyncio.run(_live(url))
     return _report(html, url)
 
 
