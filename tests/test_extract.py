@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from app.extract import extract_article
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -363,16 +365,10 @@ def test_stripped_content_root_does_not_widen_to_whole_article():
         assert FULL_ARTICLE_TOKEN not in got["article_text"]
 
 
-def test_surviving_content_root_still_beats_stripped_sibling():
-    """A live `.article__content` sibling must still win after footer chrome dies."""
-    body = (
-        f"<p>{FULL_ARTICLE_TOKEN} The chief diplomat is leading a fierce "
-        "behind-the-scenes push against plans to overhaul the diplomatic "
-        "service, courting capitals and using a new secretary-general to "
-        "develop alternative reform plans that keep the service intact for "
-        "smaller member states that depend on a shared desk for every joint "
-        "statement on foreign policy this autumn after the ambassadors met.</p>"
-    )
+@pytest.mark.parametrize("word_count", [79, 80, 81])
+def test_stripped_sibling_does_not_inflate_article(word_count):
+    """Removed content roots must not add words or flip the incomplete flag."""
+    body = " ".join(f"word{i}" for i in range(word_count))
     html = f"""<!doctype html>
 <html>
 <head>
@@ -381,19 +377,20 @@ def test_surviving_content_root_still_beats_stripped_sibling():
 </head>
 <body>
   <article>
-    <h1>Inside the fightback</h1>
-    <div class="article__content">{body}</div>
-    <footer>
+    <div class="article__content"><p>{body}</p></div>
+    <div class="comments">
       <div class="article__content"><p>{NESTED_TEASER}</p></div>
-    </footer>
+    </div>
   </article>
 </body>
 </html>
 """
     got = extract_article(html, "https://daily.test/kallas")
-    assert FULL_ARTICLE_TOKEN in got["article_text"]
-    assert got["paywalled"] is False
-    assert got["word_count"] >= 80
+    assert got["article_text"] == body
+    assert got["word_count"] == word_count
+    assert got["paywalled"] is (word_count < 80)
+    assert "<>" not in got["article_html"]
+    assert "&lt;&gt;" not in got["article_html"]
 
 
 def _outer_teaser_plus_nested_article(wrapper_open: str, wrapper_close: str, inner: str) -> str:

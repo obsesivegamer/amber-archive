@@ -107,7 +107,7 @@ def _article_body_candidate(soup: BeautifulSoup) -> str:
     for roots in groups:
         # decompose() clears removed roots and their descendants. Never replace
         # a removed body with its wider article shell or a nested comment host.
-        html = "".join(str(node) for node in roots if node.name is not None)
+        html = "".join(str(node) for node in roots if not node.decomposed)
         count = _prose_word_count(html)
         if count > best_count:
             best, best_count = html, count
