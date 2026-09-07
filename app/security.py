@@ -38,6 +38,7 @@ def _is_public_ip(ip: str) -> bool:
         or addr.is_multicast
         or addr.is_reserved
         or addr.is_unspecified
+        or not addr.is_global
     )
 
 
