@@ -27,3 +27,4 @@
 
 - 2026-09-06T22:02:30-04:00 [TOOL] Focused security verification passed: 17 tests in `tests/test_capture_security.py` and `tests/test_security.py`.
 - 2026-09-06T22:02:30-04:00 [TOOL] Full repository verification passed: 77 tests in 67.31 seconds. The only output was the same two dependency deprecation warnings reported before this fix. `git diff --check` and targeted `py_compile` also passed.
+- 2026-09-07T11:24:26-04:00 [TOOL] Commit `6bc7524a45dadce92705325410a4974c220e6871` is pushed to `codex/capture-boundaries`; PR #6 remains open against `main` with no status checks reported. No merge or deployment was performed.
