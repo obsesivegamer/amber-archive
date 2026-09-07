@@ -12,6 +12,10 @@ from playwright.async_api import async_playwright
 
 from app import capture
 
+LONG_IMAGE = b"long public image"
+PRIVATE_CSS = b"body { color: private; }"
+PRIVATE_IMAGE = b"private image"
+
 
 @pytest.fixture
 def guarded_site(monkeypatch):
@@ -23,16 +27,29 @@ def guarded_site(monkeypatch):
 
         def do_GET(self):
             hits.append((self.path, self.headers.get("User-Agent")))
-            if self.path in {"/redirect", "/redirect-private"}:
-                destination = (
-                    "/redirect-private" if self.path == "/redirect"
-                    else f"http://127.0.0.1:{self.server.server_port}/blocked-redirect"
-                )
+            path = self.path.partition("?")[0]
+            redirects = {
+                "/redirect": "/redirect-private",
+                "/redirect-private": (
+                    f"http://127.0.0.1:{self.server.server_port}/blocked-redirect"
+                ),
+                "/document-redirect": (
+                    f"http://127.0.0.1:{self.server.server_port}/private-document"
+                ),
+                "/css-redirect": (
+                    f"http://127.0.0.1:{self.server.server_port}/private.css"
+                ),
+                "/image-redirect": (
+                    f"http://127.0.0.1:{self.server.server_port}/private.png"
+                ),
+            }
+            destination = redirects.get(path)
+            if destination:
                 self.send_response(302)
                 self.send_header("Location", destination)
                 self.end_headers()
                 return
-            if self.path == "/article":
+            if path == "/article":
                 body = f"""<!doctype html><title>Guard fixture</title>
                 <article><h1>Guard fixture</h1><p>Public article content.</p></article>
                 <script>
@@ -41,10 +58,33 @@ def guarded_site(monkeypatch):
                     .catch(() => {{}});
                   window.open('http://127.0.0.1:{self.server.server_port}/blocked-popup');
                 </script>""".encode()
+                ctype = "text/html"
+            elif path == "/long-image-article":
+                query = "x" * 2100
+                body = f"""<!doctype html><title>Long image</title>
+                <article><h1>Long image</h1><p>Public article content.</p>
+                <img src="/long.png?x={query}"></article>""".encode()
+                ctype = "text/html"
+            elif path == "/private-subresource-redirects":
+                body = b"""<!doctype html><title>Redirected resources</title>
+                <link rel="stylesheet" href="/css-redirect">
+                <article><h1>Redirected resources</h1><p>Public article content.</p>
+                <img src="/image-redirect"></article>"""
+                ctype = "text/html"
+            elif path == "/long.png":
+                body, ctype = LONG_IMAGE, "image/png"
+            elif path == "/private.css":
+                body, ctype = PRIVATE_CSS, "text/css"
+            elif path == "/private.png":
+                body, ctype = PRIVATE_IMAGE, "image/png"
+            elif path == "/private-document":
+                body = b"<!doctype html><title>Private document</title>"
+                ctype = "text/html"
             else:
                 body = b"PUBLIC_RESPONSE"
+                ctype = "text/html"
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -139,3 +179,88 @@ def test_browser_blocks_private_subresources_and_popups(guarded_site):
     assert "/article" in paths
     assert "/allowed-resource" in paths
     assert not any(path.startswith("/blocked") for path in paths)
+
+
+@pytest.mark.browser
+def test_browser_archives_long_public_image_url(guarded_site, monkeypatch):
+    url, hits = guarded_site
+    monkeypatch.setattr(capture, "_is_public_ip", lambda ip: True, raising=False)
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(args=[
+                "--host-resolver-rules=MAP public.amber.test 127.0.0.1",
+                "--no-proxy-server",
+            ])
+            try:
+                visit = await capture._capture_visit(browser, {}, url + "/long-image-article")
+                try:
+                    long_urls = [key for key in visit.resource_map if "/long.png?" in key]
+                    assert len(long_urls) == 1
+                    filename = visit.resource_map[long_urls[0]]
+                    assert visit.resource_bodies[filename] == (LONG_IMAGE, "image/png")
+                finally:
+                    await visit.close()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+    assert any(path.startswith("/long.png?") for path, _ in hits)
+
+
+@pytest.mark.browser
+def test_browser_does_not_archive_private_redirected_subresources(guarded_site):
+    url, hits = guarded_site
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(args=[
+                "--host-resolver-rules=MAP public.amber.test 127.0.0.1",
+                "--no-proxy-server",
+            ])
+            try:
+                visit = await capture._capture_visit(
+                    browser, {}, url + "/private-subresource-redirects"
+                )
+                try:
+                    saved_bodies = [body for body, _ in visit.resource_bodies.values()]
+                    assert PRIVATE_CSS not in saved_bodies
+                    assert PRIVATE_IMAGE not in saved_bodies
+                    assert not any("127.0.0.1" in key for key in visit.resource_map)
+                finally:
+                    await visit.close()
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+    paths = [path for path, _ in hits]
+    assert "/private.css" in paths
+    assert "/private.png" in paths
+
+
+@pytest.mark.browser
+def test_browser_reports_private_document_redirect(guarded_site, monkeypatch):
+    url, hits = guarded_site
+
+    async def skip_settle(page):
+        pass
+
+    monkeypatch.setattr(capture, "_settle_page", skip_settle)
+
+    async def run():
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(args=[
+                "--host-resolver-rules=MAP public.amber.test 127.0.0.1",
+                "--no-proxy-server",
+            ])
+            try:
+                with pytest.raises(
+                    RuntimeError,
+                    match="Redirected to a blocked address: Private or local",
+                ):
+                    await capture._capture_visit(browser, {}, url + "/document-redirect")
+            finally:
+                await browser.close()
+
+    asyncio.run(run())
+    assert "/private-document" in [path for path, _ in hits]

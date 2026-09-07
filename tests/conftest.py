@@ -23,3 +23,4 @@ def tmp_data(tmp_path, monkeypatch):
 @pytest.fixture
 def allow_private(monkeypatch):
     monkeypatch.setattr("app.security.host_is_public", lambda host: True)
+    monkeypatch.setattr("app.capture._is_public_ip", lambda ip: True)

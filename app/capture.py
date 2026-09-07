@@ -36,7 +36,11 @@ from . import db
 from .extract import extract_article
 from .freeze import freeze_html, rewrite_css
 from .reader import build_reader_html
-from .security import validate_public_http_url
+from .security import (
+    _is_public_ip,
+    validate_public_http_request_url,
+    validate_public_http_url,
+)
 
 jobs: dict[str, dict] = {}
 job_queue: asyncio.Queue[str] | None = None
@@ -473,7 +477,7 @@ async def _capture_visit(
         try:
             # Resolve outside the event loop. Playwright does not route later
             # HTTP redirect hops; this guards each request it does expose.
-            await asyncio.to_thread(validate_public_http_url, req_url)
+            await asyncio.to_thread(validate_public_http_request_url, req_url)
         except ValueError:
             await route.abort()
             return
@@ -499,6 +503,13 @@ async def _capture_visit(
         if status >= 400 or not body:
             return
         if not _should_save(ctype):
+            return
+        try:
+            server_addr = await response.server_addr()
+            peer_ip = server_addr.get("ipAddress") if server_addr else None
+            if not peer_ip or not _is_public_ip(peer_ip):
+                return
+        except Exception:
             return
         if size > MAX_RESOURCE_BYTES or total_bytes + size > MAX_TOTAL_RESOURCE_BYTES:
             return
@@ -529,7 +540,10 @@ async def _capture_visit(
         http_status = response.status if response else None
         await _settle_page(page)
         final_url = page.url
-        await asyncio.to_thread(validate_public_http_url, final_url)
+        try:
+            await asyncio.to_thread(validate_public_http_url, final_url)
+        except ValueError as exc:
+            raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
         title = await page.title()
         html = await page.content()
         article = extract_article(html, final_url)
