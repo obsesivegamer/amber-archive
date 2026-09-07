@@ -54,6 +54,34 @@ def test_rejects_link_local_metadata():
         validate_public_http_url("http://169.254.169.254/latest/meta-data/")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://100.64.0.1/",
+        "http://100.100.100.200/",
+    ],
+)
+def test_rejects_cgnat_shared_space(url):
+    with pytest.raises(ValueError, match="Private"):
+        validate_public_http_url(url)
+
+
+def test_rejects_nat64_loopback_encoding():
+    with pytest.raises(ValueError, match="Private"):
+        validate_public_http_url("http://[64:ff9b::127.0.0.1]/")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://93.184.216.34/",
+        "http://8.8.8.8/",
+    ],
+)
+def test_accepts_public_ip(url):
+    assert validate_public_http_url(url) == url
+
+
 def test_browser_request_validation_does_not_apply_intake_length_limit():
     url = "http://93.184.216.34/image.png?x=" + "x" * 2048
     with pytest.raises(ValueError, match="too long"):
