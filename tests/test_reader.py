@@ -38,9 +38,9 @@ def test_paywalled_reader_explains_the_teaser():
         },
         "https://www.theinformation.com/articles/x",
     )
-    assert "paywalled teaser" in html
+    assert "short preview" in html
     assert "Import" in html
-    assert "retried as a Google referrer" not in html
+    assert "retried Google/X referrer" not in html
 
 
 def test_paywalled_reader_mentions_referrer_retry_when_it_happened():
@@ -55,6 +55,6 @@ def test_paywalled_reader_mentions_referrer_retry_when_it_happened():
         },
         "https://www.politico.eu/article/example",
     )
-    assert "retried as a Google referrer visit" in html
-    assert "paywalled teaser" in html
+    assert "retried Google/X referrer visits" in html
+    assert "short preview" in html
     assert "Import" in html

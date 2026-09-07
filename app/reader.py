@@ -69,15 +69,15 @@ def build_reader_html(article: dict, url: str) -> str:
     notice = ""
     if article.get("paywalled"):
         retried = (
-            " Amber retried as a Google referrer visit and still only got a teaser."
+            " Amber retried Google/X referrer visits and still extracted only a short preview."
             if article.get("referrer_retried")
             else ""
         )
         notice = (
-            '<p class="notice">Incomplete — this visit only kept a paywalled teaser.'
+            '<p class="notice">Incomplete — Amber extracted only a short preview.'
             f"{retried} "
-            "The rest of the article was not in the page a logged-out visitor received. "
-            "To keep the full piece, save the page as HTML from a logged-in browser, then "
+            "The page may have limited access, or extraction may have missed the full article. "
+            "If the full piece is visible in your browser, save the page as HTML, then "
             "Import that file on Amber's homepage.</p>"
         )
 

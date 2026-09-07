@@ -1,6 +1,10 @@
 import pytest
 
-from app.security import normalize_url, validate_public_http_url
+from app.security import (
+    normalize_url,
+    validate_public_http_request_url,
+    validate_public_http_url,
+)
 
 
 def test_normalize_strips_tracking_and_trailing_slash():
@@ -48,3 +52,10 @@ def test_rejects_rfc1918():
 def test_rejects_link_local_metadata():
     with pytest.raises(ValueError, match="Private"):
         validate_public_http_url("http://169.254.169.254/latest/meta-data/")
+
+
+def test_browser_request_validation_does_not_apply_intake_length_limit():
+    url = "http://93.184.216.34/image.png?x=" + "x" * 2048
+    with pytest.raises(ValueError, match="too long"):
+        validate_public_http_url(url)
+    assert validate_public_http_request_url(url) == url

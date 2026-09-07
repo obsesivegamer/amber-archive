@@ -17,6 +17,7 @@ PNG = (
 )
 
 CSS = "body{font-family:serif;background:#fff}h1{font-size:28px}img{width:40px;height:40px}"
+FONT = b"fixture font response"
 
 HTML = """<!doctype html>
 <html>
@@ -26,6 +27,7 @@ HTML = """<!doctype html>
   <meta property="og:site_name" content="The Daily Test">
   <meta property="og:description" content="The city council voted last night to fund a new bridge over the river. Construction starts in May.">
   <link rel="stylesheet" href="/style.css">
+  <link rel="preload" href="/fixture.woff2" as="font" type="font/woff2" crossorigin>
   <script>document.title = "pwned"</script>
 </head>
 <body>
@@ -60,6 +62,8 @@ class Handler(BaseHTTPRequestHandler):
             body, ctype = CSS.encode(), "text/css"
         elif self.path.startswith("/hero.png"):
             body, ctype = PNG, "image/png"
+        elif self.path.startswith("/fixture.woff2"):
+            body, ctype = FONT, "font/woff2"
         else:
             body, ctype = HTML.encode(), "text/html; charset=utf-8"
         self.send_response(200)
@@ -141,6 +145,12 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         from app import db
 
         meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        origin = local_site.rsplit("/", 1)[0]
+        for path, expected in (("/hero.png", PNG), ("/fixture.woff2", FONT)):
+            filename = meta["resources"][origin + path]
+            saved = client.get(f"/{sid}/r/{filename}")
+            assert saved.status_code == 200
+            assert saved.content == expected
         assert meta.get("referrer_retried") is False
         assert meta.get("referrer_bounce") is None
 
@@ -203,7 +213,6 @@ def test_capture_keeps_article_body_not_related_card(
         reader = client.get(f"/{sid}/reader")
         assert reader.status_code == 200
         assert "TOKEN_FULL_ARTICLE" in reader.text
-        assert "paywalled teaser" not in reader.text
-
+        assert "short preview" not in reader.text
 
 

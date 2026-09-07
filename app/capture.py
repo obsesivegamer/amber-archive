@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import logging
 import mimetypes
+import traceback
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,27 +36,18 @@ from . import db
 from .extract import extract_article
 from .freeze import freeze_html, rewrite_css
 from .reader import build_reader_html
-from .security import validate_public_http_url
+from .security import (
+    _is_public_ip,
+    validate_public_http_request_url,
+    validate_public_http_url,
+)
 
 jobs: dict[str, dict] = {}
 job_queue: asyncio.Queue[str] | None = None
+logger = logging.getLogger(__name__)
 
 SAVE_TYPES = {
     "text/css",
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-    "image/svg+xml",
-    "image/avif",
-    "image/bmp",
-    "image/x-icon",
-    "image/vnd.microsoft.icon",
-    "font/woff",
-    "font/woff2",
-    "font/ttf",
-    "font/otf",
     "application/font-woff",
     "application/font-woff2",
     "application/vnd.ms-fontobject",
@@ -243,9 +236,15 @@ def log_resource(job: dict, **entry) -> None:
     job.setdefault("resources", []).append(entry)
 
 
+class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        url = validate_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, url)
+
+
 def _http_get(url: str, user_agent: str) -> str:
     req = urllib.request.Request(
-        url,
+        validate_public_http_url(url),
         headers={
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -253,7 +252,8 @@ def _http_get(url: str, user_agent: str) -> str:
             "Referer": "https://www.google.com/",
         },
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    opener = urllib.request.build_opener(_PublicRedirectHandler())
+    with opener.open(req, timeout=20) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
@@ -436,6 +436,7 @@ async def _capture_visit(
     *,
     bounce_origin: str | None = None,
 ) -> _Visit:
+    url = await asyncio.to_thread(validate_public_http_url, url)
     if bounce_origin is not None:
         bounce_origin = require_bounce_origin(bounce_origin)
 
@@ -445,13 +446,9 @@ async def _capture_visit(
         locale="en-US",
         java_script_enabled=True,
         bypass_csp=True,
+        service_workers="block",
         extra_http_headers=extra_headers_for_visit(bounce=bounce_origin is not None),
     )
-    await context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
-    page = await context.new_page()
-
     resource_map: dict[str, str] = {}
     resource_bodies: dict[str, tuple[bytes, str]] = {}
     total_bytes = 0
@@ -477,6 +474,13 @@ async def _capture_visit(
         if _should_block(req_url):
             await route.abort()
             return
+        try:
+            # Resolve outside the event loop. Playwright does not route later
+            # HTTP redirect hops; this guards each request it does expose.
+            await asyncio.to_thread(validate_public_http_request_url, req_url)
+        except ValueError:
+            await route.abort()
+            return
         await route.continue_()
 
     async def on_response(response):
@@ -500,6 +504,13 @@ async def _capture_visit(
             return
         if not _should_save(ctype):
             return
+        try:
+            server_addr = await response.server_addr()
+            peer_ip = server_addr.get("ipAddress") if server_addr else None
+            if not peer_ip or not _is_public_ip(peer_ip):
+                return
+        except Exception:
+            return
         if size > MAX_RESOURCE_BYTES or total_bytes + size > MAX_TOTAL_RESOURCE_BYTES:
             return
         digest = hashlib.sha256(body).hexdigest()[:16]
@@ -515,31 +526,34 @@ async def _capture_visit(
         except Exception:
             pass
 
-    await page.route("**/*", on_route)
-    page.on("response", on_response)
-
-    log_resource(job, url=url, status=0, mime="navigation", size=0)
     try:
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        await context.route("**/*", on_route)
+        page = await context.new_page()
+        page.on("response", on_response)
+        log_resource(job, url=url, status=0, mime="navigation", size=0)
         response = await _goto_article(
             page, url, bounce_origin, on_bounce_landed=_mark_bounce_landed
         )
+        http_status = response.status if response else None
+        await _settle_page(page)
+        final_url = page.url
+        try:
+            await asyncio.to_thread(validate_public_http_url, final_url)
+        except ValueError as exc:
+            raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
+        title = await page.title()
+        html = await page.content()
+        article = extract_article(html, final_url)
     except PlaywrightTimeout as exc:
         await context.close()
         raise RuntimeError(f"Timed out loading {url}") from exc
-
-    http_status = response.status if response else None
-    await _settle_page(page)
-
-    final_url = page.url
-    try:
-        validate_public_http_url(final_url)
-    except ValueError as exc:
+    except BaseException:
         await context.close()
-        raise RuntimeError(f"Redirected to a blocked address: {exc}") from exc
+        raise
 
-    title = await page.title()
-    html = await page.content()
-    article = extract_article(html, final_url)
     return _Visit(
         html=html,
         article=article,
@@ -562,6 +576,14 @@ async def worker() -> None:
             await run_job(job_id)
         except Exception as exc:
             job = jobs.get(job_id)
+            # Exception messages can include publisher URLs or HTTP headers.
+            # Keep the useful stack and type without logging those payloads.
+            logger.error(
+                "Capture failed snapshot=%s (%s)\n%s",
+                job.get("snapshot_id") if job else job_id,
+                type(exc).__name__,
+                "".join(traceback.format_tb(exc.__traceback__)),
+            )
             if job:
                 job["status"] = "failed"
                 job["error"] = str(exc)
@@ -583,17 +605,7 @@ async def run_job(job_id: str) -> None:
     res_dir.mkdir(parents=True, exist_ok=True)
 
     visit: _Visit | None = None
-    html = ""
-    final_url = url
-    title = ""
-    http_status = None
-    article: dict = {}
-    resource_map: dict[str, str] = {}
-    resource_bodies: dict[str, tuple[bytes, str]] = {}
-    screenshot = b""
-    bounce_used: str | None = None
     retried = False
-    reader = ""
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -616,7 +628,13 @@ async def run_job(job_id: str) -> None:
                         attempt = await _capture_visit(
                             browser, job, url, bounce_origin=origin
                         )
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "Referrer retry failed snapshot=%s origin=%s (%s)",
+                            sid,
+                            origin,
+                            type(exc).__name__,
+                        )
                         continue
                     if _richer_article(attempt.article, visit.article):
                         await visit.close()

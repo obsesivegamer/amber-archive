@@ -63,11 +63,11 @@ def host_is_public(hostname: str) -> bool:
     return True
 
 
-def validate_public_http_url(url: str) -> str:
+def _validate_public_http_url(url: str, *, enforce_length: bool) -> str:
     raw = (url or "").strip()
     if not raw:
         raise ValueError("Paste a URL first.")
-    if len(raw) > 2048:
+    if enforce_length and len(raw) > 2048:
         raise ValueError("URL is too long.")
     if "://" not in raw:
         raw = "https://" + raw
@@ -84,6 +84,16 @@ def validate_public_http_url(url: str) -> str:
     if not host_is_public(host):
         raise ValueError("Private or local network URLs cannot be archived.")
     return urlunparse(parsed._replace(fragment=""))
+
+
+def validate_public_http_url(url: str) -> str:
+    """Validate a user-submitted capture URL, including its intake length limit."""
+    return _validate_public_http_url(url, enforce_length=True)
+
+
+def validate_public_http_request_url(url: str) -> str:
+    """Validate a browser request URL without applying the intake length limit."""
+    return _validate_public_http_url(url, enforce_length=False)
 
 
 def normalize_url(url: str) -> str:
