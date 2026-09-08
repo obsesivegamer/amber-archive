@@ -9,7 +9,7 @@ This directory is the maintained source for verifying Amber's user-facing behavi
 - Run `scripts/doctor.ps1` or `scripts/doctor.sh` and require exit 0: verify URL, scratch data dir, live PID, homepage 200.
 - Never drive `http://127.0.0.1:8080` or write to repo `data/`. That is the user's archive.
 - Seed snapshots only through `/import` or `/save`, not by inserting SQLite rows.
-- The fixture title is `Amber Verification Bridge`. The body token is `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`.
+- The fixture title is `Amber Verification Bridge`. The body token is `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`. The body is long enough to be a complete extract, not `incomplete · short extract`.
 
 ## Driving conventions
 

@@ -36,4 +36,5 @@ Preconditions:
 - The homepage file input is `required`. Browser automation that clicks `import` without a file will be blocked by the browser, not by Amber's empty-file flash. Use HTTP to prove the server-side empty/missing errors.
 - Import may take several seconds while it screenshots `reader.html`. Wait for the `303` to settle on `/{id}` with status 200.
 - If the HTML has no extractable original URL, Amber stores `https://example.com/`. The fixture includes a real-looking URL so search-by-host stays meaningful.
+- Keep the fixture body above Amber's short-extract threshold (80 words). A shorter file is treated as paywalled and shows `incomplete · short extract` plus the viewer note — that is not the happy-path import proof.
 - A second import of the same file creates a second id. Use the id from the latest `Location` header.
