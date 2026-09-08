@@ -8,7 +8,7 @@ Save a URL lets a user archive a public page into a short Amber link, see live c
 - `save-bookmarklet` starts the same job from `GET /save?url=`.
 - `save-progress` shows `#status-line` moving from `Loading` to `Saved` and then redirects to `/{id}`.
 - `save-exists` shows `Already saved — Amber` when that URL already has a complete snapshot, unless the user forces a new one.
-- `save-reject` returns to `/?error=` for empty, localhost, or private URLs.
+- `save-reject` returns to `/?error=` for empty, localhost, private, or CGNAT / Tailscale (`100.64.0.0/10`) URLs.
 
 ## How to get to it (user POV)
 
@@ -27,11 +27,12 @@ Preconditions:
 
 - **Home entry.** Open `/`. Fill `#url` with `https://example.com/` and choose `save`. The browser goes to `/saving/{id}` with `#status-line` starting `Loading https://example.com/`.
 - **Bookmarklet / GET entry.** `GET /save?url=https%3A%2F%2Fexample.com%2F` (no `force`). Same `/saving/{id}` redirect unless the URL already exists.
-- **HTTP form.** `curl.exe -sS -D - -o NUL --max-redirs 0 -X POST -F "url=https://example.com/" http://127.0.0.1:18080/save`. Status `303`, `Location: /saving/{id}`.
+- **HTTP form.** `curl.exe -sS -D - -o NUL --max-redirs 0 -X POST -F "url=https://example.com/" http://127.0.0.1:18080/save` (Linux/macOS: `curl` and `-o /dev/null`). Status `303`, `Location: /saving/{id}`.
 - **Progress.** Poll `GET /api/jobs/{id}` until `status` is `complete` or `failed` (allow ~90s). The saving page `#status-line` becomes `Saved …` and the browser replaces location with `/{id}`.
 - **Snapshot result.** `GET /{id}` is 200, title contains the page title or URL, and `{data_dir}/snaps/{id}/` has `page.html`, `screenshot.jpg`, and `article.txt`.
-- **Reject empty.** Submit `#url` empty (or `POST /save` with `url=`). Land on `/?error=` and a `.flash` containing `Paste a URL first.`
-- **Reject localhost.** Submit `http://127.0.0.1/secret`. Flash contains `Local URLs cannot be archived.` or `Private or local network URLs cannot be archived.`
+- **Reject empty.** `POST /save` with `url=` (homepage `#url` is HTML `required`, so a browser submit without a value never reaches Amber). Land on `/?error=` and a `.flash` containing `Paste a URL first.`
+- **Reject localhost.** Submit `http://127.0.0.1/secret`. Flash contains `Private or local network URLs cannot be archived.` Submit `http://localhost/secret` for `Local URLs cannot be archived.`
+- **Reject CGNAT.** `POST /save` with `url=http://100.64.0.1/`. Same private-network flash as loopback IP — not a separate page.
 - **Already saved.** Submit `https://example.com/` again after a complete snapshot. Page title is `Already saved — Amber`, existing rows link to `/{id}`, and no new job starts until `save a new snapshot anyway` (`force=1`).
 - **Force new.** On that page, choose `save a new snapshot anyway`. A new `/saving/{id}` job runs and `/saved` lists more than one snapshot for the same URL.
 - **Proof.** Save `evidence/save-url/before.png` on the homepage with the URL filled, `evidence/save-url/saving.png` on `/saving/{id}`, `evidence/save-url/after.png` plus `after.aria.txt` on `/{id}`, and `meta.txt` naming the entry point used.
@@ -39,7 +40,8 @@ Preconditions:
 ## Gotchas
 
 - The user's bookmarklet in the README points at port 8080. Verification must use the verify port.
-- Private and loopback hosts are blocked. A local fixture HTTP server cannot be archived unless you change product code; do not treat pytest's `allow_private` monkeypatch as a user path.
+- Private, loopback, and CGNAT (`100.64.0.0/10`) hosts are blocked at intake with the same `/?error=` flash path. A local fixture HTTP server cannot be archived unless you change product code; do not treat pytest's `allow_private` monkeypatch as a user path.
+- A public URL that later redirects to a private document fails on `/saving/{id}` (`.flash#err`, `/api/jobs/{id}` `status` is `failed`). That is not homepage `save-reject`. The failed row stays out of `/saved`.
 - Capture is asynchronous. A 303 to `/saving/{id}` is not proof the page was archived. Wait for `complete` and then open `/{id}`.
 - Re-saving the same normalized URL (tracking query params stripped) hits `save-exists`. Normalize before asserting "already saved".
 - `force=1` creates a second snapshot on purpose. Delete those ids from the scratch instance if a later recipe assumes a single row.

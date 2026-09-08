@@ -4,9 +4,9 @@ This directory is the maintained source for verifying Amber's user-facing behavi
 
 ## Baseline preconditions
 
-- Launch Amber with `.cursor/skills/verify-amber/scripts/launch.ps1`.
-- Instance URL is `http://127.0.0.1:18080` (or `$env:AMBER_VERIFY_PORT`) with `AMBER_DATA_DIR` under `.cursor/skills/verify-amber/.scratch/data`.
-- Run `scripts/doctor.ps1` and require exit 0: verify URL, scratch data dir, live PID, homepage 200.
+- Launch Amber with `.cursor/skills/verify-amber/scripts/launch.ps1` (Windows) or `scripts/launch.sh` (Linux/macOS).
+- Instance URL is `http://127.0.0.1:18080` (or `$env:AMBER_VERIFY_PORT` / `AMBER_VERIFY_PORT`) with `AMBER_DATA_DIR` under `.cursor/skills/verify-amber/.scratch/data`.
+- Run `scripts/doctor.ps1` or `scripts/doctor.sh` and require exit 0: verify URL, scratch data dir, live PID, homepage 200.
 - Never drive `http://127.0.0.1:8080` or write to repo `data/`. That is the user's archive.
 - Seed snapshots only through `/import` or `/save`, not by inserting SQLite rows.
 - The fixture title is `Amber Verification Bridge`. The body token is `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`.
@@ -16,7 +16,7 @@ This directory is the maintained source for verifying Amber's user-facing behavi
 - Start every recipe from the baseline unless its preconditions say otherwise.
 - Prefer labels and ids (`#url`, `#file`, `#q`, wordmark `Amber`, buttons `save` / `import` / `search` / `delete`) over CSS position.
 - Treat every command as literal.
-- Browser actions go through cursor-ide-browser against the verify URL.
+- Browser actions go through cursor-ide-browser against the verify URL when that MCP is available; otherwise use the available browser or HTTP against the same verify URL.
 - HTTP actions hit the same form routes the templates post to.
 - After a mutation, confirm from a second surface (browse, search, or files on disk). Do not remove proof artifacts during cleanup.
 

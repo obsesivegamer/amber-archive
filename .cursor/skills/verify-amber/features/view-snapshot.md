@@ -9,7 +9,7 @@ View a snapshot lets a user open a short Amber link and switch between the artic
 - `view-screenshot` opens `/{id}/screenshot` with the JPEG.
 - `view-files` serves `/{id}/reader`, `/{id}/raw`, `/{id}/image.jpg`, and `/{id}/thumb.jpg`.
 - `view-original` exposes the original URL in the toolbar.
-- `view-missing` is 404 for an unknown or incomplete id.
+- `view-missing` is 404 for an unknown or failed id. Pending or capturing ids redirect to `/saving/{id}` instead of the viewer.
 - `view-paywalled` shows a note on `/{id}` (and webpage / screenshot modes) when the snapshot is a paywalled teaser, with a link to homepage Import.
 
 ## How to get to it (user POV)
@@ -23,14 +23,14 @@ View a snapshot lets a user open a short Amber link and switch between the artic
 Preconditions:
 
 - Doctor is exit 0 on the verify instance.
-- A complete fixture snapshot exists (`scripts/import-fixture.ps1`). Note `{id}`.
+- A complete fixture snapshot exists (`scripts/import-fixture.ps1` or `scripts/import-fixture.sh`). Note `{id}`.
 
 - **Article mode.** Open `/{id}`. Title contains `Amber Verification Bridge — Amber`. Toolbar link `article` has class `on`. An iframe titled `Archived article` has `src="/{id}/reader"`.
 - **Webpage mode.** Choose `webpage`. URL is `/{id}/webpage`. Iframe titled `Archived webpage` has `src="/{id}/raw"`.
 - **Screenshot mode.** Choose `screenshot`. URL is `/{id}/screenshot`. An image `Graphical copy of Amber Verification Bridge` has `src="/{id}/image.jpg` when a shot exists.
-- **Reader HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/reader` is 200 and contains `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`.
-- **Raw HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/raw` is 200, `Content-Type` is HTML, and the body is the frozen page (scripts stripped).
-- **Image HTTP.** `curl.exe -sS -D - -o NUL http://127.0.0.1:18080/{id}/image.jpg`. If import's Playwright shot succeeded: 200, JPEG. If not: 404 `No screenshot` — record the skip; do not call article mode failed.
+- **Reader HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/reader` (or `curl`) is 200 and contains `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`.
+- **Raw HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/raw` (or `curl`) is 200, `Content-Type` is HTML, and the body is the frozen page (scripts stripped).
+- **Image HTTP.** `curl.exe -sS -D - -o NUL http://127.0.0.1:18080/{id}/image.jpg` (Linux/macOS: `curl` and `-o /dev/null`). If import's Playwright shot succeeded: 200, JPEG. If not: 404 `No screenshot` — record the skip; do not call article mode failed.
 - **Original URL.** Toolbar link `.orig` is the fixture URL `https://verify.example/amber-verification-bridge` and opens in a new tab.
 - **Text alias.** `GET /{id}/text` is `303` to `/{id}`.
 - **Missing.** `GET /zzzzz` (invalid or unused id) is 404.

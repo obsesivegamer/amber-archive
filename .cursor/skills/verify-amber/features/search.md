@@ -10,6 +10,7 @@ Search lets a user find complete snapshots by URL, title, or site name, open a m
 - `search-open` opens a result and lands on `/{id}`.
 - `search-empty` shows `No snapshots matched` for a query with no hits.
 - `search-blank` on `/search` with an empty `q` shows the form and no result list.
+- `search-paywalled` still lists a complete paywalled snapshot and shows `incomplete · short extract`.
 
 ## How to get to it (user POV)
 
@@ -22,7 +23,7 @@ Search lets a user find complete snapshots by URL, title, or site name, open a m
 Preconditions:
 
 - Doctor is exit 0 on the verify instance.
-- A fixture snapshot exists (run `scripts/import-fixture.ps1` if `/saved` is empty).
+- A fixture snapshot exists (run `scripts/import-fixture.ps1` or `scripts/import-fixture.sh` if `/saved` is empty).
 - Note the `snapshot_id` from import.
 
 - **Home entry.** Open `/`. Fill `#q` with `Amber Verification Bridge` and choose `search`. The URL becomes `/search?q=Amber+Verification+Bridge` (encoding may vary) and the results list includes a link whose text is `Amber Verification Bridge`.
@@ -30,8 +31,9 @@ Preconditions:
 - **Host match.** Search `verify.example`. The fixture row is present with its original URL shown.
 - **Open result.** Choose the result link `Amber Verification Bridge`. The viewer at `/{id}` loads.
 - **Empty state.** Search `volcano-no-such-snapshot`. The page contains `No snapshots matched “volcano-no-such-snapshot”.`
+- **Paywalled match.** A complete snapshot with `paywalled` set still appears in results and includes `incomplete · short extract` (same flag as `/saved`). The fixture article is not paywalled; only assert this when you imported a short teaser.
 - **Blank query.** Open `/search` with no `q`. Title is `Search — Amber`. There is no `No snapshots matched` line and no result `<ul>`.
-- **HTTP.** `curl.exe -sS "http://127.0.0.1:18080/search?q=Amber%20Verification%20Bridge"` is 200 and contains the fixture title and `/{id}`.
+- **HTTP.** `curl.exe -sS "http://127.0.0.1:18080/search?q=Amber%20Verification%20Bridge"` (or `curl`) is 200 and contains the fixture title and `/{id}`.
 - **Proof.** Save `evidence/search/before.png` on `/search` or home, `evidence/search/after.png` and `after.aria.txt` on the populated results, and `meta.txt` naming which entry point was used.
 
 ## Gotchas

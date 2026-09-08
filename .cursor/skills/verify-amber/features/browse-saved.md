@@ -4,7 +4,7 @@ Browse saved lists every complete snapshot. Delete removes that snapshot's files
 
 ## Sub-features
 
-- `browse-saved` opens `/saved` and lists titles, hosts, dates, and `/{id}`. Paywalled rows also say `incomplete · paywalled teaser`.
+- `browse-saved` opens `/saved` and lists titles, hosts, dates, and `/{id}`. Paywalled rows also say `incomplete · short extract`.
 - `browse-empty` shows `Nothing saved yet.` when the scratch archive has no complete snapshots.
 - `browse-home-recent` shows `Recently saved` on `/` after at least one complete snapshot.
 - `browse-count` shows `browse (N)` on `/` when `N` complete snapshots exist.
@@ -27,12 +27,12 @@ Preconditions:
 - For `browse-empty`, start from a freshly launched scratch dir with no imports.
 
 - **Browse entry.** Open `/` and choose the `browse` link (`href="/saved"`). Title is `Saved — Amber`. The hint mentions the count. A `.saved-row` contains `Amber Verification Bridge`, `/{id}`, and a `delete` button.
-- **Recent entry.** After a complete snapshot, `/` includes a `Recently saved` heading and a link to `/{id}`. A paywalled teaser also shows `incomplete · paywalled teaser`.
-- **HTTP list.** `curl.exe -sS http://127.0.0.1:18080/saved` is 200 and contains `everything you've saved` plus the fixture title.
+- **Recent entry.** After a complete snapshot, `/` includes a `Recently saved` heading and a link to `/{id}`. A paywalled teaser also shows `incomplete · short extract`.
+- **HTTP list.** `curl.exe -sS http://127.0.0.1:18080/saved` (or `curl`) is 200 and contains `everything you've saved` plus the fixture title.
 - **Empty archive.** On a new scratch instance with zero complete rows, `/saved` contains `Nothing saved yet.` and has no `.saved-row`.
 - **Delete from list.** On `/saved`, submit the row's `delete` form. Accept the browser confirm `Delete /{id}? This cannot be undone.` Response is `303` to `/saved`. The id is gone from the HTML.
 - **Delete from viewer.** Open `/{id}` and choose toolbar `delete`, confirm. Land on `/saved` without that id.
-- **HTTP delete.** `curl.exe -sS -D - -o NUL --max-redirs 0 -X POST http://127.0.0.1:18080/saved/{id}/delete`. Status `303`, `Location: /saved`.
+- **HTTP delete.** `curl.exe -sS -D - -o NUL --max-redirs 0 -X POST http://127.0.0.1:18080/saved/{id}/delete` (Linux/macOS: `curl` and `-o /dev/null`). Status `303`, `Location: /saved`.
 - **Side effect.** `{data_dir}/snaps/{id}/` is gone. `GET /{id}` is 404. `/saved` no longer contains the id.
 - **Proof.** Save `evidence/browse-saved/before.png` on `/saved` with the row visible, `evidence/browse-saved/after.png` and `after.aria.txt` after delete (or the populated list if you are not proving delete), plus `meta.txt` for the entry point. If you delete, also record that the folder is absent.
 
