@@ -81,6 +81,33 @@ def fmt_date(iso: str | None) -> str:
         return iso
 
 
+def fmt_bytes(value: int | None) -> str:
+    try:
+        size = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return ""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{size / (1024 * 1024 * 1024):.1f} GB"
+
+
+def fmt_duration(value: int | None) -> str:
+    try:
+        millis = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return ""
+    if millis < 1000:
+        return f"{millis} ms"
+    if millis < 60 * 1000:
+        return f"{millis / 1000:.1f} s".replace(".0 s", " s")
+    minutes, remainder = divmod(millis, 60 * 1000)
+    return f"{minutes}m {remainder / 1000:.1f}s".replace(".0s", "s")
+
+
 def host_of(url: str | None) -> str:
     if not url:
         return ""
@@ -89,7 +116,18 @@ def host_of(url: str | None) -> str:
 
 
 templates.env.filters["fmtdate"] = fmt_date
+templates.env.filters["filesize"] = fmt_bytes
+templates.env.filters["duration"] = fmt_duration
 templates.env.filters["host"] = host_of
+
+
+def _read_capture_stats(sid: str) -> dict:
+    try:
+        meta = db.read_json(db.snap_dir(sid) / "meta.json")
+    except (OSError, TypeError, ValueError):
+        return {}
+    stats = meta.get("capture_stats") if isinstance(meta, dict) else None
+    return stats if isinstance(stats, dict) else {}
 
 
 @asynccontextmanager
@@ -193,6 +231,8 @@ async def save(request: Request):
         "resources": [],
         "error": None,
         "title": None,
+        "final_url": None,
+        "capture_stats": capture.empty_capture_stats(),
     }
     assert capture.job_queue is not None
     await capture.job_queue.put(job_id)
@@ -228,6 +268,9 @@ async def job_status(job_id: str):
             "error": snap.get("error"),
             "resources": [],
             "title": snap.get("title"),
+            "url": snap.get("url"),
+            "final_url": snap.get("final_url"),
+            "capture_stats": _read_capture_stats(job_id),
         }
     return {
         "id": job["id"],
@@ -237,6 +280,8 @@ async def job_status(job_id: str):
         "resources": job.get("resources", [])[-80:],
         "title": job.get("title"),
         "url": job.get("url"),
+        "final_url": job.get("final_url"),
+        "capture_stats": job.get("capture_stats", capture.empty_capture_stats()),
     }
 
 
@@ -280,6 +325,7 @@ def _require_complete(sid: str) -> dict:
         if snap["status"] in {"pending", "capturing"}:
             return RedirectResponse(f"/saving/{sid}", status_code=303)  # type: ignore[return-value]
         raise HTTPException(404, snap.get("error") or "Snapshot failed")
+    snap["capture_stats"] = _read_capture_stats(sid)
     return snap
 
 

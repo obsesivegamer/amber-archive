@@ -46,7 +46,7 @@ HTML = """<!doctype html>
     <img src="/hero.png" alt="bridge">
     <a href="javascript:alert(1)">bad</a>
     <form action="/login"><input name="password"><button>send</button></form>
-    <iframe src="https://evil.example/ad"></iframe>
+    <iframe src="https://google-analytics.com.test/ad"></iframe>
   </article>
 </body>
 </html>
@@ -102,11 +102,20 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         r = client.post("/save", data={"url": local_site}, follow_redirects=False)
         assert r.status_code == 303
         sid = r.headers["location"].rsplit("/", 1)[-1]
-        _wait_complete(client, sid)
+        job = _wait_complete(client, sid)
+        stats = job["capture_stats"]
+        assert job["final_url"] == local_site
+        assert stats["blocked_resources"] >= 1
+        assert stats["saved_resources"] == 3
+        assert stats["bytes_saved"] == len(CSS.encode()) + len(PNG) + len(FONT)
+        assert stats["duration_ms"] > 0
 
         page = client.get(f"/{sid}")
         assert page.status_code == 200
         assert "article" in page.text
+        assert "final" in page.text
+        assert f"{stats['saved_resources']} assets" in page.text
+        assert "saved" in page.text
         reader = client.get(f"/{sid}/reader")
         assert reader.status_code == 200
         assert "City Council Approves Bridge" in reader.text
@@ -145,6 +154,14 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         from app import db
 
         meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta["capture_stats"] == stats
+        assert meta["final_url"] == local_site
+        from app import capture
+
+        capture.jobs.pop(sid, None)
+        archived_job = client.get(f"/api/jobs/{sid}").json()
+        assert archived_job["capture_stats"] == stats
+        assert archived_job["final_url"] == local_site
         origin = local_site.rsplit("/", 1)[0]
         for path, expected in (("/hero.png", PNG), ("/fixture.woff2", FONT)):
             filename = meta["resources"][origin + path]
@@ -214,5 +231,3 @@ def test_capture_keeps_article_body_not_related_card(
         assert reader.status_code == 200
         assert "TOKEN_FULL_ARTICLE" in reader.text
         assert "short preview" not in reader.text
-
-
