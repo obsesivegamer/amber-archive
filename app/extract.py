@@ -44,9 +44,14 @@ _ARTICLE_CHROME_SELECTORS = (
 # Publisher UI that leaks into the chosen extract. Applied only after a
 # candidate is picked — do not fold these into _RECIRC_SELECTORS (that list
 # changes paywall scoring). Prefer tokens + roles over site-specific classes.
-_ALWAYS_DROP_TAGS = frozenset({"button", "nav", "aside", "audio", "video", "footer"})
-_CHROME_ROLES = frozenset(
-    {"toolbar", "navigation", "menu", "menubar", "complementary"}
+# Unconditional: controls that are never article prose.
+_ALWAYS_DROP_TAGS = frozenset({"button", "audio"})
+_ALWAYS_DROP_ROLES = frozenset({"toolbar"})
+# May hold a pull quote, TOC, embed, or correction — keep when ≥40 words
+# (video with a real src counts as content even with no transcript).
+_GATED_CHROME_TAGS = frozenset({"nav", "aside", "video", "footer"})
+_GATED_CHROME_ROLES = frozenset(
+    {"navigation", "menu", "menubar", "complementary"}
 )
 _TESTID_NEEDLES = (
     "share",
@@ -109,6 +114,10 @@ _SHARE_HREF_RE = re.compile(
     re.I,
 )
 _LAZY_SRC_ATTRS = ("src", "srcset", "data-src", "data-original", "data-lazy-src")
+_PLACEHOLDER_SRC_RE = re.compile(
+    r"(spacer|placeholder|transparent|pixel|1x1|blank\.gif|dummy|lazy[-_]?load)",
+    re.I,
+)
 _LAYOUT_ATTRS = frozenset({"width", "height", "align", "hspace", "vspace", "border"})
 _PROSE_KEEP_WORDS = 40
 
@@ -180,10 +189,12 @@ def _media_url(img) -> str:
 
 
 def _has_content_media(elem) -> bool:
+    if elem.name == "video" and _video_has_src(elem):
+        return True
     for img in elem.find_all("img"):
         if _media_url(img):
             return True
-    if elem.find("source") or elem.find("picture"):
+    if elem.find("source") or elem.find("picture") or elem.find("video"):
         return True
     if elem.name == "figure" or elem.find("figure"):
         return True
@@ -193,6 +204,29 @@ def _has_content_media(elem) -> bool:
 def _safe_to_drop(elem) -> bool:
     """Keep wrappers that still hold a real body, not just a toolbar."""
     return _node_words(elem) < _PROSE_KEEP_WORDS
+
+
+def _video_has_src(elem) -> bool:
+    if (elem.get("src") or "").strip():
+        return True
+    return bool(elem.find("source"))
+
+
+def _keep_gated_chrome(elem) -> bool:
+    """aside/nav/footer/video: keep unique prose or a real media embed."""
+    if elem.name == "video" and _video_has_src(elem):
+        return True
+    return not _safe_to_drop(elem)
+
+
+def _svg_is_icon(svg) -> bool:
+    """Drop share/listen glyphs; keep charts and labeled diagrams."""
+    if svg.find_parent("figure") is not None:
+        return False
+    for tag in svg.find_all(["text", "title", "desc"]):
+        if tag.get_text(" ", strip=True):
+            return False
+    return len(svg.find_all(True)) < 8
 
 
 def _label_is_chrome(elem) -> bool:
@@ -210,13 +244,22 @@ def _testid_is_chrome(elem) -> bool:
     return any(needle in aria for needle in _ARIA_NEEDLES)
 
 
+def _src_is_placeholder(src: str, img) -> bool:
+    s = (src or "").strip()
+    if not s or s.lower().startswith("data:image"):
+        return True
+    if _PLACEHOLDER_SRC_RE.search(s):
+        return True
+    return str(img.get("width") or "") == "1" and str(img.get("height") or "") == "1"
+
+
 def _promote_lazy_src(img) -> None:
     src = (img.get("src") or "").strip()
-    if src and not src.lower().startswith("data:image"):
+    if src and not _src_is_placeholder(src, img):
         return
     for key in ("data-src", "data-original", "data-lazy-src"):
         val = (img.get(key) or "").strip()
-        if val:
+        if val and not _src_is_placeholder(val, img):
             img["src"] = val
             return
 
@@ -233,7 +276,7 @@ def _is_tiny_placeholder(img) -> bool:
 
 
 def _drop_empty_shells(root) -> None:
-    keep = {"html", "body", "[document]", "br", "hr", "img", "picture", "source"}
+    keep = {"html", "body", "[document]", "br", "hr", "img", "picture", "source", "video"}
     changed = True
     while changed:
         changed = False
@@ -268,11 +311,15 @@ def sanitize_article_html(html: str) -> str:
     root = soup.body or soup
 
     always = []
+    gated = []
     maybe = []
     for elem in root.find_all(True):
         role = (elem.get("role") or "").strip().lower()
-        if elem.name in _ALWAYS_DROP_TAGS or role in _CHROME_ROLES:
+        if elem.name in _ALWAYS_DROP_TAGS or role in _ALWAYS_DROP_ROLES:
             always.append(elem)
+            continue
+        if elem.name in _GATED_CHROME_TAGS or role in _GATED_CHROME_ROLES:
+            gated.append(elem)
             continue
         if _testid_is_chrome(elem) or _label_is_chrome(elem):
             maybe.append(elem)
@@ -283,6 +330,11 @@ def sanitize_article_html(html: str) -> str:
 
     for node in _outermost(always):
         if not getattr(node, "decomposed", False):
+            node.decompose()
+    for node in _outermost(gated):
+        if getattr(node, "decomposed", False):
+            continue
+        if not _keep_gated_chrome(node):
             node.decompose()
     for node in _outermost(maybe):
         if getattr(node, "decomposed", False):
@@ -330,7 +382,7 @@ def sanitize_article_html(html: str) -> str:
     for svg in list(root.find_all("svg")):
         if getattr(svg, "decomposed", False):
             continue
-        if svg.find_parent("figure") is None:
+        if _svg_is_icon(svg):
             svg.decompose()
 
     _drop_empty_shells(root)

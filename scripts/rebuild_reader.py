@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Rebuild reader.html from a stored page.html (no live fetch).
+"""Rebuild reader.html from a stored extract (no live fetch).
 
-Use this to refresh existing snapshots after extract/reader changes.
+Prefers snaps/<id>/article.html (the extract capture/import already
+wrote, including JSON-backed bodies). Re-extracts frozen page.html only
+when article.html is missing, and refuses to write if that extract is
+worse (word count collapses or paywalled flips true).
+
 Does not rewrite page.html or screenshots.
 
 From the repo root, with Amber's venv and the same AMBER_DATA_DIR the
@@ -42,8 +46,13 @@ def main() -> int:
             print(f"{sid}: error: {exc}", file=sys.stderr)
             failed += 1
             continue
+        if article.get("rebuild_refused"):
+            print(f"{sid}: refused: {article.get('rebuild_reason')}", file=sys.stderr)
+            failed += 1
+            continue
         print(
-            f"{sid}: words={article.get('word_count')} "
+            f"{sid}: source={article.get('rebuild_source')} "
+            f"words={article.get('word_count')} "
             f"paywalled={article.get('paywalled')} "
             f"title={article.get('title')}"
         )

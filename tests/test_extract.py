@@ -131,6 +131,32 @@ LOCKED_ARTICLE = """
 """
 
 
+def test_react_fulltext_aside_stays_in_the_extract():
+    """Sanitize must not drop a unique aside from rails fullText under 80 words."""
+    aside = " ".join(
+        f"Aside sentence {i} about the interconnect queue and crew rest."
+        for i in range(10)
+    )
+    assert len(aside.split()) >= 40
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="SpaceX Shakes Up Data Center Leadership">
+  <script type="application/json" class="js-react-on-rails-component" data-component-name="Article">
+  {{"article":{{"title":"SpaceX Shakes Up Data Center Leadership","fullText":"<p>Lead sentence about the campus TOKEN_ASIDE_LEAD.</p><aside><p>{aside}</p></aside><p>Closing sentence TOKEN_ASIDE_CLOSE.</p>"}}}}
+  </script>
+</head>
+<body><h1>SpaceX Shakes Up Data Center Leadership</h1><p>Sign in</p></body>
+</html>
+"""
+    got = extract_article(html, "https://www.theinformation.com/articles/x")
+    assert "TOKEN_ASIDE_LEAD" in got["article_text"]
+    assert "Aside sentence 0" in got["article_text"]
+    assert "TOKEN_ASIDE_CLOSE" in got["article_text"]
+    assert got["word_count"] >= 80
+    assert got["paywalled"] is False
+
+
 def test_react_article_uses_free_blurb_not_short_og():
     got = extract_article(LOCKED_ARTICLE, "https://www.theinformation.com/articles/x")
     assert got["title"] == "SpaceX Shakes Up Data Center Leadership After Aggressive Build-Out"
@@ -205,6 +231,90 @@ def test_sanitize_is_idempotent_on_nyt_extract():
     assert BEETS_BODY_TOKEN in again
     assert "Share full article" not in again
     assert "beets-bowl.jpg" in again
+
+
+def test_sanitize_keeps_long_aside_nav_video_and_footer():
+    quote = " ".join(
+        f"Pull quote word{i} about nitrate and blood pressure in beets."
+        for i in range(8)
+    )
+    toc = " ".join(
+        f"Section heading {i} covering soil, harvest, and roasting."
+        for i in range(25)
+    )
+    correction = " ".join(
+        f"Correction word{i} on the date of the garden trial."
+        for i in range(8)
+    )
+    assert len(quote.split()) >= 40
+    assert len(toc.split()) >= 40
+    assert len(correction.split()) >= 40
+    html = f"""
+    <article>
+      <p>Lead paragraph about beets TOKEN_BEETS_BODY in ordinary food.</p>
+      <aside><p>{quote}</p></aside>
+      <nav><p>{toc}</p></nav>
+      <video src="https://static.example/beets.mp4"></video>
+      <footer><p>{correction}</p></footer>
+      <aside><p>More in Well</p></aside>
+      <button>Listen · 6:27 min</button>
+      <div role="toolbar"><a href="/share">Share full article</a></div>
+      <p>Closing paragraph TOKEN_BEETS_RECIPE stays in the extract.</p>
+    </article>
+    """
+    got = sanitize_article_html(html)
+    assert "Pull quote word0" in got
+    assert "Section heading 0" in got
+    assert "beets.mp4" in got
+    assert "Correction word0" in got
+    assert "TOKEN_BEETS_BODY" in got
+    assert "TOKEN_BEETS_RECIPE" in got
+    assert "More in Well" not in got
+    assert "Listen · 6:27" not in got
+    assert "Share full article" not in got
+
+
+def test_sanitize_keeps_rails_aside_prose_above_paywall_line():
+    """A JSON fullText aside with unique prose must not be stripped under 80 words."""
+    aside = " ".join(
+        f"Aside sentence {i} about the interconnect queue and crew rest."
+        for i in range(10)
+    )
+    assert len(aside.split()) >= 40
+    html = (
+        "<p>Lead sentence about the campus.</p>"
+        f"<aside><p>{aside}</p></aside>"
+        "<p>Closing sentence.</p>"
+    )
+    got = sanitize_article_html(html)
+    assert "Aside sentence 0" in got
+    from app.extract import _prose_word_count
+
+    assert _prose_word_count(got) >= 40
+
+
+def test_sanitize_promotes_spacer_gif_to_data_src():
+    html = (
+        '<p>TOKEN_BEETS_BODY</p>'
+        '<img src="https://static.example/spacer.gif" '
+        'data-src="https://static.example/beets-real.jpg" alt="Beets">'
+    )
+    got = sanitize_article_html(html)
+    assert "beets-real.jpg" in got
+    assert 'src="https://static.example/beets-real.jpg"' in got
+    assert "spacer.gif" not in got
+
+
+def test_sanitize_keeps_svg_chart_outside_figure():
+    slices = "".join(f'<path d="M{i} 0 L{i} 10"></path>' for i in range(10))
+    html = (
+        "<p>TOKEN_BEETS_BODY</p>"
+        f'<svg viewBox="0 0 100 40"><title>Beet yield</title>{slices}</svg>'
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M0 0h16v16H0z"></path></svg>'
+    )
+    got = sanitize_article_html(html)
+    assert "Beet yield" in got
+    assert got.count("<svg") == 1
 
 
 def test_share_listen_chrome_does_not_inflate_word_count():
