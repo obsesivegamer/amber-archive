@@ -5,6 +5,7 @@ from app.ingest import (
     original_url_from_html,
     rebuild_reader,
 )
+from app.reader import build_reader_html
 from tests.test_extract import (
     ARCHIVE_IS_SAVED,
     LOCKED_ARTICLE,
@@ -306,15 +307,179 @@ def test_stored_reader_body_html_uses_body_not_wrap_chrome():
       <aside>By Chrome Author</aside>
       <div class="body">
         <p class="notice">Incomplete — Amber extracted only a short preview. CHROME_NOTICE_TOKEN</p>
+        <p class="notice">Correction: TOKEN_PUBLISHER_NOTICE editors later confirmed the count.</p>
         <p>TOKEN_READER_BODY the real extract lives here.</p>
       </div>
     </article>
     </body></html>"""
     got = _stored_reader_body_html(html)
     assert "TOKEN_READER_BODY" in got
+    assert "TOKEN_PUBLISHER_NOTICE" in got
     assert "CHROME_OUTSIDE_TOKEN" not in got
     assert "CHROME_NOTICE_TOKEN" not in got
     assert "Chrome Author" not in got
     assert _stored_reader_body_html("") == ""
     assert _stored_reader_body_html("<html><body><h1>Title</h1><p>words</p></body></html>") == ""
     assert _stored_reader_body_html(_READER_WRAP_NO_BODY) == ""
+
+
+def test_rebuild_prefers_article_html_when_reader_is_invalid_utf8(tmp_data):
+    """Valid article.html must win even if unused reader.html is not UTF-8."""
+    body = " ".join(f"keep{i}" for i in range(100))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Primary extract"></head>
+<body><article><h1>Primary extract</h1><p>TOKEN_ARTICLE_PRIMARY {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/primary")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    assert (folder / "article.html").read_text(encoding="utf-8").strip()
+    (folder / "reader.html").write_bytes(b"\xff\xfe not utf-8 \x80\x81")
+    article = rebuild_reader(sid)
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "article.html"
+    assert "TOKEN_ARTICLE_PRIMARY" in (folder / "article.txt").read_text(encoding="utf-8")
+    assert article["word_count"] >= 100
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_keeps_publisher_notice_in_reader_body(tmp_data):
+    """Publisher class=notice corrections must survive; only Amber's banner is stripped."""
+    body = " ".join(f"keep{i}" for i in range(100))
+    correction = (
+        "Correction: TOKEN_PUBLISHER_NOTICE editors later confirmed "
+        "the headcount was wrong on Tuesday night downtown after review."
+    )
+    assert len(correction.split()) == 15
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Notice probe"></head>
+<body><article><h1>Notice probe</h1>
+<p class="notice">{correction}</p>
+<p>{body}</p>
+</article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/notice")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    before = db.get_snapshot(sid)
+    amber_banner = (
+        '<p class="notice">Incomplete — Amber extracted only a short preview. '
+        "The page may have limited access, or extraction may have missed the full article. "
+        "If the full piece is visible in your browser, save the page as HTML, then "
+        "Import that file on Amber's homepage.</p>"
+    )
+    reader = f"""<!doctype html>
+<html><body>
+<article class="wrap">
+<h1>CHROME_OUTSIDE_TOKEN {before["title"]}</h1>
+<div class="body">
+{amber_banner}
+<p class="notice">{correction}</p>
+<p>{body}</p>
+</div>
+</article>
+</body></html>"""
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("stale", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    article = rebuild_reader(sid)
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    rebuilt = (folder / "reader.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "reader.html"
+    assert "TOKEN_PUBLISHER_NOTICE" in article_html
+    assert "TOKEN_PUBLISHER_NOTICE" in text
+    assert "TOKEN_PUBLISHER_NOTICE" in rebuilt
+    assert "CHROME_OUTSIDE_TOKEN" not in article_html
+    assert article["word_count"] >= 115
+    assert db.get_snapshot(sid)["title"] == before["title"]
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_empty_reader_placeholder_falls_back_to_page_html(tmp_data):
+    """Amber notice plus empty <p></p> is not a stored extract; use page.html."""
+    token = "TOKEN_PAGE_RECOVER"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Recoverable"></head>
+<body><article><h1>Recoverable</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/recover")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    empty_reader = build_reader_html(
+        {
+            "title": "Recoverable",
+            "article_html": "",
+            "article_text": "",
+            "paywalled": True,
+            "word_count": 0,
+        },
+        "https://daily.test/recover",
+    )
+    assert "<p></p>" in empty_reader
+    assert "Incomplete — Amber extracted only a short preview." in empty_reader
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(empty_reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=1)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert token in text
+    assert token in article_html
+    assert article["word_count"] >= 80
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_reader_keeps_media_only_body(tmp_data):
+    """A zero-word reader body with retained media is usable; do not take page.html."""
+    token = "TOKEN_PAGE_STORY"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Photo essay"></head>
+<body><article><h1>Photo essay</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/photo")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    reader = build_reader_html(
+        {
+            "title": "Photo essay",
+            "article_html": (
+                '<figure><img src="https://cdn.example/shot.jpg" alt=""></figure>'
+            ),
+            "article_text": "",
+            "paywalled": False,
+            "word_count": 0,
+        },
+        "https://daily.test/photo",
+    )
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "reader.html"
+    assert "shot.jpg" in article_html
+    assert token not in article_html
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
