@@ -120,10 +120,54 @@ _PLACEHOLDER_SRC_RE = re.compile(
 )
 _LAYOUT_ATTRS = frozenset({"width", "height", "align", "hspace", "vspace", "border"})
 _PROSE_KEEP_WORDS = 40
+_SCRIPT_PUNCT_CHARS = frozenset("{};()[]=<>|&!+*/^%$~`")
+_SCRIPT_TOKEN_RE = re.compile(
+    r"\bvar\s|\bfunction\s*\(|\bconst\s|\blet\s|=>|\bwindow\.|\bdocument\.|"
+    r"\btypeof\b|\breturn\b|\bnull\b|\bundefined\b|\|\||&&|===|!==|\.prototype\b|"
+    r"\baddEventListener\b|\bJSON\.(?:parse|stringify)\b"
+)
+_SCRIPT_MIN_CHARS = 200
+# freeze() writes these where an embed used to be; the reader round trip can
+# re-render the text without the class, so match the wording as well.
+_FREEZE_MARKER_RE = re.compile(r"\[embedded content removed(?::[^\]]*)?\]")
+_SCRIPT_PUNCT_RATIO = 0.05
+_SCRIPT_TOKENS_PER_100_WORDS = 10.0
+_SCRIPT_LONG_WORD = 25
+_SCRIPT_LONG_WORD_PCT = 10.0
 
 
 def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
+
+
+def text_is_freeze_markers_only(text: str) -> bool:
+    """True when a body carries freeze()'s embed markers and no prose."""
+    flat = " ".join((text or "").split())
+    if not _FREEZE_MARKER_RE.search(flat):
+        return False
+    return not _FREEZE_MARKER_RE.sub(" ", flat).split()
+
+
+def text_looks_like_script(text: str) -> bool:
+    """True when a body reads as bundle source rather than prose.
+
+    A save truncated mid-attribute swallows the following `<script>` open
+    tag, so the parser recovers by emitting minified JS as document text and
+    readability then scores that blob as the article. Three independent
+    signals, two of which must fire, so a post that quotes code still reads.
+    """
+    flat = " ".join((text or "").split())
+    if len(flat) < _SCRIPT_MIN_CHARS:
+        return False
+    words = flat.split()
+    punct = sum(1 for c in flat if c in _SCRIPT_PUNCT_CHARS) / len(flat)
+    tokens = len(_SCRIPT_TOKEN_RE.findall(flat)) / len(words) * 100
+    long_words = sum(1 for w in words if len(w) > _SCRIPT_LONG_WORD) / len(words) * 100
+    return (
+        (punct >= _SCRIPT_PUNCT_RATIO)
+        + (tokens >= _SCRIPT_TOKENS_PER_100_WORDS)
+        + (long_words >= _SCRIPT_LONG_WORD_PCT)
+    ) >= 2
 
 
 def _prose_word_count(html: str) -> int:
@@ -325,6 +369,15 @@ def sanitize_article_html(html: str) -> str:
         return html
     soup = BeautifulSoup(html, "lxml")
     root = soup.body or soup
+
+    # A stored article.html is sanitized rather than re-extracted, so freeze()'s
+    # own markers have to be dropped here too or a body of nothing but embed
+    # placeholders scores as prose and wins the rebuild source order.
+    for note in root.select("p.amber-removed"):
+        note.decompose()
+    for node in list(root.find_all(string=_FREEZE_MARKER_RE)):
+        left = _FREEZE_MARKER_RE.sub(" ", str(node))
+        node.replace_with(left) if left.split() else node.extract()
 
     always = []
     gated = []
@@ -618,6 +671,10 @@ def _dek_near_h1(h1) -> str | None:
 
 def extract_article(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
+    # freeze() leaves these markers where an embed used to be. They are Amber's
+    # own text, so they must not score as the body or pad the word count.
+    for note in soup.select("p.amber-removed"):
+        note.decompose()
     ld = _from_ld(soup)
     rails = _from_react_on_rails(soup)
     nxt = _from_next_data(soup)
@@ -745,6 +802,9 @@ def extract_article(html: str, url: str) -> dict:
         article_text = body.get_text("\n", strip=True)
 
     article_text = _WS.sub(" ", article_text).strip()
+    if text_looks_like_script(article_text):
+        article_html = ""
+        article_text = ""
     words = [w for w in re.split(r"\s+", article_text) if w]
     desc_words = [w for w in re.split(r"\s+", description or "") if w]
     # Soft paywalls often leave only a lock/CTA in the DOM while the lede

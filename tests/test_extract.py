@@ -783,3 +783,127 @@ def test_wp_comment_articles_inside_unlikely_chrome_stay_paywalled():
         assert got["word_count"] < 80, (name, got["word_count"])
         assert "Sponsor blurb 0" not in got["article_text"], name
         assert FULL_ARTICLE_TOKEN not in got["article_text"], name
+
+
+ORPHANED_INLINE_SCRIPT = (FIXTURES / "orphaned_inline_script.html").read_text(encoding="utf-8")
+
+# Minified bundle text, as a broken save leaves it loose in the document.
+MINIFIED_JS = (
+    '(window.AdKit=window.AdKit||{},window.AdKit.cmd=window.AdKit.cmd||[],window.AdKit);'
+    'var t=function(){return t=Object.assign||function(e){for(var o in e)'
+    'Object.prototype.hasOwnProperty.call(e,o)&&(e[o]=e[o]);return e},t.apply(this,arguments)};'
+    'function r(){return"undefined"!=typeof window&&window.document?window:null}'
+    'const d=()=>"full"===a();var s=function(e,t){return null!=e&&void 0!==t?e[t]:null};'
+)
+
+# A programming post: real prose that quotes code. Must stay readable.
+CODE_HEAVY_PROSE = (
+    "The team spent three weeks tracking down a memory leak in the scheduler, and the "
+    "fix turned out to be a single missing call. Every worker held a reference to the "
+    "queue long after the job finished, so nothing was ever collected. The old code read "
+    "like this: for (const job of queue) { await run(job); } and the new one simply adds "
+    "queue.clear() once the loop exits. That change alone cut steady-state memory by "
+    "roughly forty percent on the staging cluster, which had been restarting twice a day. "
+    "Reviewers argued about whether the clear belonged in the caller or the queue itself, "
+    "and the team settled on the caller because two other services already relied on the "
+    "existing behaviour. The patch shipped on a Tuesday and the restarts stopped that week."
+)
+
+
+def test_orphaned_inline_script_is_not_served_as_article():
+    """A save truncated mid-attribute spills bundle source into the document text."""
+    article = extract_article(ORPHANED_INLINE_SCRIPT, "https://daily.test/bridge")
+    assert "AdKit" not in article["article_text"]
+    assert "window." not in article["article_text"]
+    assert not article["article_text"].lstrip("(").startswith("window")
+    # Nothing readable survives, so Amber must fall back to the dek and stay honest.
+    assert article["title"] == "City Bridge Vote Draws Record Crowd"
+    assert article["paywalled"] is True
+    assert article["word_count"] < 40
+
+
+def test_text_looks_like_script_flags_minified_bundles():
+    from app.extract import text_looks_like_script
+
+    assert text_looks_like_script(MINIFIED_JS) is True
+
+
+def test_text_looks_like_script_keeps_prose_that_quotes_code():
+    from app.extract import text_looks_like_script
+
+    assert text_looks_like_script(CODE_HEAVY_PROSE) is False
+
+
+@pytest.mark.parametrize("sample", ["", "   ", "Short line.", "By Jane Reporter"])
+def test_text_looks_like_script_ignores_short_fragments(sample):
+    from app.extract import text_looks_like_script
+
+    assert text_looks_like_script(sample) is False
+
+
+def test_text_looks_like_script_keeps_ordinary_news_prose():
+    from app.extract import text_looks_like_script
+
+    article = extract_article(NEWS, "https://daily.test/bridge")
+    assert text_looks_like_script(article["article_text"]) is False
+
+
+def test_frozen_embed_placeholders_are_not_article_prose():
+    """freeze() writes these markers itself; they must never count as the body."""
+    from app.extract import text_looks_like_script
+
+    placeholders = "\n".join(
+        '<p class="amber-removed">[embedded content removed]</p>' for _ in range(40)
+    )
+    html = f"""<!doctype html><html><head>
+    <title>Council Approves Bridge - The Daily Test</title>
+    <meta property="og:title" content="Council Approves Bridge">
+    <meta property="og:description" content="The council approved the river crossing after a decade of argument.">
+    </head><body>{placeholders}</body></html>"""
+    article = extract_article(html, "https://daily.test/bridge")
+    assert "embedded content removed" not in article["article_text"]
+    assert "embedded content removed" not in (article["article_html"] or "")
+    assert article["paywalled"] is True
+    assert text_looks_like_script(article["article_text"]) is False
+
+
+def test_sanitize_drops_freeze_markers_from_a_stored_body():
+    """Stored article.html is sanitized, not re-extracted, so strip markers there too."""
+    markers = "\n".join(
+        '<p class="amber-removed">[embedded content removed]</p>' for _ in range(40)
+    )
+    assert sanitize_article_html(markers).strip() == ""
+
+
+def test_sanitize_keeps_real_prose_beside_freeze_markers():
+    html = (
+        '<p class="amber-removed">[embedded content removed]</p>'
+        "<p>The council approved the river crossing after a decade of argument.</p>"
+        '<p class="amber-removed">[embedded content removed: https://ads.example/x]</p>'
+    )
+    cleaned = sanitize_article_html(html)
+    assert "embedded content removed" not in cleaned
+    assert "river crossing" in cleaned
+
+
+def test_text_is_freeze_markers_only_flags_a_marker_run():
+    from app.extract import text_is_freeze_markers_only
+
+    text = " ".join("[embedded content removed]" for _ in range(40))
+    assert text_is_freeze_markers_only(text) is True
+    with_urls = " ".join(
+        f"[embedded content removed: https://ads.example/sync?id={i}]" for i in range(20)
+    )
+    assert text_is_freeze_markers_only(with_urls) is True
+
+
+def test_text_is_freeze_markers_only_keeps_prose():
+    from app.extract import text_is_freeze_markers_only
+
+    assert text_is_freeze_markers_only("") is False
+    assert text_is_freeze_markers_only(CODE_HEAVY_PROSE) is False
+    mixed = (
+        "[embedded content removed] The council approved the river crossing after a "
+        "decade of argument, and construction is due to start in May. [embedded content removed]"
+    )
+    assert text_is_freeze_markers_only(mixed) is False
