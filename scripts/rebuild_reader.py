@@ -2,10 +2,13 @@
 """Rebuild reader.html from a stored extract (no live fetch).
 
 Prefers snaps/<id>/article.html (the extract capture/import already
-wrote, including JSON-backed bodies). If that file is empty, uses the
-`.body` inner HTML of stored reader.html. Re-extracts frozen page.html
-only when both are missing or unusable, and refuses to write if that
-extract is worse (word count collapses or paywalled flips true).
+wrote, including JSON-backed bodies). If that file is empty or unusable,
+uses the `.body` inner HTML of stored reader.html. Re-extracts frozen
+page.html only when both are missing or unusable, and refuses to write if
+that extract is worse (word count collapses or paywalled flips true).
+
+A stored body that reads as bundle source rather than prose counts as
+unusable, and its word count does not protect it from being replaced.
 
 Does not rewrite page.html or screenshots.
 
