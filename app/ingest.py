@@ -14,8 +14,7 @@ from . import db
 from .extract import (
     PAYWALL_WORD_LIMIT,
     _media_url,
-    _source_has_media,
-    _video_has_src,
+    _url_looks_like_placeholder,
     article_is_paywalled,
     extract_article,
     sanitize_article_html,
@@ -243,16 +242,28 @@ def _stored_reader_body_html(reader_html: str) -> str:
     return node.decode_contents().strip()
 
 
+def _is_retained_media_url(src: str) -> bool:
+    s = (src or "").strip()
+    return bool(s) and not _url_looks_like_placeholder(s)
+
+
 def _has_retained_media(root) -> bool:
-    """True when sanitize kept a real img/src/srcset or video URL, not an empty figure."""
+    """True when sanitize kept a real img/src/srcset or video URL, not a placeholder."""
     for img in root.find_all("img"):
-        if _media_url(img):
+        if _is_retained_media_url(_media_url(img)):
             return True
     for video in root.find_all("video"):
-        if _video_has_src(video):
+        if _is_retained_media_url(video.get("src") or ""):
             return True
+        for source in video.find_all("source"):
+            if _is_retained_media_url(source.get("src") or "") or _is_retained_media_url(
+                source.get("srcset") or ""
+            ):
+                return True
     for source in root.find_all("source"):
-        if _source_has_media(source):
+        if _is_retained_media_url(source.get("src") or "") or _is_retained_media_url(
+            source.get("srcset") or ""
+        ):
             return True
     return False
 
@@ -365,9 +376,12 @@ def rebuild_reader(sid: str) -> dict:
         update_identity = False
     else:
         reader_path = folder / "reader.html"
-        stored_reader = (
-            reader_path.read_text(encoding="utf-8") if reader_path.exists() else ""
-        )
+        stored_reader = ""
+        if reader_path.exists():
+            try:
+                stored_reader = reader_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                stored_reader = ""
         from_reader = _article_from_stored_reader(stored_reader, current, url)
         if from_reader is not None:
             article = from_reader

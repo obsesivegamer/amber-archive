@@ -346,6 +346,33 @@ def test_rebuild_prefers_article_html_when_reader_is_invalid_utf8(tmp_data):
     assert (folder / "page.html").read_text(encoding="utf-8") == page
 
 
+def test_rebuild_undecodable_reader_falls_back_to_page_html(tmp_data):
+    """Invalid UTF-8 in reader.html is unusable; recoverable page.html still wins."""
+    token = "TOKEN_PAGE_RECOVER_UTF8"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Recoverable utf8"></head>
+<body><article><h1>Recoverable utf8</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/recover-utf8")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_bytes(b"\xff\xfe not utf-8 \x80\x81")
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert token in text
+    assert token in article_html
+    assert article["word_count"] >= 80
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
 def test_rebuild_keeps_publisher_notice_in_reader_body(tmp_data):
     """Publisher class=notice corrections must survive; only Amber's banner is stripped."""
     body = " ".join(f"keep{i}" for i in range(100))
@@ -485,6 +512,49 @@ def test_rebuild_empty_figure_after_placeholder_falls_back_to_page_html(tmp_data
     assert (folder / "page.html").read_text(encoding="utf-8") == page
 
 
+def test_rebuild_placeholder_spacer_gif_falls_back_to_page_html(tmp_data):
+    """A sanitizer-recognized placeholder URL is not retained media."""
+    token = "TOKEN_PAGE_RECOVER_SPACER"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Recoverable spacer"></head>
+<body><article><h1>Recoverable spacer</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/recover-spacer")
+    from app import db
+    from app.extract import _url_looks_like_placeholder
+
+    assert _url_looks_like_placeholder("spacer.gif") is True
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    reader = build_reader_html(
+        {
+            "title": "Recoverable spacer",
+            "article_html": '<figure><img src="spacer.gif" alt=""></figure>',
+            "article_text": "",
+            "paywalled": False,
+            "word_count": 0,
+        },
+        "https://daily.test/recover-spacer",
+    )
+    assert "spacer.gif" in reader
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert token in text
+    assert token in article_html
+    assert article["word_count"] >= 80
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
 def test_rebuild_reader_keeps_media_only_body(tmp_data):
     """A zero-word reader body with retained media is usable; do not take page.html."""
     token = "TOKEN_PAGE_STORY"
@@ -521,5 +591,47 @@ def test_rebuild_reader_keeps_media_only_body(tmp_data):
     assert article.get("rebuild_refused") is False
     assert article.get("rebuild_source") == "reader.html"
     assert "shot.jpg" in article_html
+    assert token not in article_html
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_reader_keeps_srcset_and_video_media(tmp_data):
+    """Real srcset and video URLs stay usable after the placeholder check."""
+    token = "TOKEN_PAGE_AV"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="AV essay"></head>
+<body><article><h1>AV essay</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/av")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    reader = build_reader_html(
+        {
+            "title": "AV essay",
+            "article_html": (
+                '<img srcset="https://cdn.example/wide.jpg 640w" alt="">'
+                '<video src="https://cdn.example/clip.mp4"></video>'
+            ),
+            "article_text": "",
+            "paywalled": False,
+            "word_count": 0,
+        },
+        "https://daily.test/av",
+    )
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "reader.html"
+    assert "wide.jpg" in article_html
+    assert "clip.mp4" in article_html
     assert token not in article_html
     assert (folder / "page.html").read_text(encoding="utf-8") == page
