@@ -188,14 +188,24 @@ def _media_url(img) -> str:
     return ""
 
 
+def _source_has_media(elem) -> bool:
+    return bool((elem.get("src") or "").strip() or (elem.get("srcset") or "").strip())
+
+
 def _has_content_media(elem) -> bool:
     if elem.name == "video" and _video_has_src(elem):
         return True
     for img in elem.find_all("img"):
         if _media_url(img):
             return True
-    if elem.find("source") or elem.find("picture") or elem.find("video"):
+    if elem.find("picture"):
         return True
+    for video in elem.find_all("video"):
+        if _video_has_src(video):
+            return True
+    for source in elem.find_all("source"):
+        if _source_has_media(source):
+            return True
     if elem.name == "figure" or elem.find("figure"):
         return True
     return False
@@ -209,7 +219,7 @@ def _safe_to_drop(elem) -> bool:
 def _video_has_src(elem) -> bool:
     if (elem.get("src") or "").strip():
         return True
-    return bool(elem.find("source"))
+    return any(_source_has_media(source) for source in elem.find_all("source"))
 
 
 def _keep_gated_chrome(elem) -> bool:
@@ -244,12 +254,18 @@ def _testid_is_chrome(elem) -> bool:
     return any(needle in aria for needle in _ARIA_NEEDLES)
 
 
-def _src_is_placeholder(src: str, img) -> bool:
+def _url_looks_like_placeholder(src: str) -> bool:
     s = (src or "").strip()
     if not s or s.lower().startswith("data:image"):
         return True
-    if _PLACEHOLDER_SRC_RE.search(s):
+    return bool(_PLACEHOLDER_SRC_RE.search(s))
+
+
+def _src_is_placeholder(src: str, img=None) -> bool:
+    if _url_looks_like_placeholder(src):
         return True
+    if img is None:
+        return False
     return str(img.get("width") or "") == "1" and str(img.get("height") or "") == "1"
 
 
@@ -259,7 +275,7 @@ def _promote_lazy_src(img) -> None:
         return
     for key in ("data-src", "data-original", "data-lazy-src"):
         val = (img.get(key) or "").strip()
-        if val and not _src_is_placeholder(val, img):
+        if val and not _url_looks_like_placeholder(val):
             img["src"] = val
             return
 

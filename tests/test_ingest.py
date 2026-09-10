@@ -1,4 +1,9 @@
-from app.ingest import ingest_html, original_url_from_html, rebuild_reader
+from app.ingest import (
+    _extract_is_worse,
+    ingest_html,
+    original_url_from_html,
+    rebuild_reader,
+)
 from tests.test_extract import (
     ARCHIVE_IS_SAVED,
     LOCKED_ARTICLE,
@@ -169,3 +174,50 @@ def test_rebuild_refuses_worse_page_html_extract(tmp_data):
     assert after["word_count"] == before["word_count"]
     assert after["paywalled"] is False
     assert stored_html  # ingest did store the JSON body
+
+
+def test_extract_is_worse_refuses_short_collapses():
+    """Half-or-worse must fire below the old 40-word / strict-half gates."""
+    assert _extract_is_worse({"word_count": 1, "paywalled": True}, {"word_count": 39, "paywalled": True})
+    assert _extract_is_worse({"word_count": 20, "paywalled": True}, {"word_count": 40, "paywalled": True})
+    assert _extract_is_worse({"word_count": 0, "paywalled": True}, {"word_count": 12, "paywalled": True})
+    assert not _extract_is_worse(
+        {"word_count": 200, "paywalled": False}, {"word_count": 216, "paywalled": False}
+    )
+    assert not _extract_is_worse(
+        {"word_count": 10, "paywalled": True}, {"word_count": 0, "paywalled": True, "article_text": ""}
+    )
+
+
+def test_rebuild_refuses_short_legacy_page_html_collapse(tmp_data):
+    """A 39-word stored teaser must not be overwritten by a 1-word page.html."""
+    body = " ".join(f"word{i}" for i in range(39))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Short teaser"></head>
+<body><article><h1>Short teaser</h1><p>{body}</p></article></body>
+</html>
+"""
+    sid = ingest_html(html, url="https://daily.test/short")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    before = db.get_snapshot(sid)
+    assert before["paywalled"] is True
+    assert 20 <= before["word_count"] < 80
+    stored_n = before["word_count"]
+    stored_txt = (folder / "article.txt").read_text(encoding="utf-8")
+    stored_reader = (folder / "reader.html").read_text(encoding="utf-8")
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "page.html").write_text(
+        "<!doctype html><html><body><p>Sign</p></body></html>",
+        encoding="utf-8",
+    )
+    article = rebuild_reader(sid)
+    assert article.get("rebuild_refused") is True
+    assert article.get("rebuild_source") == "page.html"
+    assert (folder / "article.txt").read_text(encoding="utf-8") == stored_txt
+    assert (folder / "reader.html").read_text(encoding="utf-8") == stored_reader
+    after = db.get_snapshot(sid)
+    assert after["word_count"] == stored_n
+    assert after["paywalled"] is True

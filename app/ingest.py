@@ -221,7 +221,11 @@ def _article_from_stored_html(html: str, current: dict, url: str) -> dict:
 
 
 def _extract_is_worse(candidate: dict, current: dict) -> bool:
-    """Refuse a rebuild that would collapse a complete extract."""
+    """Refuse a rebuild that would collapse a stored extract.
+
+    Half-or-worse applies to every nonempty stored count, including short
+    paywalled teasers (39→1, 40→20). Small chrome-only drops stay allowed.
+    """
     old_n = int(current.get("word_count") or 0)
     new_n = int(candidate.get("word_count") or 0)
     old_pw = bool(current.get("paywalled"))
@@ -230,9 +234,11 @@ def _extract_is_worse(candidate: dict, current: dict) -> bool:
         return False
     if not old_pw and new_pw:
         return True
+    if old_n > 0 and new_n <= 0:
+        return True
     if old_n >= PAYWALL_WORD_LIMIT and new_n < PAYWALL_WORD_LIMIT:
         return True
-    if old_n >= 40 and new_n * 2 < old_n:
+    if old_n > 0 and new_n * 2 <= old_n:
         return True
     return False
 

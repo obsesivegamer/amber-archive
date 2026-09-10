@@ -305,6 +305,33 @@ def test_sanitize_promotes_spacer_gif_to_data_src():
     assert "spacer.gif" not in got
 
 
+def test_sanitize_promotes_1x1_spacer_gif_to_data_src():
+    """Placeholder width/height must not make the real data-src look empty."""
+    html = (
+        '<p>TOKEN_BEETS_BODY</p>'
+        '<img src="https://static.example/spacer.gif" width="1" height="1" '
+        'data-src="https://static.example/beets-real.jpg" alt="Beets">'
+    )
+    got = sanitize_article_html(html)
+    assert "beets-real.jpg" in got
+    assert 'src="https://static.example/beets-real.jpg"' in got
+    assert "spacer.gif" not in got
+
+
+def test_sanitize_drops_empty_source_video():
+    html = (
+        "<p>TOKEN_BEETS_BODY Beets are food, not a toolbar.</p>"
+        "<video><source></source></video>"
+        '<video><source src=""></source></video>'
+        '<video><source src="https://static.example/beets.mp4"></source></video>'
+    )
+    got = sanitize_article_html(html)
+    assert got.count("<video") == 1
+    assert "beets.mp4" in got
+    assert "<source></source>" not in got
+    assert 'src=""' not in got
+
+
 def test_sanitize_keeps_svg_chart_outside_figure():
     slices = "".join(f'<path d="M{i} 0 L{i} 10"></path>' for i in range(10))
     html = (
