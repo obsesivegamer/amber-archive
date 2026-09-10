@@ -865,3 +865,45 @@ def test_frozen_embed_placeholders_are_not_article_prose():
     assert "embedded content removed" not in (article["article_html"] or "")
     assert article["paywalled"] is True
     assert text_looks_like_script(article["article_text"]) is False
+
+
+def test_sanitize_drops_freeze_markers_from_a_stored_body():
+    """Stored article.html is sanitized, not re-extracted, so strip markers there too."""
+    markers = "\n".join(
+        '<p class="amber-removed">[embedded content removed]</p>' for _ in range(40)
+    )
+    assert sanitize_article_html(markers).strip() == ""
+
+
+def test_sanitize_keeps_real_prose_beside_freeze_markers():
+    html = (
+        '<p class="amber-removed">[embedded content removed]</p>'
+        "<p>The council approved the river crossing after a decade of argument.</p>"
+        '<p class="amber-removed">[embedded content removed: https://ads.example/x]</p>'
+    )
+    cleaned = sanitize_article_html(html)
+    assert "embedded content removed" not in cleaned
+    assert "river crossing" in cleaned
+
+
+def test_text_is_freeze_markers_only_flags_a_marker_run():
+    from app.extract import text_is_freeze_markers_only
+
+    text = " ".join("[embedded content removed]" for _ in range(40))
+    assert text_is_freeze_markers_only(text) is True
+    with_urls = " ".join(
+        f"[embedded content removed: https://ads.example/sync?id={i}]" for i in range(20)
+    )
+    assert text_is_freeze_markers_only(with_urls) is True
+
+
+def test_text_is_freeze_markers_only_keeps_prose():
+    from app.extract import text_is_freeze_markers_only
+
+    assert text_is_freeze_markers_only("") is False
+    assert text_is_freeze_markers_only(CODE_HEAVY_PROSE) is False
+    mixed = (
+        "[embedded content removed] The council approved the river crossing after a "
+        "decade of argument, and construction is due to start in May. [embedded content removed]"
+    )
+    assert text_is_freeze_markers_only(mixed) is False

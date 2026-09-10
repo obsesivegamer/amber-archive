@@ -765,3 +765,142 @@ def test_extract_is_worse_ignores_script_like_stored_text():
     assert _extract_is_worse(candidate, stored_script) is False
     # A genuine 142-word extract is still protected.
     assert _extract_is_worse(candidate, stored_prose) is True
+
+
+_MARKER_HTML = "\n".join(
+    '<p class="amber-removed">[embedded content removed]</p>' for _ in range(40)
+)
+_MARKER_TEXT = " ".join("[embedded content removed]" for _ in range(40))
+
+
+def test_rebuild_rejects_marker_only_article_html(tmp_data):
+    """A stored body of freeze markers must not outrank a real page.html story."""
+    from app import db
+
+    token = "TOKEN_REAL_STORY"
+    sid = ingest_html(_page_with_prose("Real story", token, 290), url="https://daily.test/rs")
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    (folder / "article.html").write_text(_MARKER_HTML, encoding="utf-8")
+    (folder / "article.txt").write_text(_MARKER_TEXT, encoding="utf-8")
+    # The reader was built from that same marker body, so it is junk too.
+    (folder / "reader.html").write_text(
+        build_reader_html(
+            {
+                "title": "Real story",
+                "article_html": _MARKER_HTML,
+                "article_text": _MARKER_TEXT,
+                "paywalled": False,
+                "word_count": 120,
+            },
+            "https://daily.test/rs",
+        ),
+        encoding="utf-8",
+    )
+    db.update_snapshot(sid, word_count=120, paywalled=0)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert "embedded content removed" not in text
+    assert token in text
+    assert article["word_count"] > 250
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_rejects_marker_only_reader_body(tmp_data):
+    """The reader round trip can drop the class, so match the marker text too."""
+    from app import db
+
+    token = "TOKEN_REAL_STORY_READER"
+    sid = ingest_html(_page_with_prose("Real reader", token, 290), url="https://daily.test/rr")
+    folder = db.snap_dir(sid)
+    reader = build_reader_html(
+        {
+            "title": "Real reader",
+            "article_html": "",
+            "article_text": _MARKER_TEXT,
+            "paywalled": False,
+            "word_count": 120,
+        },
+        "https://daily.test/rr",
+    )
+    assert "embedded content removed" in reader
+    assert 'class="amber-removed"' not in reader
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert "embedded content removed" not in (folder / "article.txt").read_text(encoding="utf-8")
+    assert token in (folder / "article.txt").read_text(encoding="utf-8")
+
+
+def test_extract_is_worse_ignores_marker_only_stored_text():
+    candidate = {"word_count": 56, "article_text": "real prose " * 28, "paywalled": True}
+    stored_markers = {
+        "word_count": 120,
+        "article_text": _MARKER_TEXT,
+        "paywalled": False,
+    }
+    assert _extract_is_worse(candidate, stored_markers) is False
+
+
+def test_rebuild_keeps_prose_that_sits_beside_markers(tmp_data):
+    """Markers alongside a real body must not cost the body its source slot."""
+    from app import db
+
+    token = "TOKEN_MIXED_BODY"
+    sid = ingest_html(_page_with_prose("Mixed", token, 40), url="https://daily.test/mixed")
+    folder = db.snap_dir(sid)
+    keep = " ".join(f"kept{i}" for i in range(120))
+    mixed = (
+        '<p class="amber-removed">[embedded content removed]</p>'
+        f"<p>TOKEN_KEPT_BODY {keep}</p>"
+        '<p class="amber-removed">[embedded content removed]</p>'
+    )
+    (folder / "article.html").write_text(mixed, encoding="utf-8")
+    (folder / "article.txt").write_text(f"TOKEN_KEPT_BODY {keep}", encoding="utf-8")
+    db.update_snapshot(sid, word_count=121, paywalled=0)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    assert article.get("rebuild_source") == "article.html"
+    assert "TOKEN_KEPT_BODY" in text
+    assert "embedded content removed" not in text
+
+
+def test_marker_only_article_html_still_lets_a_real_reader_body_win(tmp_data):
+    """Rejecting article.html must not skip a stored reader body that has prose."""
+    from app import db
+
+    token = "TOKEN_READER_PROSE"
+    sid = ingest_html(_page_with_prose("Reader wins", token, 290), url="https://daily.test/rw")
+    folder = db.snap_dir(sid)
+    kept = " ".join(f"kept{i}" for i in range(150))
+    (folder / "article.html").write_text(_MARKER_HTML, encoding="utf-8")
+    (folder / "article.txt").write_text(_MARKER_TEXT, encoding="utf-8")
+    (folder / "reader.html").write_text(
+        build_reader_html(
+            {
+                "title": "Reader wins",
+                "article_html": f"<p>TOKEN_READER_BODY {kept}</p><p>second para here</p>",
+                "article_text": f"TOKEN_READER_BODY {kept}",
+                "paywalled": False,
+                "word_count": 151,
+            },
+            "https://daily.test/rw",
+        ),
+        encoding="utf-8",
+    )
+    db.update_snapshot(sid, word_count=120, paywalled=0)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    assert article.get("rebuild_source") == "reader.html"
+    assert "TOKEN_READER_BODY" in text
+    assert "embedded content removed" not in text

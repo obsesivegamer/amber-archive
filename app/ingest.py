@@ -18,6 +18,7 @@ from .extract import (
     article_is_paywalled,
     extract_article,
     sanitize_article_html,
+    text_is_freeze_markers_only,
     text_looks_like_script,
 )
 from .freeze import freeze_html
@@ -269,9 +270,14 @@ def _has_retained_media(root) -> bool:
     return False
 
 
+def _body_text_is_junk(text: str) -> bool:
+    """Bundle source and freeze's own embed markers are never article prose."""
+    return text_looks_like_script(text) or text_is_freeze_markers_only(text)
+
+
 def _sanitized_body_is_usable(article: dict) -> bool:
     """True when a sanitized extract has prose or retained content media."""
-    if text_looks_like_script(article.get("article_text") or ""):
+    if _body_text_is_junk(article.get("article_text") or ""):
         return False
     if int(article.get("word_count") or 0) > 0:
         return True
@@ -298,9 +304,10 @@ def _extract_is_worse(candidate: dict, current: dict) -> bool:
 
     Half-or-worse applies to every nonempty stored count, including short
     paywalled teasers (39→1, 40→20). Small chrome-only drops stay allowed.
-    A stored body of bundle source is junk, so its count protects nothing.
+    A stored body of bundle source or freeze markers is junk, so its count
+    protects nothing.
     """
-    if text_looks_like_script(current.get("article_text") or ""):
+    if _body_text_is_junk(current.get("article_text") or ""):
         return False
     old_n = int(current.get("word_count") or 0)
     new_n = int(candidate.get("word_count") or 0)
@@ -361,8 +368,8 @@ def rebuild_reader(sid: str) -> dict:
 
     Source order: usable article.html, else the `.body` inner HTML of stored
     reader.html, else re-extract frozen page.html. A stored body of bundle
-    source counts as unusable at every step. Refuses to write if the
-    candidate is worse than the stored extract.
+    source or freeze markers counts as unusable at every step. Refuses to
+    write if the candidate is worse than the stored extract.
     """
     snap = db.get_snapshot(sid)
     if not snap:
