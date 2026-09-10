@@ -2,12 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from app.extract import extract_article
+from app.extract import extract_article, sanitize_article_html
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 POLITICO_RELATED_CARD = (FIXTURES / "politico_related_card.html").read_text(encoding="utf-8")
+NYT_BEETS_CHROME = (FIXTURES / "nyt_beets_chrome.html").read_text(encoding="utf-8")
 FULL_ARTICLE_TOKEN = "TOKEN_FULL_ARTICLE"
 CARD_TEASER_TOKEN = "CARD_TEASER_TOKEN"
+BEETS_BODY_TOKEN = "TOKEN_BEETS_BODY"
+BEETS_RECIPE_TOKEN = "TOKEN_BEETS_RECIPE"
 
 NEWS = """
 <!doctype html>
@@ -151,6 +154,98 @@ def test_extract_uses_article_body_not_related_card():
     assert got["title"].startswith("Inside the fightback")
     assert got["site_name"] == "Daily Test"
     assert got["author"] == "Jane Reporter"
+    assert "Listen" not in got["article_text"]
+    assert "Share via email" not in got["article_text"]
+    assert "Share on X" not in got["article_text"]
+
+
+def test_nyt_shaped_chrome_and_images_are_sanitized():
+    got = extract_article(
+        NYT_BEETS_CHROME,
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    text = got["article_text"]
+    html = got["article_html"]
+    assert got["title"] == "How Healthy Are Beets?"
+    assert got["author"] == "Simar Bajaj"
+    assert got["site_name"] == "The New York Times"
+    assert BEETS_BODY_TOKEN in text
+    assert BEETS_RECIPE_TOKEN in text
+    assert "eye-popping colors" in (got.get("dek") or text)
+    assert "By Simar Bajaj" in text
+    assert "David Chow" in text
+    assert "roasted beets on a wooden table" in text
+    assert "Beet hummus in a bowl" in text
+    assert "beets-hero.jpg" in html
+    assert "beets-bowl.jpg" in html
+    assert 'src="https://static.example/beets-bowl.jpg"' in html
+    assert "Share full article" not in text
+    assert "Share full article" not in html
+    assert "Listen" not in text
+    assert "6:27" not in text
+    assert "Leer en español" not in text
+    assert "Gift this article" not in text
+    assert "More in Well" not in text
+    assert "sleep trackers" not in text
+    assert "width:1600" not in html
+    assert "float:left" not in html
+    assert "float:right" not in html
+    assert 'style="' not in html
+    assert got["paywalled"] is False
+    assert got["word_count"] >= 80
+    assert text.lower().count("share") == 0
+
+
+def test_sanitize_is_idempotent_on_nyt_extract():
+    got = extract_article(
+        NYT_BEETS_CHROME,
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    again = sanitize_article_html(got["article_html"])
+    assert BEETS_BODY_TOKEN in again
+    assert "Share full article" not in again
+    assert "beets-bowl.jpg" in again
+
+
+def test_share_listen_chrome_does_not_inflate_word_count():
+    """Toolbar copy must not push a short teaser over the paywall line."""
+    chrome = """
+    <button>Listen · 6:27 min</button>
+    <div role="toolbar">
+      <a href="https://x.com/intent/post/?url=https://daily.test/x">Share full article</a>
+      <button aria-label="Gift this article">Gift</button>
+    </div>
+    <p>Listen</p>
+    <p>Share full article</p>
+    <p>Leer en español</p>
+    """
+    body = (
+        "Beets are a root vegetable with pigment that stains the board. "
+        "TOKEN_TEASER_ONLY Doctors mention nitrate and blood pressure in passing."
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="How Healthy Are Beets?">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>How Healthy Are Beets?</h1>
+    {chrome}
+    <p>{body}</p>
+  </article>
+</body>
+</html>
+"""
+    assert len(body.split()) < 80
+    got = extract_article(html, "https://daily.test/beets")
+    assert got["paywalled"] is True
+    assert got["word_count"] < 80
+    assert "TOKEN_TEASER_ONLY" in got["article_text"]
+    assert "Share full article" not in got["article_text"]
+    assert "Listen" not in got["article_text"]
+    assert "Leer en español" not in got["article_text"]
 
 
 def test_teaser_plus_related_cards_stays_paywalled():

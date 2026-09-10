@@ -172,3 +172,49 @@ def ingest_html(
         error=None,
     )
     return sid
+
+
+def rebuild_reader(sid: str) -> dict:
+    """Re-run extract + sanitize + reader from stored page.html (no live fetch)."""
+    snap = db.get_snapshot(sid)
+    if not snap:
+        raise ValueError(f"No snapshot {sid}")
+    folder = db.snap_dir(sid)
+    page_path = folder / "page.html"
+    if not page_path.exists():
+        raise FileNotFoundError(f"No page.html for {sid}")
+    url = snap.get("final_url") or snap.get("url") or ""
+    article = extract_article(page_path.read_text(encoding="utf-8"), url)
+    meta_path = folder / "meta.json"
+    meta = db.read_json(meta_path) if meta_path.exists() else {}
+    if meta.get("referrer_retried"):
+        article["referrer_retried"] = True
+    reader = build_reader_html(article, url)
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    (folder / "article.html").write_text(article.get("article_html") or "", encoding="utf-8")
+    (folder / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
+    db.update_snapshot(
+        sid,
+        title=article.get("title"),
+        site_name=article.get("site_name"),
+        author=article.get("author"),
+        published_at=article.get("published_at"),
+        description=article.get("description"),
+        word_count=article.get("word_count"),
+        paywalled=1 if article.get("paywalled") else 0,
+    )
+    if meta_path.exists():
+        meta.update(
+            {
+                "title": article.get("title"),
+                "site_name": article.get("site_name"),
+                "author": article.get("author"),
+                "published_at": article.get("published_at"),
+                "description": article.get("description"),
+                "dek": article.get("dek"),
+                "word_count": article.get("word_count"),
+                "paywalled": article.get("paywalled"),
+            }
+        )
+        db.write_json(meta_path, meta)
+    return article

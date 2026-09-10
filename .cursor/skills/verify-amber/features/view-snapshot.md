@@ -29,6 +29,7 @@ Preconditions:
 - **Webpage mode.** Choose `webpage`. URL is `/{id}/webpage`. Iframe titled `Archived webpage` has `src="/{id}/raw"`.
 - **Screenshot mode.** Choose `screenshot`. URL is `/{id}/screenshot`. An image `Graphical copy of Amber Verification Bridge` has `src="/{id}/image.jpg` when a shot exists.
 - **Reader HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/reader` (or `curl`) is 200 and contains `VERIFICATION_TOKEN_AMBER_BRIDGE_2026`.
+- **Readable article.** `GET /{id}/reader` is a single text column. It does not include publisher share / listen / gift toolbar chrome. Images in the reader body are constrained (`max-width: 100%`, no float) with captions under the figure. Webpage mode (`/{id}/raw`) stays the frozen original.
 - **Raw HTTP.** `curl.exe -sS http://127.0.0.1:18080/{id}/raw` (or `curl`) is 200, `Content-Type` is HTML, and the body is the frozen page (scripts stripped).
 - **Image HTTP.** `curl.exe -sS -D - -o NUL http://127.0.0.1:18080/{id}/image.jpg` (Linux/macOS: `curl` and `-o /dev/null`). If import's Playwright shot succeeded: 200, JPEG. If not: 404 `No screenshot` — record the skip; do not call article mode failed.
 - **Original URL.** Toolbar link `.orig` is the fixture URL `https://verify.example/amber-verification-bridge` and opens in a new tab.

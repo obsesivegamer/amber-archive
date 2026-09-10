@@ -41,6 +41,77 @@ _ARTICLE_CHROME_SELECTORS = (
     ".related-stories",
 )
 
+# Publisher UI that leaks into the chosen extract. Applied only after a
+# candidate is picked — do not fold these into _RECIRC_SELECTORS (that list
+# changes paywall scoring). Prefer tokens + roles over site-specific classes.
+_ALWAYS_DROP_TAGS = frozenset({"button", "nav", "aside", "audio", "video", "footer"})
+_CHROME_ROLES = frozenset(
+    {"toolbar", "navigation", "menu", "menubar", "complementary"}
+)
+_TESTID_NEEDLES = (
+    "share",
+    "listen",
+    "gift",
+    "bookmark",
+    "toolbar",
+    "newsletter",
+    "audio",
+    "recirc",
+)
+_ARIA_NEEDLES = (
+    "share",
+    "listen",
+    "gift this",
+    "gift article",
+    "bookmark",
+    "save this",
+    "save article",
+    "copy link",
+)
+_CHROME_TOKEN_RE = re.compile(
+    r"(?:^|[_\s\-])(?:"
+    r"share|sharing|sharetools|share-tools|social-share|social-sharing|"
+    r"listen|gift|bookmark|toolbar|"
+    r"newsletter|subscribe|"
+    r"recirc|related-stories|related-coverage|related-content|"
+    r"article-tools|articletools|byline-tools|utility-bar|"
+    r"hero__actions|content-listing"
+    r")(?:[_\s\-]|$)",
+    re.I,
+)
+_CHROME_TEXT_RE = re.compile(
+    r"""
+    ^\s*(
+        share(\s+(full\s+article|this(\s+article)?|on\s+\w+|via\s+\w+))? |
+        listen(\s*[·•\-\|:].*)? |
+        gift(\s+this(\s+article)?)? |
+        bookmark |
+        save(\s+(this\s+)?article)? |
+        copy(\s+link)? |
+        copied |
+        leer\s+en\s+espa[ñn]ol |
+        read\s+in\s+(spanish|english|espa[ñn]ol) |
+        advertisement |
+        skip\s+advertisement |
+        more\s+photos
+    )\s*$
+    """,
+    re.I | re.VERBOSE,
+)
+_LANG_LINK_RE = re.compile(
+    r"^(leer|read|lire|lesen|leggi|leia)\s+(en|in|auf)\s+\S+$",
+    re.I,
+)
+_SHARE_HREF_RE = re.compile(
+    r"(twitter\.com/intent|x\.com/intent|facebook\.com/shar|"
+    r"linkedin\.com/share|api\.whatsapp\.com/send|whatsapp\.com/send|"
+    r"mailto:\?|reddit\.com/submit|pinterest\.com/pin)",
+    re.I,
+)
+_LAZY_SRC_ATTRS = ("src", "srcset", "data-src", "data-original", "data-lazy-src")
+_LAYOUT_ATTRS = frozenset({"width", "height", "align", "hspace", "vspace", "border"})
+_PROSE_KEEP_WORDS = 40
+
 
 def article_is_paywalled(word_count: int | None) -> bool:
     return word_count is not None and int(word_count) < PAYWALL_WORD_LIMIT
@@ -82,6 +153,191 @@ def _is_unlikely_chrome(elem) -> bool:
         _READABILITY_REGEXES["unlikelyCandidatesRe"].search(label)
         and not _READABILITY_REGEXES["okMaybeItsACandidateRe"].search(label)
     )
+
+
+def _elem_label(elem) -> str:
+    classes = elem.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    bits = list(classes)
+    for key in ("id", "data-testid", "data-test-id", "aria-label"):
+        val = elem.get(key)
+        if val:
+            bits.append(str(val))
+    return " ".join(bits)
+
+
+def _node_words(elem) -> int:
+    return len(elem.get_text(" ", strip=True).split())
+
+
+def _media_url(img) -> str:
+    for key in _LAZY_SRC_ATTRS:
+        val = (img.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _has_content_media(elem) -> bool:
+    for img in elem.find_all("img"):
+        if _media_url(img):
+            return True
+    if elem.find("source") or elem.find("picture"):
+        return True
+    if elem.name == "figure" or elem.find("figure"):
+        return True
+    return False
+
+
+def _safe_to_drop(elem) -> bool:
+    """Keep wrappers that still hold a real body, not just a toolbar."""
+    return _node_words(elem) < _PROSE_KEEP_WORDS
+
+
+def _label_is_chrome(elem) -> bool:
+    if elem.name in {None, "html", "body", "[document]", "article"}:
+        return False
+    return bool(_CHROME_TOKEN_RE.search(_elem_label(elem)))
+
+
+def _testid_is_chrome(elem) -> bool:
+    for key in ("data-testid", "data-test-id"):
+        val = (elem.get(key) or "").lower()
+        if any(needle in val for needle in _TESTID_NEEDLES):
+            return True
+    aria = (elem.get("aria-label") or "").lower()
+    return any(needle in aria for needle in _ARIA_NEEDLES)
+
+
+def _promote_lazy_src(img) -> None:
+    src = (img.get("src") or "").strip()
+    if src and not src.lower().startswith("data:image"):
+        return
+    for key in ("data-src", "data-original", "data-lazy-src"):
+        val = (img.get(key) or "").strip()
+        if val:
+            img["src"] = val
+            return
+
+
+def _is_tiny_placeholder(img) -> bool:
+    if _media_url(img) and (
+        img.get("data-src") or img.get("srcset") or img.get("data-original")
+    ):
+        return False
+    src = (img.get("src") or "").strip()
+    if src.lower().startswith("data:image") and len(src) < 120:
+        return True
+    return str(img.get("width") or "") == "1" and str(img.get("height") or "") == "1"
+
+
+def _drop_empty_shells(root) -> None:
+    keep = {"html", "body", "[document]", "br", "hr", "img", "picture", "source"}
+    changed = True
+    while changed:
+        changed = False
+        for elem in list(root.find_all(True)):
+            if getattr(elem, "decomposed", False) or elem.name in keep:
+                continue
+            if _has_content_media(elem):
+                continue
+            if elem.get_text(" ", strip=True):
+                continue
+            if elem.find(["img", "picture", "figure", "source"]):
+                continue
+            elem.decompose()
+            changed = True
+
+
+def _strip_publisher_layout(root) -> None:
+    """Publisher (and capture-inlined) styles must not blow out the reader."""
+    for elem in root.find_all(True):
+        if "style" in elem.attrs:
+            del elem.attrs["style"]
+        if elem.name in {"img", "figure", "picture", "video", "table"}:
+            for attr in _LAYOUT_ATTRS:
+                elem.attrs.pop(attr, None)
+
+
+def sanitize_article_html(html: str) -> str:
+    """Remove site chrome from an extract; keep prose, figures, and captions."""
+    if not html or not str(html).strip():
+        return html
+    soup = BeautifulSoup(html, "lxml")
+    root = soup.body or soup
+
+    always = []
+    maybe = []
+    for elem in root.find_all(True):
+        role = (elem.get("role") or "").strip().lower()
+        if elem.name in _ALWAYS_DROP_TAGS or role in _CHROME_ROLES:
+            always.append(elem)
+            continue
+        if _testid_is_chrome(elem) or _label_is_chrome(elem):
+            maybe.append(elem)
+            continue
+        elem_id = (elem.get("id") or "").lower()
+        if "recirc" in elem_id:
+            maybe.append(elem)
+
+    for node in _outermost(always):
+        if not getattr(node, "decomposed", False):
+            node.decompose()
+    for node in _outermost(maybe):
+        if getattr(node, "decomposed", False):
+            continue
+        if _safe_to_drop(node):
+            node.decompose()
+
+    for a in list(root.find_all("a")):
+        if getattr(a, "decomposed", False):
+            continue
+        href = a.get("href") or ""
+        text = a.get_text(" ", strip=True)
+        if (
+            _SHARE_HREF_RE.search(href)
+            or _CHROME_TEXT_RE.match(text)
+            or _LANG_LINK_RE.match(text)
+        ):
+            a.decompose()
+
+    for elem in list(root.find_all(["p", "div", "span", "li", "section", "h2", "h3"])):
+        if getattr(elem, "decomposed", False):
+            continue
+        text = elem.get_text(" ", strip=True)
+        if text and len(text) <= 80 and _CHROME_TEXT_RE.match(text):
+            elem.decompose()
+
+    for elem in list(root.find_all(True)):
+        if getattr(elem, "decomposed", False):
+            continue
+        hidden = elem.get("aria-hidden")
+        if hidden not in {"true", True, "True"} and not elem.has_attr("hidden"):
+            continue
+        if elem.find_parent("figcaption") is not None:
+            continue
+        if _safe_to_drop(elem) and not _has_content_media(elem):
+            elem.decompose()
+
+    for img in list(root.find_all("img")):
+        if getattr(img, "decomposed", False):
+            continue
+        _promote_lazy_src(img)
+        if not _media_url(img) or _is_tiny_placeholder(img):
+            img.decompose()
+
+    for svg in list(root.find_all("svg")):
+        if getattr(svg, "decomposed", False):
+            continue
+        if svg.find_parent("figure") is None:
+            svg.decompose()
+
+    _drop_empty_shells(root)
+    _strip_publisher_layout(root)
+
+    inner = soup.body
+    return inner.decode_contents() if inner else str(soup)
 
 
 def _article_body_candidate(soup: BeautifulSoup) -> str:
@@ -412,6 +668,7 @@ def extract_article(html: str, url: str) -> dict:
                     del tag.attrs[attr]
         inner = art.body
         article_html = inner.decode_contents() if inner else str(art)
+        article_html = sanitize_article_html(article_html)
 
     if article_html:
         article_text = BeautifulSoup(article_html, "lxml").get_text("\n", strip=True)

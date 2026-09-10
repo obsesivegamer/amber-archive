@@ -1,4 +1,7 @@
 from app.reader import build_reader_html
+from tests.test_extract import NYT_BEETS_CHROME
+
+from app.extract import extract_article
 
 
 def test_reader_layout_has_headline_dek_byline_and_body():
@@ -58,3 +61,55 @@ def test_paywalled_reader_mentions_referrer_retry_when_it_happened():
     assert "retried Google/X referrer visits" in html
     assert "short preview" in html
     assert "Import" in html
+
+
+def test_reader_constrains_images_and_drops_publisher_chrome():
+    article = extract_article(
+        NYT_BEETS_CHROME,
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    html = build_reader_html(article, article.get("title") or "https://example.com/")
+    assert "max-width: 100% !important" in html
+    assert "float: none !important" in html
+    assert "height: auto !important" in html
+    assert "TOKEN_BEETS_BODY" in html
+    assert "A pile of roasted beets on a wooden table." in html
+    assert "Beet hummus in a bowl" in html
+    assert "beets-hero.jpg" in html
+    assert "beets-bowl.jpg" in html
+    assert "Share full article" not in html
+    assert "Listen · 6:27" not in html
+    assert "Leer en español" not in html
+    assert "width:1600" not in html
+    assert "float:left" not in html
+    assert "How Healthy Are Beets?" in html
+    assert "By Simar Bajaj" in html
+
+
+def test_reader_sanitizes_dirty_article_html_and_overrides_inline_layout():
+    html = build_reader_html(
+        {
+            "title": "How Healthy Are Beets?",
+            "dek": "Their eye-popping colors will give you a hint.",
+            "author": "Simar Bajaj",
+            "site_name": "The New York Times",
+            "article_html": (
+                "<p>TOKEN_BEETS_BODY Beets bring folate and nitrate in ordinary food.</p>"
+                '<p><button>Listen · 6:27 min</button>'
+                '<a href="https://x.com/intent/post/?url=https://daily.test/x">'
+                "Share full article</a></p>"
+                '<figure><img src="https://static.example/beets.jpg" '
+                'style="width:2400px;float:left;" width="2400">'
+                "<figcaption>Beet hummus in a bowl.</figcaption></figure>"
+                "<p>Roasting concentrates the sugar and keeps the color.</p>"
+            ),
+        },
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    assert "TOKEN_BEETS_BODY" in html
+    assert "Beet hummus in a bowl." in html
+    assert "Share full article" not in html
+    assert "Listen · 6:27" not in html
+    assert "width:2400" not in html
+    assert "float:left" not in html
+    assert "max-width: 100% !important" in html
