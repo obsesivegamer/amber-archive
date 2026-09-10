@@ -635,3 +635,133 @@ def test_rebuild_reader_keeps_srcset_and_video_media(tmp_data):
     assert "clip.mp4" in article_html
     assert token not in article_html
     assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+# A broken save leaves bundle source loose in the document; it must never be prose.
+_SCRIPT_BODY_TEXT = (
+    '(window.AdKit=window.AdKit||{},window.AdKit.cmd=window.AdKit.cmd||[],window.AdKit);'
+    'var t=function(){return t=Object.assign||function(e){for(var o in e)'
+    'Object.prototype.hasOwnProperty.call(e,o)&&(e[o]=e[o]);return e},t.apply(this,arguments)};'
+    'function r(){return"undefined"!=typeof window&&window.document?window:null}'
+    'const d=()=>"full"===a();var s=function(e,t){return null!=e&&void 0!==t?e[t]:null};'
+    'function l(e,t,n){const i=document.getElementsByTagName("head")[0],'
+    'o=document.createElement("script");t&&(o.onload=t),o.src=e,o.async=!0,i.appendChild(o)}'
+)
+_SCRIPT_BODY_HTML = f"<p><strong>{_SCRIPT_BODY_TEXT[:60]}</strong> {_SCRIPT_BODY_TEXT[60:]}</p>"
+
+
+def _script_reader():
+    """Amber's own reader wrap around a body of bundle source."""
+    return build_reader_html(
+        {
+            "title": "Bundle source",
+            "article_html": _SCRIPT_BODY_HTML,
+            "article_text": _SCRIPT_BODY_TEXT,
+            "paywalled": False,
+            "word_count": 142,
+        },
+        "https://daily.test/script",
+    )
+
+
+def _page_with_prose(title, token, n_words):
+    body = " ".join(f"story{i}" for i in range(n_words))
+    return f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="{title}"></head>
+<body><article><h1>{title}</h1><p>{token} {body}</p></article></body>
+</html>"""
+
+
+def test_rebuild_rejects_script_like_article_html(tmp_data):
+    """Stored article.html holding bundle source must not win the source order."""
+    from app import db
+
+    token = "TOKEN_PAGE_OVER_SCRIPT"
+    sid = ingest_html(_page_with_prose("Script art", token, 120), url="https://daily.test/sa")
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    (folder / "article.html").write_text(_SCRIPT_BODY_HTML, encoding="utf-8")
+    (folder / "article.txt").write_text(_SCRIPT_BODY_TEXT, encoding="utf-8")
+    # The rebuild that shipped the bug wrote the same bundle source into both.
+    (folder / "reader.html").write_text(_script_reader(), encoding="utf-8")
+    db.update_snapshot(sid, word_count=142, paywalled=0)
+
+    article = rebuild_reader(sid)
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert "AdKit" not in article_html
+    assert "AdKit" not in text
+    assert token in text
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
+def test_rebuild_rejects_script_like_reader_body(tmp_data):
+    """A reader.html body of bundle source is unusable, like an empty one."""
+    from app import db
+
+    token = "TOKEN_PAGE_OVER_READER_SCRIPT"
+    sid = ingest_html(_page_with_prose("Script reader", token, 120), url="https://daily.test/sr")
+    folder = db.snap_dir(sid)
+    reader = build_reader_html(
+        {
+            "title": "Script reader",
+            "article_html": _SCRIPT_BODY_HTML,
+            "article_text": _SCRIPT_BODY_TEXT,
+            "paywalled": False,
+            "word_count": 142,
+        },
+        "https://daily.test/sr",
+    )
+    assert "AdKit" in reader
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert "AdKit" not in (folder / "article.html").read_text(encoding="utf-8")
+    assert token in (folder / "article.txt").read_text(encoding="utf-8")
+
+
+def test_refuse_guard_does_not_protect_script_word_count(tmp_data):
+    """Bundle-source "words" must not veto a shorter run of real prose."""
+    from app import db
+
+    token = "TOKEN_SHORT_REAL_PROSE"
+    sid = ingest_html(_page_with_prose("Short real", token, 55), url="https://daily.test/short")
+    folder = db.snap_dir(sid)
+    (folder / "article.html").write_text(_SCRIPT_BODY_HTML, encoding="utf-8")
+    (folder / "article.txt").write_text(_SCRIPT_BODY_TEXT, encoding="utf-8")
+    (folder / "reader.html").write_text(_script_reader(), encoding="utf-8")
+    # 142 junk "words", not paywalled: both the half-or-worse and the
+    # paywall-flip arms of _extract_is_worse would fire on the real 56.
+    db.update_snapshot(sid, word_count=142, paywalled=0)
+
+    article = rebuild_reader(sid)
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert token in (folder / "article.txt").read_text(encoding="utf-8")
+    assert article["word_count"] < 142
+    assert article["paywalled"] is True
+
+
+def test_extract_is_worse_ignores_script_like_stored_text():
+    candidate = {"word_count": 56, "article_text": "real prose " * 28, "paywalled": True}
+    stored_script = {
+        "word_count": 142,
+        "article_text": _SCRIPT_BODY_TEXT,
+        "paywalled": False,
+    }
+    stored_prose = {
+        "word_count": 142,
+        "article_text": "real prose " * 71,
+        "paywalled": False,
+    }
+    assert _extract_is_worse(candidate, stored_script) is False
+    # A genuine 142-word extract is still protected.
+    assert _extract_is_worse(candidate, stored_prose) is True

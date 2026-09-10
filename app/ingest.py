@@ -18,6 +18,7 @@ from .extract import (
     article_is_paywalled,
     extract_article,
     sanitize_article_html,
+    text_looks_like_script,
 )
 from .freeze import freeze_html
 from .reader import AMBER_INCOMPLETE_NOTICE_PREFIX, build_reader_html
@@ -270,6 +271,8 @@ def _has_retained_media(root) -> bool:
 
 def _sanitized_body_is_usable(article: dict) -> bool:
     """True when a sanitized extract has prose or retained content media."""
+    if text_looks_like_script(article.get("article_text") or ""):
+        return False
     if int(article.get("word_count") or 0) > 0:
         return True
     html = (article.get("article_html") or "").strip()
@@ -295,7 +298,10 @@ def _extract_is_worse(candidate: dict, current: dict) -> bool:
 
     Half-or-worse applies to every nonempty stored count, including short
     paywalled teasers (39→1, 40→20). Small chrome-only drops stay allowed.
+    A stored body of bundle source is junk, so its count protects nothing.
     """
+    if text_looks_like_script(current.get("article_text") or ""):
+        return False
     old_n = int(current.get("word_count") or 0)
     new_n = int(candidate.get("word_count") or 0)
     old_pw = bool(current.get("paywalled"))
@@ -353,9 +359,10 @@ def _write_rebuilt(folder, article: dict, url: str, sid: str, meta: dict, meta_p
 def rebuild_reader(sid: str) -> dict:
     """Rebuild reader.html from the stored extract. No live fetch.
 
-    Source order: nonempty article.html, else the `.body` inner HTML of
-    stored reader.html, else re-extract frozen page.html. Refuses to write
-    if the candidate is worse than the stored extract.
+    Source order: usable article.html, else the `.body` inner HTML of stored
+    reader.html, else re-extract frozen page.html. A stored body of bundle
+    source counts as unusable at every step. Refuses to write if the
+    candidate is worse than the stored extract.
     """
     snap = db.get_snapshot(sid)
     if not snap:
@@ -370,11 +377,17 @@ def rebuild_reader(sid: str) -> dict:
     stored_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
     page_path = folder / "page.html"
 
+    article = None
+    source = ""
+    update_identity = False
+
     if stored_html.strip():
-        article = _article_from_stored_html(stored_html, current, url)
-        source = "article.html"
-        update_identity = False
-    else:
+        from_html = _article_from_stored_html(stored_html, current, url)
+        if _sanitized_body_is_usable(from_html):
+            article = from_html
+            source = "article.html"
+
+    if article is None:
         reader_path = folder / "reader.html"
         stored_reader = ""
         if reader_path.exists():
@@ -386,17 +399,17 @@ def rebuild_reader(sid: str) -> dict:
         if from_reader is not None:
             article = from_reader
             source = "reader.html"
-            update_identity = False
-        else:
-            if not page_path.exists():
-                raise FileNotFoundError(
-                    f"No article.html, reader.html body, or page.html for {sid}"
-                )
-            article = extract_article(page_path.read_text(encoding="utf-8"), url)
-            source = "page.html"
-            update_identity = True
-            if meta.get("referrer_retried"):
-                article["referrer_retried"] = True
+
+    if article is None:
+        if not page_path.exists():
+            raise FileNotFoundError(
+                f"No article.html, reader.html body, or page.html for {sid}"
+            )
+        article = extract_article(page_path.read_text(encoding="utf-8"), url)
+        source = "page.html"
+        update_identity = True
+        if meta.get("referrer_retried"):
+            article["referrer_retried"] = True
 
     if _extract_is_worse(article, current):
         current["rebuild_refused"] = True
