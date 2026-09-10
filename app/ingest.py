@@ -13,7 +13,9 @@ from PIL import Image
 from . import db
 from .extract import (
     PAYWALL_WORD_LIMIT,
-    _has_content_media,
+    _media_url,
+    _source_has_media,
+    _video_has_src,
     article_is_paywalled,
     extract_article,
     sanitize_article_html,
@@ -241,6 +243,20 @@ def _stored_reader_body_html(reader_html: str) -> str:
     return node.decode_contents().strip()
 
 
+def _has_retained_media(root) -> bool:
+    """True when sanitize kept a real img/src/srcset or video URL, not an empty figure."""
+    for img in root.find_all("img"):
+        if _media_url(img):
+            return True
+    for video in root.find_all("video"):
+        if _video_has_src(video):
+            return True
+    for source in root.find_all("source"):
+        if _source_has_media(source):
+            return True
+    return False
+
+
 def _sanitized_body_is_usable(article: dict) -> bool:
     """True when a sanitized extract has prose or retained content media."""
     if int(article.get("word_count") or 0) > 0:
@@ -250,7 +266,7 @@ def _sanitized_body_is_usable(article: dict) -> bool:
         return False
     soup = BeautifulSoup(html, "lxml")
     root = soup.body or soup
-    return _has_content_media(root)
+    return _has_retained_media(root)
 
 
 def _article_from_stored_reader(reader_html: str, current: dict, url: str) -> dict | None:

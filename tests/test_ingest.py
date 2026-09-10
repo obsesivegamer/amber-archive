@@ -445,6 +445,46 @@ def test_rebuild_empty_reader_placeholder_falls_back_to_page_html(tmp_data):
     assert (folder / "page.html").read_text(encoding="utf-8") == page
 
 
+def test_rebuild_empty_figure_after_placeholder_falls_back_to_page_html(tmp_data):
+    """An empty <figure> left after a placeholder img is not retained media."""
+    token = "TOKEN_PAGE_RECOVER_FIGURE"
+    body = " ".join(f"story{i}" for i in range(90))
+    html = f"""<!doctype html>
+<html>
+<head><meta property="og:title" content="Recoverable figure"></head>
+<body><article><h1>Recoverable figure</h1><p>{token} {body}</p></article></body>
+</html>"""
+    sid = ingest_html(html, url="https://daily.test/recover-figure")
+    from app import db
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    reader = build_reader_html(
+        {
+            "title": "Recoverable figure",
+            "article_html": '<figure><img src=""></figure>',
+            "article_text": "",
+            "paywalled": False,
+            "word_count": 0,
+        },
+        "https://daily.test/recover-figure",
+    )
+    (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "article.txt").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(reader, encoding="utf-8")
+    db.update_snapshot(sid, word_count=0, paywalled=0)
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "page.html"
+    assert token in text
+    assert token in article_html
+    assert article["word_count"] >= 80
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
 def test_rebuild_reader_keeps_media_only_body(tmp_data):
     """A zero-word reader body with retained media is usable; do not take page.html."""
     token = "TOKEN_PAGE_STORY"
