@@ -2,12 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from app.extract import extract_article
+from app.extract import extract_article, sanitize_article_html
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 POLITICO_RELATED_CARD = (FIXTURES / "politico_related_card.html").read_text(encoding="utf-8")
+NYT_BEETS_CHROME = (FIXTURES / "nyt_beets_chrome.html").read_text(encoding="utf-8")
 FULL_ARTICLE_TOKEN = "TOKEN_FULL_ARTICLE"
 CARD_TEASER_TOKEN = "CARD_TEASER_TOKEN"
+BEETS_BODY_TOKEN = "TOKEN_BEETS_BODY"
+BEETS_RECIPE_TOKEN = "TOKEN_BEETS_RECIPE"
 
 NEWS = """
 <!doctype html>
@@ -128,6 +131,32 @@ LOCKED_ARTICLE = """
 """
 
 
+def test_react_fulltext_aside_stays_in_the_extract():
+    """Sanitize must not drop a unique aside from rails fullText under 80 words."""
+    aside = " ".join(
+        f"Aside sentence {i} about the interconnect queue and crew rest."
+        for i in range(10)
+    )
+    assert len(aside.split()) >= 40
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="SpaceX Shakes Up Data Center Leadership">
+  <script type="application/json" class="js-react-on-rails-component" data-component-name="Article">
+  {{"article":{{"title":"SpaceX Shakes Up Data Center Leadership","fullText":"<p>Lead sentence about the campus TOKEN_ASIDE_LEAD.</p><aside><p>{aside}</p></aside><p>Closing sentence TOKEN_ASIDE_CLOSE.</p>"}}}}
+  </script>
+</head>
+<body><h1>SpaceX Shakes Up Data Center Leadership</h1><p>Sign in</p></body>
+</html>
+"""
+    got = extract_article(html, "https://www.theinformation.com/articles/x")
+    assert "TOKEN_ASIDE_LEAD" in got["article_text"]
+    assert "Aside sentence 0" in got["article_text"]
+    assert "TOKEN_ASIDE_CLOSE" in got["article_text"]
+    assert got["word_count"] >= 80
+    assert got["paywalled"] is False
+
+
 def test_react_article_uses_free_blurb_not_short_og():
     got = extract_article(LOCKED_ARTICLE, "https://www.theinformation.com/articles/x")
     assert got["title"] == "SpaceX Shakes Up Data Center Leadership After Aggressive Build-Out"
@@ -151,6 +180,209 @@ def test_extract_uses_article_body_not_related_card():
     assert got["title"].startswith("Inside the fightback")
     assert got["site_name"] == "Daily Test"
     assert got["author"] == "Jane Reporter"
+    assert "Listen" not in got["article_text"]
+    assert "Share via email" not in got["article_text"]
+    assert "Share on X" not in got["article_text"]
+
+
+def test_nyt_shaped_chrome_and_images_are_sanitized():
+    got = extract_article(
+        NYT_BEETS_CHROME,
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    text = got["article_text"]
+    html = got["article_html"]
+    assert got["title"] == "How Healthy Are Beets?"
+    assert got["author"] == "Simar Bajaj"
+    assert got["site_name"] == "The New York Times"
+    assert BEETS_BODY_TOKEN in text
+    assert BEETS_RECIPE_TOKEN in text
+    assert "eye-popping colors" in (got.get("dek") or text)
+    assert "By Simar Bajaj" in text
+    assert "David Chow" in text
+    assert "roasted beets on a wooden table" in text
+    assert "Beet hummus in a bowl" in text
+    assert "beets-hero.jpg" in html
+    assert "beets-bowl.jpg" in html
+    assert 'src="https://static.example/beets-bowl.jpg"' in html
+    assert "Share full article" not in text
+    assert "Share full article" not in html
+    assert "Listen" not in text
+    assert "6:27" not in text
+    assert "Leer en español" not in text
+    assert "Gift this article" not in text
+    assert "More in Well" not in text
+    assert "sleep trackers" not in text
+    assert "width:1600" not in html
+    assert "float:left" not in html
+    assert "float:right" not in html
+    assert 'style="' not in html
+    assert got["paywalled"] is False
+    assert got["word_count"] >= 80
+    assert text.lower().count("share") == 0
+
+
+def test_sanitize_is_idempotent_on_nyt_extract():
+    got = extract_article(
+        NYT_BEETS_CHROME,
+        "https://www.nytimes.com/2026/08/10/well/eat/beets-health-benefits-recipes.html",
+    )
+    again = sanitize_article_html(got["article_html"])
+    assert BEETS_BODY_TOKEN in again
+    assert "Share full article" not in again
+    assert "beets-bowl.jpg" in again
+
+
+def test_sanitize_keeps_long_aside_nav_video_and_footer():
+    quote = " ".join(
+        f"Pull quote word{i} about nitrate and blood pressure in beets."
+        for i in range(8)
+    )
+    toc = " ".join(
+        f"Section heading {i} covering soil, harvest, and roasting."
+        for i in range(25)
+    )
+    correction = " ".join(
+        f"Correction word{i} on the date of the garden trial."
+        for i in range(8)
+    )
+    assert len(quote.split()) >= 40
+    assert len(toc.split()) >= 40
+    assert len(correction.split()) >= 40
+    html = f"""
+    <article>
+      <p>Lead paragraph about beets TOKEN_BEETS_BODY in ordinary food.</p>
+      <aside><p>{quote}</p></aside>
+      <nav><p>{toc}</p></nav>
+      <video src="https://static.example/beets.mp4"></video>
+      <footer><p>{correction}</p></footer>
+      <aside><p>More in Well</p></aside>
+      <button>Listen · 6:27 min</button>
+      <div role="toolbar"><a href="/share">Share full article</a></div>
+      <p>Closing paragraph TOKEN_BEETS_RECIPE stays in the extract.</p>
+    </article>
+    """
+    got = sanitize_article_html(html)
+    assert "Pull quote word0" in got
+    assert "Section heading 0" in got
+    assert "beets.mp4" in got
+    assert "Correction word0" in got
+    assert "TOKEN_BEETS_BODY" in got
+    assert "TOKEN_BEETS_RECIPE" in got
+    assert "More in Well" not in got
+    assert "Listen · 6:27" not in got
+    assert "Share full article" not in got
+
+
+def test_sanitize_keeps_rails_aside_prose_above_paywall_line():
+    """A JSON fullText aside with unique prose must not be stripped under 80 words."""
+    aside = " ".join(
+        f"Aside sentence {i} about the interconnect queue and crew rest."
+        for i in range(10)
+    )
+    assert len(aside.split()) >= 40
+    html = (
+        "<p>Lead sentence about the campus.</p>"
+        f"<aside><p>{aside}</p></aside>"
+        "<p>Closing sentence.</p>"
+    )
+    got = sanitize_article_html(html)
+    assert "Aside sentence 0" in got
+    from app.extract import _prose_word_count
+
+    assert _prose_word_count(got) >= 40
+
+
+def test_sanitize_promotes_spacer_gif_to_data_src():
+    html = (
+        '<p>TOKEN_BEETS_BODY</p>'
+        '<img src="https://static.example/spacer.gif" '
+        'data-src="https://static.example/beets-real.jpg" alt="Beets">'
+    )
+    got = sanitize_article_html(html)
+    assert "beets-real.jpg" in got
+    assert 'src="https://static.example/beets-real.jpg"' in got
+    assert "spacer.gif" not in got
+
+
+def test_sanitize_promotes_1x1_spacer_gif_to_data_src():
+    """Placeholder width/height must not make the real data-src look empty."""
+    html = (
+        '<p>TOKEN_BEETS_BODY</p>'
+        '<img src="https://static.example/spacer.gif" width="1" height="1" '
+        'data-src="https://static.example/beets-real.jpg" alt="Beets">'
+    )
+    got = sanitize_article_html(html)
+    assert "beets-real.jpg" in got
+    assert 'src="https://static.example/beets-real.jpg"' in got
+    assert "spacer.gif" not in got
+
+
+def test_sanitize_drops_empty_source_video():
+    html = (
+        "<p>TOKEN_BEETS_BODY Beets are food, not a toolbar.</p>"
+        "<video><source></source></video>"
+        '<video><source src=""></source></video>'
+        '<video><source src="https://static.example/beets.mp4"></source></video>'
+    )
+    got = sanitize_article_html(html)
+    assert got.count("<video") == 1
+    assert "beets.mp4" in got
+    assert "<source></source>" not in got
+    assert 'src=""' not in got
+
+
+def test_sanitize_keeps_svg_chart_outside_figure():
+    slices = "".join(f'<path d="M{i} 0 L{i} 10"></path>' for i in range(10))
+    html = (
+        "<p>TOKEN_BEETS_BODY</p>"
+        f'<svg viewBox="0 0 100 40"><title>Beet yield</title>{slices}</svg>'
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M0 0h16v16H0z"></path></svg>'
+    )
+    got = sanitize_article_html(html)
+    assert "Beet yield" in got
+    assert got.count("<svg") == 1
+
+
+def test_share_listen_chrome_does_not_inflate_word_count():
+    """Toolbar copy must not push a short teaser over the paywall line."""
+    chrome = """
+    <button>Listen · 6:27 min</button>
+    <div role="toolbar">
+      <a href="https://x.com/intent/post/?url=https://daily.test/x">Share full article</a>
+      <button aria-label="Gift this article">Gift</button>
+    </div>
+    <p>Listen</p>
+    <p>Share full article</p>
+    <p>Leer en español</p>
+    """
+    body = (
+        "Beets are a root vegetable with pigment that stains the board. "
+        "TOKEN_TEASER_ONLY Doctors mention nitrate and blood pressure in passing."
+    )
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta property="og:title" content="How Healthy Are Beets?">
+  <meta property="og:description" content="A short dek for a locked page.">
+</head>
+<body>
+  <article>
+    <h1>How Healthy Are Beets?</h1>
+    {chrome}
+    <p>{body}</p>
+  </article>
+</body>
+</html>
+"""
+    assert len(body.split()) < 80
+    got = extract_article(html, "https://daily.test/beets")
+    assert got["paywalled"] is True
+    assert got["word_count"] < 80
+    assert "TOKEN_TEASER_ONLY" in got["article_text"]
+    assert "Share full article" not in got["article_text"]
+    assert "Listen" not in got["article_text"]
+    assert "Leer en español" not in got["article_text"]
 
 
 def test_teaser_plus_related_cards_stays_paywalled():

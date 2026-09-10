@@ -5,6 +5,8 @@ from __future__ import annotations
 from html import escape
 import re
 
+from .extract import sanitize_article_html
+
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z“\"])")
 
 
@@ -44,7 +46,7 @@ def build_reader_html(article: dict, url: str) -> str:
     author = escape(article.get("author") or "")
     published = escape(article.get("published_at") or "")
     source = escape(article.get("site_name") or "")
-    raw_html = article.get("article_html") or ""
+    raw_html = sanitize_article_html(article.get("article_html") or "")
     p_count = len(re.findall(r"<p\b", raw_html, flags=re.I))
     if p_count >= 2:
         body_html = raw_html
@@ -126,9 +128,34 @@ def build_reader_html(article: dict, url: str) -> str:
       padding-bottom: 1.1rem; border-bottom: 1px solid #e6e6e6;
     }}
     .meta .k {{ color: #888; }}
-    .body {{ font-size: 1.18rem; line-height: 1.55; }}
+    .body {{
+      font-size: 1.18rem; line-height: 1.55;
+      max-width: 40rem; overflow-wrap: break-word;
+    }}
     .body p {{ margin: 0 0 1.25rem; }}
     .body a {{ color: #111; }}
+    .body img,
+    .body picture,
+    .body video,
+    .body figure {{
+      display: block;
+      max-width: 100% !important;
+      height: auto !important;
+      width: auto;
+      float: none !important;
+      margin: 1.25rem 0;
+    }}
+    .body figure {{ margin: 1.5rem 0; }}
+    .body figure img,
+    .body picture img {{ margin: 0 auto; }}
+    .body figcaption,
+    .body .caption {{
+      display: block;
+      font-size: 0.95rem;
+      line-height: 1.4;
+      color: #555;
+      margin: 0.45rem 0 0;
+    }}
     .notice {{
       background: #fff4e5;
       border: 1px solid #e6c48a;
