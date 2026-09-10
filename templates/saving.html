@@ -26,37 +26,21 @@
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
     return (n / (1024 * 1024)).toFixed(1) + ' MB';
   }
-  function prettyBytes(n) {
-    n = Number(n);
-    if (!Number.isFinite(n) || n < 0) return '';
-    if (n < 1024) return Math.round(n) + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
-    return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
-  }
   function prettyDuration(ms) {
-    ms = Number(ms);
-    if (!Number.isFinite(ms) || ms < 0) return '';
     if (ms < 1000) return Math.round(ms) + ' ms';
-    if (ms < 60 * 1000) return (ms / 1000).toFixed(1).replace('.0', '') + ' s';
+    if (ms < 60 * 1000) return Math.round(ms / 100) / 10 + ' s';
     const minutes = Math.floor(ms / (60 * 1000));
-    const seconds = ((ms % (60 * 1000)) / 1000).toFixed(1).replace('.0', '');
+    const seconds = Math.round((ms % (60 * 1000)) / 100) / 10;
     return minutes + 'm ' + seconds + 's';
   }
   function renderCaptureStats(stats, finalUrl) {
-    stats = stats || {};
-    const parts = [];
-    if (Number.isFinite(Number(stats.blocked_resources))) {
-      parts.push(Number(stats.blocked_resources) + ' blocked');
-    }
-    if (Number.isFinite(Number(stats.saved_resources))) {
-      parts.push(Number(stats.saved_resources) + ' assets');
-    }
-    const bytes = prettyBytes(stats.bytes_saved);
-    if (bytes) parts.push(bytes + ' saved');
-    const duration = prettyDuration(stats.duration_ms);
-    if (duration) parts.push(duration);
-    statsEl.textContent = parts.join(' · ') || 'Capture details unavailable';
+    const bytes = stats.bytes_saved === 0 ? '0 B' : prettySize(stats.bytes_saved);
+    statsEl.textContent = [
+      stats.blocked_resources + ' blocked',
+      stats.saved_resources + ' assets',
+      bytes + ' saved',
+      prettyDuration(stats.duration_ms),
+    ].join(' · ');
     if (finalUrl) {
       finalUrlEl.textContent = 'Final URL: ' + finalUrl;
       finalUrlEl.classList.remove('hidden');

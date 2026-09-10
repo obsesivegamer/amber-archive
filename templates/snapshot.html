@@ -24,10 +24,10 @@
       {% set stats = snap.capture_stats or {} %}
       {% if stats %}
       <div class="capture-stats" aria-label="Capture details">
-        {% if stats.blocked_resources is defined %}<span>{{ stats.blocked_resources }} blocked</span>{% endif %}
-        {% if stats.saved_resources is defined %}<span>{{ stats.saved_resources }} assets</span>{% endif %}
-        {% if stats.bytes_saved is defined %}<span>{{ stats.bytes_saved | filesize }} saved</span>{% endif %}
-        {% if stats.duration_ms is defined %}<span>{{ stats.duration_ms | duration }}</span>{% endif %}
+        <span>{{ stats.blocked_resources }} blocked</span>
+        <span>{{ stats.saved_resources }} assets</span>
+        <span>{{ stats.bytes_saved | filesize }} saved</span>
+        <span>{{ stats.duration_ms | duration }}</span>
       </div>
       {% endif %}
     </div>

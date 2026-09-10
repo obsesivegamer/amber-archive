@@ -361,7 +361,6 @@ class _Visit:
 
 
 def empty_capture_stats() -> dict[str, int]:
-    """Return the stable shape used by live jobs and saved metadata."""
     return {
         "blocked_resources": 0,
         "saved_resources": 0,
@@ -371,18 +370,16 @@ def empty_capture_stats() -> dict[str, int]:
 
 
 def _capture_stats(visit: _Visit, duration_ms: int = 0) -> dict[str, int]:
-    stats = empty_capture_stats()
-    stats.update(
-        blocked_resources=visit.blocked_resources,
-        saved_resources=len(visit.resource_bodies),
-        bytes_saved=sum(len(body) for body, _ in visit.resource_bodies.values()),
-        duration_ms=max(0, int(duration_ms)),
-    )
-    return stats
+    return {
+        "blocked_resources": visit.blocked_resources,
+        "saved_resources": len(visit.resource_bodies),
+        "bytes_saved": sum(len(body) for body, _ in visit.resource_bodies.values()),
+        "duration_ms": duration_ms,
+    }
 
 
 def _elapsed_ms(started: float) -> int:
-    return max(0, round((time.perf_counter() - started) * 1000))
+    return round((time.perf_counter() - started) * 1000)
 
 
 async def _settle_page(page) -> None:
@@ -742,17 +739,19 @@ async def run_job(job_id: str) -> None:
                 await visit.close()
             await browser.close()
 
+    saved_bytes = 0
     for filename, (body, _ctype) in resource_bodies.items():
+        target = res_dir / filename
         if filename.endswith(".css"):
             css_url = next((u for u, n in resource_map.items() if n == filename), final_url)
             try:
                 text = body.decode("utf-8", errors="replace")
                 text = rewrite_css(text, css_url, resource_map, sid)
-                (res_dir / filename).write_text(text, encoding="utf-8")
+                saved_bytes += target.write_bytes(text.encode("utf-8"))
                 continue
             except Exception:
                 pass
-        (res_dir / filename).write_bytes(body)
+        saved_bytes += target.write_bytes(body)
 
     frozen = freeze_html(html, final_url, resource_map, sid)
 
@@ -770,6 +769,7 @@ async def run_job(job_id: str) -> None:
         pass
 
     capture_stats = _capture_stats(visit, _elapsed_ms(started))
+    capture_stats["bytes_saved"] = saved_bytes
     job["capture_stats"] = capture_stats
     job["final_url"] = final_url
 

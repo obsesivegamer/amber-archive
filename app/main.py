@@ -81,11 +81,7 @@ def fmt_date(iso: str | None) -> str:
         return iso
 
 
-def fmt_bytes(value: int | None) -> str:
-    try:
-        size = max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return ""
+def fmt_bytes(size: int) -> str:
     if size < 1024:
         return f"{size} B"
     if size < 1024 * 1024:
@@ -95,17 +91,15 @@ def fmt_bytes(value: int | None) -> str:
     return f"{size / (1024 * 1024 * 1024):.1f} GB"
 
 
-def fmt_duration(value: int | None) -> str:
-    try:
-        millis = max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return ""
+def fmt_duration(millis: int) -> str:
     if millis < 1000:
         return f"{millis} ms"
     if millis < 60 * 1000:
-        return f"{millis / 1000:.1f} s".replace(".0 s", " s")
+        seconds = round(millis / 1000, 1)
+        return f"{seconds:g} s"
     minutes, remainder = divmod(millis, 60 * 1000)
-    return f"{minutes}m {remainder / 1000:.1f}s".replace(".0s", "s")
+    seconds = round(remainder / 1000, 1)
+    return f"{minutes}m {seconds:g}s"
 
 
 def host_of(url: str | None) -> str:
@@ -123,11 +117,9 @@ templates.env.filters["host"] = host_of
 
 def _read_capture_stats(sid: str) -> dict:
     try:
-        meta = db.read_json(db.snap_dir(sid) / "meta.json")
-    except (OSError, TypeError, ValueError):
+        return db.read_json(db.snap_dir(sid) / "meta.json").get("capture_stats", {})
+    except (OSError, ValueError):
         return {}
-    stats = meta.get("capture_stats") if isinstance(meta, dict) else None
-    return stats if isinstance(stats, dict) else {}
 
 
 @asynccontextmanager
@@ -281,7 +273,7 @@ async def job_status(job_id: str):
         "title": job.get("title"),
         "url": job.get("url"),
         "final_url": job.get("final_url"),
-        "capture_stats": job.get("capture_stats", capture.empty_capture_stats()),
+        "capture_stats": job["capture_stats"],
     }
 
 

@@ -16,7 +16,10 @@ PNG = (
     b"\x00\x00\x00\x03\x00\x01\x00\x05\xfe\xd4\xef\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
-CSS = "body{font-family:serif;background:#fff}h1{font-size:28px}img{width:40px;height:40px}"
+CSS = (
+    "body{font-family:serif;background:#fff}h1{font-size:28px}"
+    "img{width:40px;height:40px;background-image:url('/hero.png')}"
+)
 FONT = b"fixture font response"
 
 HTML = """<!doctype html>
@@ -107,7 +110,6 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         assert job["final_url"] == local_site
         assert stats["blocked_resources"] >= 1
         assert stats["saved_resources"] == 3
-        assert stats["bytes_saved"] == len(CSS.encode()) + len(PNG) + len(FONT)
         assert stats["duration_ms"] > 0
 
         page = client.get(f"/{sid}")
@@ -154,6 +156,10 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         from app import db
 
         meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        res_dir = db.snap_dir(sid) / "res"
+        assert stats["bytes_saved"] == sum(
+            path.stat().st_size for path in res_dir.iterdir() if path.is_file()
+        )
         assert meta["capture_stats"] == stats
         assert meta["final_url"] == local_site
         from app import capture

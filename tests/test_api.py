@@ -75,26 +75,15 @@ def test_import_html_creates_article_snapshot(tmp_data, monkeypatch):
     assert snap["author"] == "Grace Kay"
 
 
-def test_snapshot_labels_original_and_final_urls(tmp_data, monkeypatch):
-    from tests.test_extract import ARCHIVE_IS_SAVED
-
-    async def _skip_shot(sid: str) -> None:
-        return None
+def test_snapshot_labels_original_and_final_urls(tmp_data):
+    from app import db
 
     original = "https://original.example/story?from=bookmark"
     final = "https://final.example/story"
-    monkeypatch.setattr("app.main.screenshot_reader", _skip_shot)
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, original, original)
+    db.update_snapshot(sid, final_url=final, status="complete")
     with TestClient(app) as client:
-        r = client.post(
-            "/import",
-            data={"url": original},
-            files={"file": ("article.html", ARCHIVE_IS_SAVED, "text/html")},
-            follow_redirects=False,
-        )
-        sid = r.headers["location"].strip("/")
-        from app import db
-
-        db.update_snapshot(sid, final_url=final)
         page = client.get(f"/{sid}")
 
     assert page.status_code == 200
