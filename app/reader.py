@@ -8,6 +8,7 @@ import re
 from .extract import sanitize_article_html
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z“\"])")
+AMBER_INCOMPLETE_NOTICE_PREFIX = "Incomplete — Amber extracted only a short preview."
 
 
 def _paragraphs(text: str) -> list[str]:
@@ -76,7 +77,7 @@ def build_reader_html(article: dict, url: str) -> str:
             else ""
         )
         notice = (
-            '<p class="notice">Incomplete — Amber extracted only a short preview.'
+            f'<p class="notice">{AMBER_INCOMPLETE_NOTICE_PREFIX}'
             f"{retried} "
             "The page may have limited access, or extraction may have missed the full article. "
             "If the full piece is visible in your browser, save the page as HTML, then "

@@ -11,9 +11,16 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from . import db
-from .extract import PAYWALL_WORD_LIMIT, article_is_paywalled, extract_article, sanitize_article_html
+from .extract import (
+    PAYWALL_WORD_LIMIT,
+    _media_url,
+    _url_looks_like_placeholder,
+    article_is_paywalled,
+    extract_article,
+    sanitize_article_html,
+)
 from .freeze import freeze_html
-from .reader import build_reader_html
+from .reader import AMBER_INCOMPLETE_NOTICE_PREFIX, build_reader_html
 from .security import normalize_url
 
 log = logging.getLogger("amber.ingest")
@@ -220,6 +227,69 @@ def _article_from_stored_html(html: str, current: dict, url: str) -> dict:
     return article
 
 
+def _stored_reader_body_html(reader_html: str) -> str:
+    """Inner HTML of Amber's `.body`, excluding wrap chrome and Amber's banner."""
+    if not (reader_html or "").strip():
+        return ""
+    soup = BeautifulSoup(reader_html, "lxml")
+    node = soup.select_one("div.body")
+    if node is None:
+        return ""
+    for child in node.find_all("p", class_="notice", recursive=False):
+        text = child.get_text(" ", strip=True)
+        if text.startswith(AMBER_INCOMPLETE_NOTICE_PREFIX):
+            child.decompose()
+    return node.decode_contents().strip()
+
+
+def _is_retained_media_url(src: str) -> bool:
+    s = (src or "").strip()
+    return bool(s) and not _url_looks_like_placeholder(s)
+
+
+def _has_retained_media(root) -> bool:
+    """True when sanitize kept a real img/src/srcset or video URL, not a placeholder."""
+    for img in root.find_all("img"):
+        if _is_retained_media_url(_media_url(img)):
+            return True
+    for video in root.find_all("video"):
+        if _is_retained_media_url(video.get("src") or ""):
+            return True
+        for source in video.find_all("source"):
+            if _is_retained_media_url(source.get("src") or "") or _is_retained_media_url(
+                source.get("srcset") or ""
+            ):
+                return True
+    for source in root.find_all("source"):
+        if _is_retained_media_url(source.get("src") or "") or _is_retained_media_url(
+            source.get("srcset") or ""
+        ):
+            return True
+    return False
+
+
+def _sanitized_body_is_usable(article: dict) -> bool:
+    """True when a sanitized extract has prose or retained content media."""
+    if int(article.get("word_count") or 0) > 0:
+        return True
+    html = (article.get("article_html") or "").strip()
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "lxml")
+    root = soup.body or soup
+    return _has_retained_media(root)
+
+
+def _article_from_stored_reader(reader_html: str, current: dict, url: str) -> dict | None:
+    body = _stored_reader_body_html(reader_html)
+    if not body:
+        return None
+    article = _article_from_stored_html(body, current, url)
+    if not _sanitized_body_is_usable(article):
+        return None
+    return article
+
+
 def _extract_is_worse(candidate: dict, current: dict) -> bool:
     """Refuse a rebuild that would collapse a stored extract.
 
@@ -283,9 +353,9 @@ def _write_rebuilt(folder, article: dict, url: str, sid: str, meta: dict, meta_p
 def rebuild_reader(sid: str) -> dict:
     """Rebuild reader.html from the stored extract. No live fetch.
 
-    Prefers stored article.html (JSON-backed bodies survive freeze). Falls
-    back to re-extracting page.html only when article.html is empty.
-    Refuses to write if the candidate is worse than the stored extract.
+    Source order: nonempty article.html, else the `.body` inner HTML of
+    stored reader.html, else re-extract frozen page.html. Refuses to write
+    if the candidate is worse than the stored extract.
     """
     snap = db.get_snapshot(sid)
     if not snap:
@@ -298,19 +368,35 @@ def rebuild_reader(sid: str) -> dict:
 
     html_path = folder / "article.html"
     stored_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    page_path = folder / "page.html"
+
     if stored_html.strip():
         article = _article_from_stored_html(stored_html, current, url)
         source = "article.html"
         update_identity = False
     else:
-        page_path = folder / "page.html"
-        if not page_path.exists():
-            raise FileNotFoundError(f"No article.html or page.html for {sid}")
-        article = extract_article(page_path.read_text(encoding="utf-8"), url)
-        source = "page.html"
-        update_identity = True
-        if meta.get("referrer_retried"):
-            article["referrer_retried"] = True
+        reader_path = folder / "reader.html"
+        stored_reader = ""
+        if reader_path.exists():
+            try:
+                stored_reader = reader_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                stored_reader = ""
+        from_reader = _article_from_stored_reader(stored_reader, current, url)
+        if from_reader is not None:
+            article = from_reader
+            source = "reader.html"
+            update_identity = False
+        else:
+            if not page_path.exists():
+                raise FileNotFoundError(
+                    f"No article.html, reader.html body, or page.html for {sid}"
+                )
+            article = extract_article(page_path.read_text(encoding="utf-8"), url)
+            source = "page.html"
+            update_identity = True
+            if meta.get("referrer_retried"):
+                article["referrer_retried"] = True
 
     if _extract_is_worse(article, current):
         current["rebuild_refused"] = True
