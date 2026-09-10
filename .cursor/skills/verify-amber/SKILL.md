@@ -15,24 +15,34 @@ Read `features/README.md` before driving. Use the matching feature file. A proof
 
 Never drive the user's live instance. Live Amber is `http://127.0.0.1:8080` with SQLite and files in repo `data/`. Verification uses port **18080** and a disposable data dir under this skill's `.scratch/`.
 
-From the repo root:
+From the repo root, Windows:
 
 ```powershell
 powershell -NoProfile -File .cursor\skills\verify-amber\scripts\launch.ps1
 ```
 
+Linux / macOS (this skill's bash helpers; same isolation rules):
+
+```bash
+bash .cursor/skills/verify-amber/scripts/launch.sh
+```
+
 Ready when stdout contains `Amber verify instance ready at http://127.0.0.1:18080` and `GET http://127.0.0.1:18080/` returns 200 with title `Amber — a time capsule for web pages`.
 
-`launch.ps1` sets `AMBER_DATA_DIR` to `.cursor/skills/verify-amber/.scratch/data`, starts `.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 18080`, and writes `.cursor/skills/verify-amber/.scratch/instance.json`. It reuses a healthy existing verify instance instead of starting a second one on the same port.
+`launch.ps1` / `launch.sh` set `AMBER_DATA_DIR` to `.cursor/skills/verify-amber/.scratch/data`, start `.venv` Python as `-m uvicorn app.main:app --host 127.0.0.1 --port 18080`, and write `.cursor/skills/verify-amber/.scratch/instance.json`. They reuse a healthy existing verify instance instead of starting a second one on the same port.
 
-Override port with `$env:AMBER_VERIFY_PORT` (must still not be 8080). Two verify instances may run only if they have different ports **and** different `AMBER_DATA_DIR` values. If 18080 is already taken by something that is not this skill's `instance.json`, refuse and stop.
+Override port with `$env:AMBER_VERIFY_PORT` / `AMBER_VERIFY_PORT` (must still not be 8080). Two verify instances may run only if they have different ports **and** different `AMBER_DATA_DIR` values. If 18080 is already taken by something that is not this skill's `instance.json`, refuse and stop.
 
-If `.venv\Scripts\python.exe` is missing, run the README setup first (`.\run.ps1` or the manual venv + `pip install` + `playwright install chromium` steps), then launch again. Do not install into the user's live `data/` tree.
+Python is `.venv\Scripts\python.exe` on Windows and `.venv/bin/python` on Linux/macOS. If that interpreter is missing, run the README setup first (`.\run.ps1` or the manual venv + `pip install` + `playwright install chromium` steps), then launch again. Do not install into the user's live `data/` tree.
 
 Teardown:
 
 ```powershell
 powershell -NoProfile -File .cursor\skills\verify-amber\scripts\cleanup.ps1
+```
+
+```bash
+bash .cursor/skills/verify-amber/scripts/cleanup.sh
 ```
 
 ## Doctor
@@ -41,6 +51,10 @@ Read-only. Run this first whenever anything looks off:
 
 ```powershell
 powershell -NoProfile -File .cursor\skills\verify-amber\scripts\doctor.ps1
+```
+
+```bash
+bash .cursor/skills/verify-amber/scripts/doctor.sh
 ```
 
 Doctor is worth driving only when all of these hold:
@@ -56,7 +70,7 @@ If doctor fails, do not continue. Fix launch or clean up and relaunch. If you fi
 
 ## Drive
 
-Harness: **cursor-ide-browser** for the user path, plus **HTTP** for the same form actions and for job polling. Prefer accessible names and element ids from the templates over coordinates.
+Harness: **cursor-ide-browser** for the user path when that MCP is available; otherwise drive the same verify URL with the available browser (or HTTP). Plus **HTTP** for the same form actions and for job polling. Prefer accessible names and element ids from the templates over coordinates. Never fall back to port 8080.
 
 Base URL is the verify instance from `instance.json` (default `http://127.0.0.1:18080`).
 
@@ -96,10 +110,24 @@ curl.exe -sS "http://127.0.0.1:18080/search?q=VERIFICATION_TOKEN_AMBER_BRIDGE_20
 curl.exe -sS "http://127.0.0.1:18080/api/jobs/JOBID"
 ```
 
+Linux / macOS (`curl`; `-o /dev/null` instead of `NUL`):
+
+```bash
+curl -sS "http://127.0.0.1:18080/"
+curl -sS -D - -o /dev/null --max-redirs 0 -X POST -F "url=https://example.com/" "http://127.0.0.1:18080/save"
+curl -sS -D - -o /dev/null --max-redirs 0 -F "file=@.cursor/skills/verify-amber/fixtures/article.html;filename=article.html;type=text/html" "http://127.0.0.1:18080/import"
+curl -sS "http://127.0.0.1:18080/search?q=VERIFICATION_TOKEN_AMBER_BRIDGE_2026"
+curl -sS "http://127.0.0.1:18080/api/jobs/JOBID"
+```
+
 Seed a snapshot without the file picker (same `/import` form the homepage posts):
 
 ```powershell
 powershell -NoProfile -File .cursor\skills\verify-amber\scripts\import-fixture.ps1
+```
+
+```bash
+bash .cursor/skills/verify-amber/scripts/import-fixture.sh
 ```
 
 Stdout is `snapshot_id=<id>`. Use that id for search, browse, and viewer recipes.
@@ -137,7 +165,11 @@ Plus whatever disk or HTTP dump the feature file names.
 powershell -NoProfile -File .cursor\skills\verify-amber\scripts\cleanup.ps1
 ```
 
-Kills only the PID in `.scratch/instance.json`, then removes `.scratch/` (data dir, logs, instance file). Does not kill by process name. Does not touch repo `data/`, port 8080, or `evidence/`.
+```bash
+bash .cursor/skills/verify-amber/scripts/cleanup.sh
+```
+
+Kills only the PID in `.scratch/instance.json` (and that PID's remaining children on Unix), then removes `.scratch/` (data dir, logs, instance file). Does not kill by process name. Does not touch repo `data/`, port 8080, or `evidence/`.
 
 After a failed iteration, run cleanup before the next launch so port 18080 and the scratch DB are not stranded.
 
@@ -147,9 +179,11 @@ All scripts are launched from the repo root as shown.
 
 | Script | Purpose |
 |---|---|
-| `scripts/launch.ps1` | Start or reuse the isolated verify instance |
-| `scripts/doctor.ps1` | Read-only health check; exit 0 only if worth driving |
-| `scripts/import-fixture.ps1` | POST `fixtures/article.html` to `/import`; print `snapshot_id=` |
-| `scripts/cleanup.ps1` | Stop the launched PID; delete scratch only |
+| `scripts/launch.ps1` / `scripts/launch.sh` | Start or reuse the isolated verify instance |
+| `scripts/doctor.ps1` / `scripts/doctor.sh` | Read-only health check; exit 0 only if worth driving |
+| `scripts/import-fixture.ps1` / `scripts/import-fixture.sh` | POST `fixtures/article.html` to `/import`; print `snapshot_id=` |
+| `scripts/cleanup.ps1` / `scripts/cleanup.sh` | Stop the launched PID; delete scratch only |
+
+Use the `.ps1` files from PowerShell on Windows. Use the `.sh` files from bash on Linux/macOS. Do not mix a Windows launch with a Unix cleanup (or the reverse): each pair writes and reads the same `.scratch/instance.json`.
 
 Fixture `fixtures/article.html` is a news-shaped page titled **Amber Verification Bridge** whose body contains the unique token `VERIFICATION_TOKEN_AMBER_BRIDGE_2026` and byline Casey Prover. Search, browse, and viewer proofs assert that token or title.
