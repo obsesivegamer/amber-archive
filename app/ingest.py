@@ -220,6 +220,19 @@ def _article_from_stored_html(html: str, current: dict, url: str) -> dict:
     return article
 
 
+def _stored_reader_body_html(reader_html: str) -> str:
+    """Inner HTML of Amber's `.body`, not wrap chrome or the paywall notice."""
+    if not (reader_html or "").strip():
+        return ""
+    soup = BeautifulSoup(reader_html, "lxml")
+    node = soup.select_one("div.body")
+    if node is None:
+        return ""
+    for notice in node.select(".notice"):
+        notice.decompose()
+    return node.decode_contents().strip()
+
+
 def _extract_is_worse(candidate: dict, current: dict) -> bool:
     """Refuse a rebuild that would collapse a stored extract.
 
@@ -283,9 +296,9 @@ def _write_rebuilt(folder, article: dict, url: str, sid: str, meta: dict, meta_p
 def rebuild_reader(sid: str) -> dict:
     """Rebuild reader.html from the stored extract. No live fetch.
 
-    Prefers stored article.html (JSON-backed bodies survive freeze). Falls
-    back to re-extracting page.html only when article.html is empty.
-    Refuses to write if the candidate is worse than the stored extract.
+    Source order: nonempty article.html, else the `.body` inner HTML of
+    stored reader.html, else re-extract frozen page.html. Refuses to write
+    if the candidate is worse than the stored extract.
     """
     snap = db.get_snapshot(sid)
     if not snap:
@@ -298,14 +311,24 @@ def rebuild_reader(sid: str) -> dict:
 
     html_path = folder / "article.html"
     stored_html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+    reader_path = folder / "reader.html"
+    stored_reader = reader_path.read_text(encoding="utf-8") if reader_path.exists() else ""
+    reader_body = _stored_reader_body_html(stored_reader)
+    page_path = folder / "page.html"
+
     if stored_html.strip():
         article = _article_from_stored_html(stored_html, current, url)
         source = "article.html"
         update_identity = False
+    elif reader_body:
+        article = _article_from_stored_html(reader_body, current, url)
+        source = "reader.html"
+        update_identity = False
     else:
-        page_path = folder / "page.html"
         if not page_path.exists():
-            raise FileNotFoundError(f"No article.html or page.html for {sid}")
+            raise FileNotFoundError(
+                f"No article.html, reader.html body, or page.html for {sid}"
+            )
         article = extract_article(page_path.read_text(encoding="utf-8"), url)
         source = "page.html"
         update_identity = True

@@ -1,5 +1,6 @@
 from app.ingest import (
     _extract_is_worse,
+    _stored_reader_body_html,
     ingest_html,
     original_url_from_html,
     rebuild_reader,
@@ -10,6 +11,19 @@ from tests.test_extract import (
     NYT_BEETS_CHROME,
     POLITICO_RELATED_CARD,
 )
+
+# Amber wrap chrome with no usable article body (notice-only .body).
+_READER_WRAP_NO_BODY = """<!doctype html>
+<html><body>
+<article class="wrap">
+<h1>CHROME_OUTSIDE_TOKEN leftover title</h1>
+<aside>By Chrome Author</aside>
+<div class="body">
+<p class="notice">Incomplete — Amber extracted only a short preview. CHROME_NOTICE_TOKEN</p>
+</div>
+</article>
+</body></html>
+"""
 
 
 def test_original_url_skips_archive_is_saved_from_comment():
@@ -150,8 +164,67 @@ def test_rebuild_keeps_information_json_extract(tmp_data):
     assert (folder / "page.html").read_text(encoding="utf-8") == page
 
 
+def test_rebuild_reader_from_stored_reader_html_body(tmp_data):
+    """Empty article.html still rebuilds from the stored reader .body."""
+    sid = ingest_html(
+        LOCKED_ARTICLE, url="https://www.theinformation.com/articles/x"
+    )
+    from app import db
+    from bs4 import BeautifulSoup
+
+    folder = db.snap_dir(sid)
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    before = db.get_snapshot(sid)
+    stored_title = before["title"]
+    stored_author = before["author"]
+
+    soup = BeautifulSoup(
+        (folder / "reader.html").read_text(encoding="utf-8"), "lxml"
+    )
+    h1 = soup.find("h1")
+    if h1 is not None:
+        h1.insert(0, "CHROME_OUTSIDE_TOKEN ")
+    body = soup.select_one("div.body")
+    notice = soup.new_tag("p", attrs={"class": "notice"})
+    notice.string = (
+        "Incomplete — Amber extracted only a short preview. CHROME_NOTICE_TOKEN"
+    )
+    share = soup.new_tag("p")
+    share_a = soup.new_tag("a", href="https://example.com/share")
+    share_a.string = "Share full article"
+    share.append(share_a)
+    body.insert(0, share)
+    body.insert(0, notice)
+    (folder / "reader.html").write_text(str(soup), encoding="utf-8")
+    (folder / "article.html").write_text("  \n\t  ", encoding="utf-8")
+    (folder / "article.txt").write_text("stale", encoding="utf-8")
+
+    article = rebuild_reader(sid)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    article_html = (folder / "article.html").read_text(encoding="utf-8")
+    reader = (folder / "reader.html").read_text(encoding="utf-8")
+    snap = db.get_snapshot(sid)
+    assert article.get("rebuild_refused") is False
+    assert article.get("rebuild_source") == "reader.html"
+    assert "FREEBLURB_TOKEN_UKrA8" in text
+    assert "FREEBLURB_TOKEN_UKrA8" in article_html
+    assert "FREEBLURB_TOKEN_UKrA8" in reader
+    assert "CHROME_OUTSIDE_TOKEN" not in article_html
+    assert "CHROME_NOTICE_TOKEN" not in article_html
+    assert "CHROME_NOTICE_TOKEN" not in reader
+    assert "Share full article" not in article_html
+    assert "Share full article" not in reader
+    assert "Sign in" not in text
+    assert article["paywalled"] is False
+    assert article["word_count"] >= 90
+    assert snap["word_count"] == article["word_count"]
+    assert snap["title"] == stored_title
+    assert snap["author"] == stored_author
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
+
+
 def test_rebuild_refuses_worse_page_html_extract(tmp_data):
-    """Without article.html, frozen page.html must not clobber a complete extract."""
+    """Without article.html or a reader body, frozen page.html must not clobber."""
     sid = ingest_html(
         LOCKED_ARTICLE, url="https://www.theinformation.com/articles/x"
     )
@@ -160,19 +233,22 @@ def test_rebuild_refuses_worse_page_html_extract(tmp_data):
     folder = db.snap_dir(sid)
     stored_txt = (folder / "article.txt").read_text(encoding="utf-8")
     stored_html = (folder / "article.html").read_text(encoding="utf-8")
-    stored_reader = (folder / "reader.html").read_text(encoding="utf-8")
+    page = (folder / "page.html").read_text(encoding="utf-8")
     before = db.get_snapshot(sid)
     (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(_READER_WRAP_NO_BODY, encoding="utf-8")
     article = rebuild_reader(sid)
     assert article.get("rebuild_refused") is True
     assert article.get("rebuild_source") == "page.html"
     assert "FREEBLURB_TOKEN_UKrA8" in stored_txt
     assert (folder / "article.txt").read_text(encoding="utf-8") == stored_txt
     assert (folder / "article.html").read_text(encoding="utf-8") == ""
-    assert (folder / "reader.html").read_text(encoding="utf-8") == stored_reader
+    assert (folder / "reader.html").read_text(encoding="utf-8") == _READER_WRAP_NO_BODY
+    assert (folder / "page.html").read_text(encoding="utf-8") == page
     after = db.get_snapshot(sid)
     assert after["word_count"] == before["word_count"]
     assert after["paywalled"] is False
+    assert after["title"] == before["title"]
     assert stored_html  # ingest did store the JSON body
 
 
@@ -207,8 +283,8 @@ def test_rebuild_refuses_short_legacy_page_html_collapse(tmp_data):
     assert 20 <= before["word_count"] < 80
     stored_n = before["word_count"]
     stored_txt = (folder / "article.txt").read_text(encoding="utf-8")
-    stored_reader = (folder / "reader.html").read_text(encoding="utf-8")
     (folder / "article.html").write_text("", encoding="utf-8")
+    (folder / "reader.html").write_text(_READER_WRAP_NO_BODY, encoding="utf-8")
     (folder / "page.html").write_text(
         "<!doctype html><html><body><p>Sign</p></body></html>",
         encoding="utf-8",
@@ -217,7 +293,28 @@ def test_rebuild_refuses_short_legacy_page_html_collapse(tmp_data):
     assert article.get("rebuild_refused") is True
     assert article.get("rebuild_source") == "page.html"
     assert (folder / "article.txt").read_text(encoding="utf-8") == stored_txt
-    assert (folder / "reader.html").read_text(encoding="utf-8") == stored_reader
+    assert (folder / "reader.html").read_text(encoding="utf-8") == _READER_WRAP_NO_BODY
     after = db.get_snapshot(sid)
     assert after["word_count"] == stored_n
     assert after["paywalled"] is True
+
+
+def test_stored_reader_body_html_uses_body_not_wrap_chrome():
+    html = """<!doctype html><html><body>
+    <article class="wrap">
+      <h1>CHROME_OUTSIDE_TOKEN Title</h1>
+      <aside>By Chrome Author</aside>
+      <div class="body">
+        <p class="notice">Incomplete — Amber extracted only a short preview. CHROME_NOTICE_TOKEN</p>
+        <p>TOKEN_READER_BODY the real extract lives here.</p>
+      </div>
+    </article>
+    </body></html>"""
+    got = _stored_reader_body_html(html)
+    assert "TOKEN_READER_BODY" in got
+    assert "CHROME_OUTSIDE_TOKEN" not in got
+    assert "CHROME_NOTICE_TOKEN" not in got
+    assert "Chrome Author" not in got
+    assert _stored_reader_body_html("") == ""
+    assert _stored_reader_body_html("<html><body><h1>Title</h1><p>words</p></body></html>") == ""
+    assert _stored_reader_body_html(_READER_WRAP_NO_BODY) == ""

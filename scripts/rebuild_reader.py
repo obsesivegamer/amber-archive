@@ -2,8 +2,9 @@
 """Rebuild reader.html from a stored extract (no live fetch).
 
 Prefers snaps/<id>/article.html (the extract capture/import already
-wrote, including JSON-backed bodies). Re-extracts frozen page.html only
-when article.html is missing, and refuses to write if that extract is
+wrote, including JSON-backed bodies). If that file is empty, uses the
+`.body` inner HTML of stored reader.html. Re-extracts frozen page.html
+only when both are missing, and refuses to write if that extract is
 worse (word count collapses or paywalled flips true).
 
 Does not rewrite page.html or screenshots.
