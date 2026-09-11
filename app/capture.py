@@ -7,6 +7,7 @@ import hashlib
 import io
 import logging
 import mimetypes
+import time
 import traceback
 import urllib.request
 from dataclasses import dataclass
@@ -350,12 +351,35 @@ class _Visit:
     page: Any
     context: Any
     bounce_origin: str | None = None
+    blocked_resources: int = 0
 
     async def close(self) -> None:
         try:
             await self.context.close()
         except Exception:
             pass
+
+
+def empty_capture_stats() -> dict[str, int]:
+    return {
+        "blocked_resources": 0,
+        "saved_resources": 0,
+        "bytes_saved": 0,
+        "duration_ms": 0,
+    }
+
+
+def _capture_stats(visit: _Visit, duration_ms: int = 0) -> dict[str, int]:
+    return {
+        "blocked_resources": visit.blocked_resources,
+        "saved_resources": len(visit.resource_bodies),
+        "bytes_saved": sum(len(body) for body, _ in visit.resource_bodies.values()),
+        "duration_ms": duration_ms,
+    }
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
 
 
 async def _settle_page(page) -> None:
@@ -482,6 +506,7 @@ async def _capture_visit(
     resource_map: dict[str, str] = {}
     resource_bodies: dict[str, tuple[bytes, str]] = {}
     total_bytes = 0
+    blocked_resources = 0
     bounce_landed = False
 
     def _mark_bounce_landed() -> None:
@@ -489,6 +514,7 @@ async def _capture_visit(
         bounce_landed = True
 
     async def on_route(route):
+        nonlocal blocked_resources
         req_url = route.request.url
         if intercept_bounce_host(req_url, bounce_origin, landed=bounce_landed):
             if route.request.resource_type == "document":
@@ -502,6 +528,7 @@ async def _capture_visit(
             await route.abort()
             return
         if _should_block(req_url):
+            blocked_resources += 1
             await route.abort()
             return
         try:
@@ -509,12 +536,13 @@ async def _capture_visit(
             # HTTP redirect hops; this guards each request it does expose.
             await asyncio.to_thread(validate_public_http_request_url, req_url)
         except ValueError:
+            blocked_resources += 1
             await route.abort()
             return
         await route.continue_()
 
     async def on_response(response):
-        nonlocal total_bytes
+        nonlocal total_bytes, blocked_resources
         req_url = response.url
         status = response.status
         ctype = response.headers.get("content-type", "")
@@ -538,10 +566,13 @@ async def _capture_visit(
             server_addr = await response.server_addr()
             peer_ip = server_addr.get("ipAddress") if server_addr else None
             if not peer_ip or not _is_public_ip(peer_ip):
+                blocked_resources += 1
                 return
         except Exception:
+            blocked_resources += 1
             return
         if size > MAX_RESOURCE_BYTES or total_bytes + size > MAX_TOTAL_RESOURCE_BYTES:
+            blocked_resources += 1
             return
         digest = hashlib.sha256(body).hexdigest()[:16]
         filename = digest + _ext_for(ctype, req_url)
@@ -594,6 +625,7 @@ async def _capture_visit(
         page=page,
         context=context,
         bounce_origin=bounce_origin,
+        blocked_resources=blocked_resources,
     )
 
 
@@ -614,6 +646,10 @@ async def worker() -> None:
                 "".join(traceback.format_tb(exc.__traceback__)),
             )
             if job:
+                started = job.pop("_capture_started", None)
+                if started is not None:
+                    stats = job.setdefault("capture_stats", empty_capture_stats())
+                    stats["duration_ms"] = _elapsed_ms(started)
                 job["status"] = "failed"
                 job["error"] = str(exc)
                 db.update_snapshot(job["snapshot_id"], status="failed", error=str(exc)[:500])
@@ -625,6 +661,9 @@ async def run_job(job_id: str) -> None:
     job = jobs[job_id]
     sid = job["snapshot_id"]
     url = job["url"]
+    started = time.perf_counter()
+    job["_capture_started"] = started
+    job["capture_stats"] = empty_capture_stats()
     job["status"] = "capturing"
     db.update_snapshot(sid, status="capturing")
 
@@ -643,6 +682,8 @@ async def run_job(job_id: str) -> None:
         )
         try:
             visit = await _capture_visit(browser, job, url)
+            job["final_url"] = visit.final_url
+            job["capture_stats"] = _capture_stats(visit, _elapsed_ms(started))
             article = visit.article
             crawler_html = await fetch_crawler_html(visit.final_url or url)
             if crawler_html:
@@ -673,6 +714,8 @@ async def run_job(job_id: str) -> None:
                     if not visit.article.get("paywalled"):
                         break
 
+            job["final_url"] = visit.final_url
+            job["capture_stats"] = _capture_stats(visit, _elapsed_ms(started))
             article = visit.article
             if retried:
                 article["referrer_retried"] = True
@@ -696,17 +739,19 @@ async def run_job(job_id: str) -> None:
                 await visit.close()
             await browser.close()
 
+    saved_bytes = 0
     for filename, (body, _ctype) in resource_bodies.items():
+        target = res_dir / filename
         if filename.endswith(".css"):
             css_url = next((u for u, n in resource_map.items() if n == filename), final_url)
             try:
                 text = body.decode("utf-8", errors="replace")
                 text = rewrite_css(text, css_url, resource_map, sid)
-                (res_dir / filename).write_text(text, encoding="utf-8")
+                saved_bytes += target.write_bytes(text.encode("utf-8"))
                 continue
             except Exception:
                 pass
-        (res_dir / filename).write_bytes(body)
+        saved_bytes += target.write_bytes(body)
 
     frozen = freeze_html(html, final_url, resource_map, sid)
 
@@ -722,6 +767,11 @@ async def run_job(job_id: str) -> None:
         im.convert("RGB").save(folder / "thumb.jpg", "JPEG", quality=70)
     except Exception:
         pass
+
+    capture_stats = _capture_stats(visit, _elapsed_ms(started))
+    capture_stats["bytes_saved"] = saved_bytes
+    job["capture_stats"] = capture_stats
+    job["final_url"] = final_url
 
     meta = {
         "id": sid,
@@ -740,6 +790,7 @@ async def run_job(job_id: str) -> None:
         "referrer_retried": bool(retried),
         "referrer_bounce": bounce_used,
         "resources": resource_map,
+        "capture_stats": capture_stats,
         "created_at": db.now_iso(),
     }
     db.write_json(folder / "meta.json", meta)
@@ -759,3 +810,4 @@ async def run_job(job_id: str) -> None:
     )
     job["status"] = "complete"
     job["title"] = meta["title"]
+    job.pop("_capture_started", None)

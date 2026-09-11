@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.main import app, mime_for_filename
+from app.main import app, fmt_bytes, fmt_duration, mime_for_filename
 
 
 def test_homepage_and_about_render():
@@ -40,6 +40,16 @@ def test_css_mime_is_not_octet_stream_on_windows():
     assert mime_for_filename("hero.jpg") == "image/jpeg"
 
 
+def test_capture_metric_formatters():
+    assert fmt_bytes(0) == "0 B"
+    assert fmt_bytes(1024) == "1.0 KB"
+    assert fmt_bytes(1024 * 1024) == "1.0 MB"
+    assert fmt_duration(0) == "0 ms"
+    assert fmt_duration(999) == "999 ms"
+    assert fmt_duration(1_000) == "1 s"
+    assert fmt_duration(61_250) == "1m 1.2s"
+
+
 def test_import_html_creates_article_snapshot(tmp_data, monkeypatch):
     from tests.test_extract import ARCHIVE_IS_SAVED
 
@@ -63,6 +73,24 @@ def test_import_html_creates_article_snapshot(tmp_data, monkeypatch):
     assert snap["status"] == "complete"
     assert "Elon Musk" in (snap.get("title") or "")
     assert snap["author"] == "Grace Kay"
+
+
+def test_snapshot_labels_original_and_final_urls(tmp_data):
+    from app import db
+
+    original = "https://original.example/story?from=bookmark"
+    final = "https://final.example/story"
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, original, original)
+    db.update_snapshot(sid, final_url=final, status="complete")
+    with TestClient(app) as client:
+        page = client.get(f"/{sid}")
+
+    assert page.status_code == 200
+    assert "original.example/story?from=bookmark" in page.text
+    assert "final.example/story" in page.text
+    assert 'class="url-label">original' in page.text
+    assert 'class="url-label">final' in page.text
 
 
 def test_saved_page_lists_all_snapshots(tmp_data, monkeypatch):

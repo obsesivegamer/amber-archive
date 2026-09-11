@@ -10,7 +10,27 @@
     <a href="/{{ snap.id }}/screenshot" class="{% if mode == 'screenshot' %}on{% endif %}">screenshot</a>
   </nav>
   <div class="meta">
-    <a class="orig" href="{{ snap.final_url or snap.url }}" target="_blank" rel="noopener">{{ snap.final_url or snap.url }}</a>
+    <div class="url-meta">
+      {% if snap.final_url and snap.final_url != snap.url %}
+      <div class="url-line">
+        <span class="url-label">original</span>
+        <span class="orig" title="{{ snap.url }}">{{ snap.url }}</span>
+      </div>
+      {% endif %}
+      <div class="url-line">
+        <span class="url-label">final</span>
+        <a class="orig" href="{{ snap.final_url or snap.url }}" target="_blank" rel="noopener">{{ snap.final_url or snap.url }}</a>
+      </div>
+      {% set stats = snap.capture_stats or {} %}
+      {% if stats %}
+      <div class="capture-stats" aria-label="Capture details">
+        <span>{{ stats.blocked_resources }} blocked</span>
+        <span>{{ stats.saved_resources }} assets</span>
+        <span>{{ stats.bytes_saved | filesize }} saved</span>
+        <span>{{ stats.duration_ms | duration }}</span>
+      </div>
+      {% endif %}
+    </div>
     <time>{{ snap.created_at | fmtdate }}</time>
     <form class="delete-form" action="/saved/{{ snap.id }}/delete" method="post"
           onsubmit="return confirm('Delete /{{ snap.id }}? This cannot be undone.')">

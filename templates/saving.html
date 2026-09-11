@@ -8,6 +8,8 @@
   </header>
   <p class="lede" id="status-line">Loading {{ job.url }}</p>
   <p class="hint">Text copy + graphical copy. Scripts will be stripped from the saved page.</p>
+  <p class="capture-stats" id="capture-stats" aria-live="polite">Preparing capture details…</p>
+  <p class="capture-final-url hidden" id="capture-final-url" aria-live="polite"></p>
   <ol class="log" id="log"></ol>
   <p class="flash hidden" id="err"></p>
 </main>
@@ -16,11 +18,33 @@
   const logEl = document.getElementById('log');
   const errEl = document.getElementById('err');
   const statusEl = document.getElementById('status-line');
+  const statsEl = document.getElementById('capture-stats');
+  const finalUrlEl = document.getElementById('capture-final-url');
   function prettySize(n) {
     if (!n) return '';
     if (n < 1024) return n + ' B';
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
     return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+  function prettyDuration(ms) {
+    if (ms < 1000) return Math.round(ms) + ' ms';
+    if (ms < 60 * 1000) return Math.round(ms / 100) / 10 + ' s';
+    const minutes = Math.floor(ms / (60 * 1000));
+    const seconds = Math.round((ms % (60 * 1000)) / 100) / 10;
+    return minutes + 'm ' + seconds + 's';
+  }
+  function renderCaptureStats(stats, finalUrl) {
+    const bytes = stats.bytes_saved === 0 ? '0 B' : prettySize(stats.bytes_saved);
+    statsEl.textContent = [
+      stats.blocked_resources + ' blocked',
+      stats.saved_resources + ' assets',
+      bytes + ' saved',
+      prettyDuration(stats.duration_ms),
+    ].join(' · ');
+    if (finalUrl) {
+      finalUrlEl.textContent = 'Final URL: ' + finalUrl;
+      finalUrlEl.classList.remove('hidden');
+    }
   }
   async function poll() {
     try {
@@ -28,6 +52,7 @@
       if (!r.ok) throw new Error('job missing');
       const j = await r.json();
       statusEl.textContent = (j.status === 'complete' ? 'Saved' : 'Loading') + ' ' + (j.url || '');
+      renderCaptureStats(j.capture_stats, j.final_url);
       logEl.innerHTML = '';
       (j.resources || []).forEach((row) => {
         const li = document.createElement('li');
