@@ -328,14 +328,17 @@ body.viewer {
   flex: 1;
   min-width: 12rem;
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   justify-content: flex-end;
   align-items: baseline;
 }
 
+/* The URL is the provenance, so it wraps the row rather than shrinking away:
+   the column holds 12rem and the date and delete button drop below it. */
 .toolbar .url-meta {
   flex: 1;
-  min-width: 0;
+  min-width: 12rem;
   display: flex;
   flex-direction: column;
   gap: 0.2rem;

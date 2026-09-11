@@ -22,7 +22,7 @@
       {% endif %}
       <div class="url-line">
         <span class="url-label">final</span>
-        <a class="orig" href="{{ snap.final_url or snap.url }}" target="_blank" rel="noopener">{{ snap.final_url or snap.url }}</a>
+        <a class="orig" href="{{ snap.final_url or snap.url }}" title="{{ snap.final_url or snap.url }}" target="_blank" rel="noopener">{{ snap.final_url or snap.url }}</a>
       </div>
       {% set stats = snap.capture_stats or {} %}
       {% if stats %}
