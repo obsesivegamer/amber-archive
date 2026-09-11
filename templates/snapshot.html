@@ -9,6 +9,9 @@
     <a href="/{{ snap.id }}/webpage" class="{% if mode == 'webpage' %}on{% endif %}">webpage</a>
     <a href="/{{ snap.id }}/screenshot" class="{% if mode == 'screenshot' %}on{% endif %}">screenshot</a>
   </nav>
+  {% if mode == 'article' %}
+  <a class="open-reader" href="/{{ snap.id }}/reader" target="_blank" rel="noopener" title="Open article without Amber chrome (Chrome Reader Mode)">open reader</a>
+  {% endif %}
   <div class="meta">
     <div class="url-meta">
       {% if snap.final_url and snap.final_url != snap.url %}

@@ -315,6 +315,15 @@ body.viewer {
   color: #e2b56a;
 }
 
+.toolbar .open-reader {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid #5a4e42;
+  white-space: nowrap;
+}
+.toolbar .open-reader:hover {
+  border-color: var(--amber);
+}
+
 .toolbar .meta {
   flex: 1;
   min-width: 12rem;
