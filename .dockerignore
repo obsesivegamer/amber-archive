@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!requirements.txt
+!pytest.ini
+!app/
+!app/**
+!templates/
+!templates/**
+!static/
+!static/**
+!tests/
+!tests/**
+**/__pycache__/
