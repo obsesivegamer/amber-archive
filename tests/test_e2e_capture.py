@@ -98,14 +98,22 @@ def _wait_complete(client: TestClient, sid: str, seconds: int = 90) -> dict:
     pytest.fail("capture timed out")
 
 
-def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
+@pytest.mark.parametrize("ft_banner", [False, True])
+def test_end_to_end_archives_article(tmp_data, allow_private, local_site, monkeypatch, ft_banner):
     from app.main import app
 
+    if ft_banner:
+        monkeypatch.setattr(
+            __name__ + ".HTML",
+            HTML.replace('<body>', '<body><div class="o-banner"><h1>Sale now live</h1></div>')
+            .replace('<h1>City', '<h1 class="o-topper__headline">City'),
+        )
     with TestClient(app) as client:
         r = client.post("/save", data={"url": local_site}, follow_redirects=False)
         assert r.status_code == 303
         sid = r.headers["location"].rsplit("/", 1)[-1]
         job = _wait_complete(client, sid)
+        assert job["title"] == "City Council Approves Bridge"
         stats = job["capture_stats"]
         assert job["final_url"] == local_site
         assert stats["blocked_resources"] >= 1
@@ -156,6 +164,8 @@ def test_end_to_end_archives_article(tmp_data, allow_private, local_site):
         from app import db
 
         meta = db.read_json(db.snap_dir(sid) / "meta.json")
+        assert meta["title"] == "City Council Approves Bridge"
+        assert db.get_snapshot(sid)["title"] == "City Council Approves Bridge"
         res_dir = db.snap_dir(sid) / "res"
         assert stats["bytes_saved"] == sum(
             path.stat().st_size for path in res_dir.iterdir() if path.is_file()

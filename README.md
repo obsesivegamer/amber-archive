@@ -66,3 +66,11 @@ Snapshots live in `data/snaps/<id>/` as `page.html`, `screenshot.jpg`, `article.
 ```
 
 Unit tests cover URL guards, HTML freezing, and article extraction (including a The Information-style signup wall). `tests/test_e2e_capture.py` runs a real Playwright capture against a local article page.
+
+For container verification, run `docker build -t amber-tests .` followed by
+`docker run --rm amber-tests`. See [AGENTS.md](AGENTS.md) for lint and compile commands.
+
+FT imports and captures select the article's `o-topper__headline` heading before
+other page headings and exclude `o-banner` promotional headings from fallback
+selection. Existing snapshots keep their stored titles; this change does not
+rewrite saved articles or change gift-link acquisition.

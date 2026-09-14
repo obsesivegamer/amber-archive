@@ -646,7 +646,11 @@ def _paragraphs_to_html(text: str) -> str:
 
 
 def _first_h1(soup: BeautifulSoup) -> tuple[str | None, Any]:
-    for h in soup.find_all("h1"):
+    # FT puts promotional banner headings before its article topper.
+    headings = soup.select("h1.o-topper__headline") + soup.find_all("h1")
+    for h in headings:
+        if h.find_parent(class_="o-banner") is not None:
+            continue
         t = _text(h.get_text(" ", strip=True))
         if t and 12 <= len(t) <= 240:
             return t, h
