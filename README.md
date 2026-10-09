@@ -33,6 +33,18 @@ C:\Python313\python.exe -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8080
 ```
 
+## Run (macOS)
+
+From Terminal, in the repo folder:
+
+```bash
+./run.sh
+```
+
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080). Press `Ctrl+C` to stop.
+
+`run.sh` does what `run.ps1` does: creates `.venv` if missing, installs dependencies, installs Playwright's Chromium, and starts the server. The first run downloads Chromium, so it takes a minute or two. If `run.sh` is not executable, run `chmod +x run.sh` once.
+
 ## Bookmarklet
 
 While Amber is running, bookmark:
