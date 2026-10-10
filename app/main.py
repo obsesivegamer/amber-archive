@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import os
 import re
 import sys
 from contextlib import asynccontextmanager
@@ -144,10 +145,10 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=sorted({"127.0.0.1", "localhost", "[::1]", "testserver", HOST}),
-)
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", HOST}
+if os.environ.get("AMBER_ALLOW_TESTSERVER"):
+    ALLOWED_HOSTS.add("testserver")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
 

@@ -60,7 +60,9 @@ Snapshots live in `data/snaps/<id>/` as `page.html`, `screenshot.jpg`, `article.
 
 ## JSON API
 
-Read-only, no auth, meant for local tools. Requests must carry a `127.0.0.1`, `localhost` or `[::1]` Host header (others get 400, which blocks DNS rebinding). Only *usable* snapshots appear: status `complete`, at least 120 words, a non-empty `article.txt`, and a title that is not just the site or host name (failed paywall captures are excluded).
+Read-only, no auth, meant for local tools. Every route only answers requests whose Host header is `127.0.0.1`, `localhost`, `[::1]` or the configured `AMBER_HOST` (anything else gets 400, which blocks DNS rebinding). If you bind to a non-loopback address (`AMBER_HOST` or `--host`), set `AMBER_HOST` to the name or address clients use, otherwise LAN clients get 400.
+
+Only *usable* snapshots appear: status `complete`, a stored `word_count` of at least 120, a title that is not just the site or host name, and article text of at least 120 words after extraction (see `/text` below). Paywall stubs are excluded too: text under 400 words that opens with a "Subscribe to unlock/read" or "Already a subscriber" notice. Failed paywall captures are excluded by these rules.
 
 `GET /api/snapshots?since_days=14&limit=60` lists usable snapshots saved in the last `since_days` days (default 14, clamped to 1-365), newest first, at most `limit` (default 60, clamped to 1-200):
 
@@ -76,7 +78,7 @@ Read-only, no auth, meant for local tools. Requests must carry a `127.0.0.1`, `l
 
 `total_usable` and `sources` cover the whole window, before `limit`. When the same URL was saved more than once, only the newest usable copy is listed. `site` is a normalized display name: the stored site name, or for bare hostnames such as `nytimes.com` the publication's name.
 
-`GET /api/snapshots/{id}/text` returns the same fields plus `text`: the article body with paragraphs separated by blank lines, rebuilt from `article.html` with site menus dropped (falls back to `article.txt`). It answers `404 {"detail": "..."}` for unknown, malformed, incomplete or unusable ids.
+`GET /api/snapshots/{id}/text` returns the same fields plus `text`: the article body with paragraphs separated by blank lines, rebuilt from `article.html` (only the marked article body when the page has one; menus, related-story lists and newsletter filler dropped) and falling back to `article.txt`. Extracted text is cached per snapshot until its files change, so the first list call after a restart is slower than later ones. It answers `404 {"detail": "..."}` for unknown, malformed, incomplete or unusable ids.
 
 ## Tests
 

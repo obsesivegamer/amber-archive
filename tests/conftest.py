@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+
 import pytest
+
+os.environ.setdefault("AMBER_ALLOW_TESTSERVER", "1")
 
 
 @pytest.fixture

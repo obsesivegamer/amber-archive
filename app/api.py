@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -16,12 +17,25 @@ ID_RE = re.compile(rf"^[{re.escape(ID_ALPHABET)}]{{{ID_LENGTH}}}$")
 MIN_USABLE_WORDS = 120
 MAX_SINCE_DAYS = 365
 MAX_LIMIT = 200
+# Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
+# 150-330 words of offers. Real articles that merely mention subscribing are
+# longer, or carry the notice at the tail, so only a leading notice counts.
+STUB_MAX_WORDS = 400
+STUB_RE = re.compile(r"subscribe to (?:unlock|read)|already a subscriber", re.IGNORECASE)
 
-# article.html still carries site chrome (NYT menus, video shortcuts). Block
-# tags give paragraph breaks; leaf <div>s are only used for pages that keep
-# the body in divs (Reuters), where the block tags recover under half the text.
+# article.html still carries site chrome (NYT menus, related-story lists, video
+# shortcuts). Block tags give paragraph breaks; when the page marks its article
+# body, only that is read. Leaf <div>s are used only for pages that keep the
+# body in divs (Reuters), where the block tags recover under half the text.
 CHROME_TAGS = ["script", "style", "noscript", "svg", "nav", "dialog", "button", "footer", "aside", "figure", "video", "audio"]
-BLOCK_TAGS = ["p", "h2", "h3", "h4", "blockquote", "li"]
+BODY_SELECTOR = 'section[name="articleBody"], [itemprop="articleBody"]'
+BLOCK_SELECTOR = "p, h2, h3, h4, blockquote, li, [class*='video-description']"
+FILLER_RE = re.compile(
+    r"what readers are saying|related content|trending in the times|editors[\u2019']? picks"
+    r"|skip to content(?: skip to site index)?|\d+ min read"
+    r"|roula khalaf, editor of the ft, selects.*|simply sign up to the .* myft digest.*",
+    re.IGNORECASE,
+)
 
 HOSTNAME_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 SITE_BY_HOST = {
@@ -78,18 +92,22 @@ def _read(sid: str, name: str) -> str:
         return ""
 
 
-def _blocks(soup: BeautifulSoup, tags: list[str]) -> str:
+def _blocks(scopes: list, selector: str) -> str:
     paragraphs = []
-    for el in soup.find_all(tags):
-        if el.find(tags):
-            continue
-        text = " ".join(el.get_text(" ", strip=True).split())
-        if text:
-            paragraphs.append(text)
+    seen: set[int] = set()
+    for scope in scopes:
+        for el in scope.select(selector):
+            if id(el) in seen or el.select_one(selector):
+                continue
+            seen.add(id(el))
+            text = " ".join(el.get_text(" ", strip=True).split())
+            if text and not FILLER_RE.fullmatch(text):
+                paragraphs.append(text)
     return "\n\n".join(paragraphs)
 
 
-def _article_text(sid: str) -> str:
+@lru_cache(maxsize=512)
+def _derive_text(sid: str, stamp: tuple) -> str:
     flat = _read(sid, "article.txt")
     html = _read(sid, "article.html")
     if not html:
@@ -97,22 +115,38 @@ def _article_text(sid: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     for el in soup.find_all(CHROME_TAGS):
         el.decompose()
-    text = _blocks(soup, BLOCK_TAGS)
-    if len(text.split()) * 2 < len(flat.split()):
-        with_divs = _blocks(soup, BLOCK_TAGS + ["div"])
+    body = soup.select(BODY_SELECTOR)
+    text = _blocks(body or [soup], BLOCK_SELECTOR)
+    if not body and len(text.split()) * 2 < len(flat.split()):
+        with_divs = _blocks([soup], BLOCK_SELECTOR + ", div")
         if len(with_divs) > len(text):
             text = with_divs
     return text or flat
 
 
-def _usable_text(snap: dict, site: str) -> str | None:
+def _article_text(sid: str) -> str:
+    folder = db.snap_dir(sid)
+    stamp = []
+    for name in ("article.txt", "article.html"):
+        try:
+            stamp.append(folder.joinpath(name).stat().st_mtime_ns)
+        except OSError:
+            stamp.append(0)
+    return _derive_text(sid, tuple(stamp))
+
+
+def _is_usable(snap: dict, site: str) -> bool:
     if snap["status"] != "complete":
-        return None
+        return False
     if int(snap.get("word_count") or 0) < MIN_USABLE_WORDS:
-        return None
+        return False
     if _title_is_just_a_name(snap, site):
-        return None
-    return _article_text(snap["id"]) or None
+        return False
+    text = _article_text(snap["id"])
+    words = len(text.split())
+    if words < MIN_USABLE_WORDS:
+        return False
+    return not (words < STUB_MAX_WORDS and STUB_RE.search(text[:300]))
 
 
 def _summary(snap: dict, site: str) -> dict:
@@ -141,7 +175,7 @@ def list_snapshots(since_days: int = 14, limit: int = 60):
         if snap["url_normalized"] in seen_urls:
             continue
         site = _site_name(snap)
-        if _usable_text(snap, site) is not None:
+        if _is_usable(snap, site):
             seen_urls.add(snap["url_normalized"])
             usable.append((snap, site))
 
@@ -163,7 +197,7 @@ def snapshot_article_text(sid: str):
     snap = db.get_snapshot(sid) if ID_RE.fullmatch(sid) else None
     if snap:
         site = _site_name(snap)
-        text = _usable_text(snap, site)
-        if text is not None:
+        text = _article_text(snap["id"]) if _is_usable(snap, site) else ""
+        if text:
             return {**_summary(snap, site), "text": text}
     raise HTTPException(404, "No usable article text for this snapshot")
