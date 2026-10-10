@@ -629,6 +629,26 @@ async def _capture_visit(
     )
 
 
+async def enqueue_capture(url: str, url_normalized: str) -> str:
+    """Create a snapshot row and queue its capture; returns the job (= snapshot) id."""
+    assert job_queue is not None
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, url, url_normalized)
+    jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "url": url,
+        "status": "queued",
+        "resources": [],
+        "error": None,
+        "title": None,
+        "final_url": None,
+        "capture_stats": empty_capture_stats(),
+    }
+    await job_queue.put(sid)
+    return sid
+
+
 async def worker() -> None:
     assert job_queue is not None
     while True:

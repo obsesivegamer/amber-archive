@@ -139,6 +139,23 @@ def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
     return [_as_snap(r) for r in rows]
 
 
+def find_by_host(host: str, limit: int = 500) -> list[dict]:
+    """Snapshots of any status whose url or final_url mentions `host`, newest first."""
+    escaped = host.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%://{escaped}%"
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE url_normalized LIKE ? ESCAPE '\\' OR final_url LIKE ? ESCAPE '\\'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (pattern, pattern, limit),
+        ).fetchall()
+    return [_as_snap(r) for r in rows]
+
+
 def search_snapshots(query: str, limit: int = 50) -> list[dict]:
     q = f"%{query.strip()}%"
     with connect() as db:

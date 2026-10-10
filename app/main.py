@@ -47,7 +47,7 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db
-from .api import router as api_router
+from .api import effective_status, router as api_router
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
 from .ingest import ingest_html, original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
@@ -219,22 +219,7 @@ async def save(request: Request):
             {"url": clean, "existing": existing},
         )
 
-    sid = db.allocate_id()
-    job_id = sid
-    db.insert_snapshot(sid, clean, normalized)
-    capture.jobs[job_id] = {
-        "id": job_id,
-        "snapshot_id": sid,
-        "url": clean,
-        "status": "queued",
-        "resources": [],
-        "error": None,
-        "title": None,
-        "final_url": None,
-        "capture_stats": capture.empty_capture_stats(),
-    }
-    assert capture.job_queue is not None
-    await capture.job_queue.put(job_id)
+    job_id = await capture.enqueue_capture(clean, normalized)
     return RedirectResponse(f"/saving/{job_id}", status_code=303)
 
 
@@ -260,11 +245,15 @@ async def job_status(job_id: str):
         snap = db.get_snapshot(job_id)
         if not snap:
             raise HTTPException(404, "No such job")
+        status = effective_status(snap)
+        error = snap.get("error")
+        if status == "failed" and not error:
+            error = "Capture was interrupted before it finished."
         return {
             "id": job_id,
             "snapshot_id": job_id,
-            "status": snap["status"],
-            "error": snap.get("error"),
+            "status": status,
+            "error": error,
             "resources": [],
             "title": snap.get("title"),
             "url": snap.get("url"),
