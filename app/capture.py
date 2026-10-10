@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import http.client
 import io
 import logging
-import mimetypes
+import os
 import socket
+import threading
 import time
 import traceback
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -47,15 +48,11 @@ from .security import (
 )
 
 MAX_QUEUED_JOBS = 10
-# LocalNetworkAccessChecks stops a page Chromium treats as public from reaching
-# loopback and private addresses. It is on by default in the Chromium that
-# Playwright 1.62 ships (151); pinned so a changed default cannot switch it off.
-# Verified: with 127.0.0.1:PORT overridden to "public", loopback requests are
-# blocked with the feature enabled and succeed with it disabled.
-CHROMIUM_ARGS = [
-    "--disable-blink-features=AutomationControlled",
-    "--enable-features=LocalNetworkAccessChecks",
-]
+# Local Network Access checks (a page Chromium treats as public cannot reach
+# loopback or private addresses) are on by default in the Chromium Playwright
+# ships. Passing --enable-features here would replace Playwright's own
+# --enable-features list, so the default is relied on; see the README.
+CHROMIUM_ARGS = ["--disable-blink-features=AutomationControlled"]
 MAX_CRAWLER_BYTES = 8 * 1024 * 1024
 CRAWLER_DEADLINE_S = 30.0
 
@@ -90,6 +87,11 @@ EXT_FOR_TYPE = {
     "font/otf": ".otf",
     "application/font-woff": ".woff",
     "application/font-woff2": ".woff2",
+    "application/x-font-woff": ".woff",
+    "application/x-font-ttf": ".ttf",
+    "application/vnd.ms-fontobject": ".eot",
+    "image/apng": ".png",
+    "image/tiff": ".tiff",
 }
 
 CLEAN_PAGE_JS = """
@@ -231,15 +233,13 @@ def _should_block(url: str) -> bool:
 
 
 def _ext_for(content_type: str, url: str) -> str:
+    """Stored extension comes from the response MIME type only.
+
+    The URL suffix is attacker-controlled: a response typed image/x-evil from
+    /a.html must not become an .html file that a browser would execute.
+    """
     mime = (content_type or "").split(";")[0].strip().lower()
-    if mime in EXT_FOR_TYPE:
-        return EXT_FOR_TYPE[mime]
-    guessed = mimetypes.guess_extension(mime) if mime else None
-    if guessed:
-        return guessed
-    path = urlparse(url).path
-    suffix = Path(path).suffix
-    return suffix if suffix and len(suffix) < 8 else ".bin"
+    return EXT_FOR_TYPE.get(mime, ".bin")
 
 
 def _should_save(content_type: str) -> bool:
@@ -282,10 +282,24 @@ def _check_public_peer(sock: socket.socket) -> socket.socket:
 
 
 class _PeerCheckedMixin:
-    def __init__(self, *args, **kwargs):
+    """Peer check on every new connection, and a per-fetch wall-clock budget.
+
+    `deadline` bounds the connect; `register` receives every raw socket so a
+    timer can shut it down mid-handshake or mid-headers, which a per-recv
+    socket timeout cannot do against a slow drip.
+    """
+
+    def __init__(self, *args, deadline: float, register, **kwargs):
         super().__init__(*args, **kwargs)
+        self.timeout = max(0.05, min(self.timeout or 10.0, deadline - time.monotonic()))
         connect = self._create_connection
-        self._create_connection = lambda *a, **kw: _check_public_peer(connect(*a, **kw))
+
+        def checked(*a, **kw):
+            sock = _check_public_peer(connect(*a, **kw))
+            register(sock)
+            return sock
+
+        self._create_connection = checked
 
 
 class _PublicHTTPConnection(_PeerCheckedMixin, http.client.HTTPConnection):
@@ -297,17 +311,33 @@ class _PublicHTTPSConnection(_PeerCheckedMixin, http.client.HTTPSConnection):
 
 
 class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, **conn_args):
+        super().__init__()
+        self._conn_args = conn_args
+
     def http_open(self, req):
-        return self.do_open(_PublicHTTPConnection, req)
+        return self.do_open(
+            functools.partial(_PublicHTTPConnection, **self._conn_args), req
+        )
 
 
 class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, **conn_args):
+        super().__init__()
+        self._conn_args = conn_args
+
     def https_open(self, req):
-        return self.do_open(_PublicHTTPSConnection, req, context=self._context)
+        return self.do_open(
+            functools.partial(_PublicHTTPSConnection, **self._conn_args),
+            req,
+            context=self._context,
+        )
 
 
-def _http_get(url: str, user_agent: str) -> str:
-    deadline = time.monotonic() + CRAWLER_DEADLINE_S
+def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
+    """Fetch HTML within one wall-clock budget covering connect, TLS, headers and body."""
+    if deadline is None:
+        deadline = time.monotonic() + CRAWLER_DEADLINE_S
     req = urllib.request.Request(
         validate_public_http_url(url),
         headers={
@@ -317,12 +347,42 @@ def _http_get(url: str, user_agent: str) -> str:
             "Referer": "https://www.google.com/",
         },
     )
-    # No ProxyHandler: the peer check below must see the publisher, not a proxy.
+    expired = threading.Event()
+    lock = threading.Lock()
+    shutdowns: list[socket.socket] = []
+
+    def register(sock: socket.socket) -> None:
+        # A duplicate descriptor survives TLS wrapping (which detaches `sock`)
+        # and shutdown() on it ends the same connection.
+        dup = socket.socket(fileno=os.dup(sock.fileno()))
+        with lock:
+            shutdowns.append(dup)
+            late = expired.is_set()
+        if late:
+            _shutdown(dup)
+
+    def _shutdown(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def expire() -> None:
+        expired.set()
+        with lock:
+            for sock in shutdowns:
+                _shutdown(sock)
+
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+    timer.daemon = True
+    timer.start()
+    # No ProxyHandler: the peer check must see the publisher, not a proxy.
     opener = urllib.request.OpenerDirector()
+    conn_args = {"deadline": deadline, "register": register}
     for handler in (
         urllib.request.UnknownHandler(),
-        _PublicHTTPHandler(),
-        _PublicHTTPSHandler(),
+        _PublicHTTPHandler(**conn_args),
+        _PublicHTTPSHandler(**conn_args),
         _PublicRedirectHandler(deadline),
         urllib.request.HTTPDefaultErrorHandler(),
         urllib.request.HTTPErrorProcessor(),
@@ -330,22 +390,39 @@ def _http_get(url: str, user_agent: str) -> str:
         opener.add_handler(handler)
     chunks: list[bytes] = []
     received = 0
-    with opener.open(req, timeout=10) as resp:
-        while received < MAX_CRAWLER_BYTES:
-            if time.monotonic() > deadline:
-                raise TimeoutError("crawler fetch took too long")
-            chunk = resp.read1(min(65536, MAX_CRAWLER_BYTES - received))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            received += len(chunk)
+    try:
+        with opener.open(req, timeout=10) as resp:
+            while received < MAX_CRAWLER_BYTES:
+                if expired.is_set() or time.monotonic() > deadline:
+                    raise TimeoutError("crawler fetch took too long")
+                chunk = resp.read1(min(65536, MAX_CRAWLER_BYTES - received))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+    except Exception as exc:
+        if expired.is_set() and not isinstance(exc, TimeoutError):
+            raise TimeoutError("crawler fetch took too long") from exc
+        raise
+    finally:
+        timer.cancel()
+        with lock:
+            for sock in shutdowns:
+                sock.close()
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 async def fetch_crawler_html(url: str) -> str | None:
+    # One budget for both user-agent attempts together.
+    deadline = time.monotonic() + CRAWLER_DEADLINE_S
     for ua in (GOOGLEBOT_UA, USER_AGENT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            html = await asyncio.to_thread(_http_get, url, ua)
+            html = await asyncio.wait_for(
+                asyncio.to_thread(_http_get, url, ua, deadline), remaining + 0.5
+            )
         except Exception:
             continue
         if html and len(html) > 2000 and "Attention Required" not in html:
@@ -634,32 +711,31 @@ async def _capture_visit(
             declared = int(response.headers.get("content-length", "0"))
         except ValueError:
             declared = 0
-        if declared > MAX_RESOURCE_BYTES:
-            # Never pull an oversized body into memory just to discard it.
+        mime = (ctype or "").split(";")[0]
+        if status >= 400 or not _should_save(ctype):
+            # Not stored, so the body is never pulled into this process.
+            log_resource(job, url=req_url, status=status, mime=mime, size=declared)
+            return
+        # Chunked or understated Content-Length: ask the browser for the real
+        # transferred size (after the response finishes) before fetching a body.
+        try:
+            sizes = await asyncio.wait_for(response.request.sizes(), 30)
+            wire_size = int(sizes.get("responseBodySize") or 0)
+        except Exception:
             blocked_resources += 1
-            log_resource(
-                job,
-                url=req_url,
-                status=status,
-                mime=(ctype or "").split(";")[0],
-                size=declared,
-            )
+            log_resource(job, url=req_url, status=status, mime=mime, size=declared)
+            return
+        if max(declared, wire_size) > MAX_RESOURCE_BYTES:
+            blocked_resources += 1
+            log_resource(job, url=req_url, status=status, mime=mime, size=max(declared, wire_size))
             return
         try:
             body = await response.body()
         except Exception:
             body = b""
         size = len(body)
-        log_resource(
-            job,
-            url=req_url,
-            status=status,
-            mime=(ctype or "").split(";")[0],
-            size=size,
-        )
-        if status >= 400 or not body:
-            return
-        if not _should_save(ctype):
+        log_resource(job, url=req_url, status=status, mime=mime, size=size)
+        if not body:
             return
         try:
             server_addr = await response.server_addr()

@@ -40,6 +40,7 @@ def _is_public_ip(ip: str) -> bool:
         or addr.is_reserved
         or addr.is_unspecified
         or not addr.is_global
+        or (addr.version == 6 and addr.is_site_local)
     )
 
 
@@ -113,10 +114,25 @@ def validate_public_http_request_url(url: str) -> str:
 
 # Dropped from the lookup key only; the stored URL is never altered.
 _KEY_DROP_PARAMS = TRACKING_PARAMS | {
-    "smid", "unlocked_article_code", "accesstoken", "sharetype", "token",
-    "referringsource", "reflink", "st", "cmp", "cmpid", "ocid", "ref", "ref_src",
-    "ref_url", "taid", "partner", "guccounter", "gaa_at", "gaa_n", "gaa_sig", "gaa_ts",
+    "smid", "unlocked_article_code", "accesstoken", "sharetype", "referringsource",
+    "ocid", "guccounter", "gaa_at", "gaa_n", "gaa_sig", "gaa_ts",
 }
+# Names that are generic elsewhere, so they only count as share/tracking
+# tokens on the publishers that use them that way.
+_KEY_DROP_PARAMS_BY_HOST = {
+    "wsj.com": {"st", "reflink", "mod"},
+    "ft.com": {"token", "segmentid"},
+    "nytimes.com": {"partner", "referringsource"},
+    "theguardian.com": {"cmp"},
+}
+
+
+def _scoped_drops(host: str) -> set[str]:
+    drops: set[str] = set()
+    for domain, names in _KEY_DROP_PARAMS_BY_HOST.items():
+        if host == domain or host.endswith("." + domain):
+            drops |= names
+    return drops
 
 
 def article_match_key(url: str | None) -> str:
@@ -148,10 +164,11 @@ def article_match_key(url: str | None) -> str:
     path = parsed.path or "/"
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/") or "/"
+    drops = _KEY_DROP_PARAMS | _scoped_drops((parsed.hostname or "").lower().rstrip("."))
     pairs = sorted(
         (k, v)
         for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-        if k.lower() not in _KEY_DROP_PARAMS and not k.lower().startswith("utm_")
+        if k.lower() not in drops and not k.lower().startswith("utm_")
     )
     query = urlencode(pairs)
     return f"{host}{path}?{query}" if query else f"{host}{path}"

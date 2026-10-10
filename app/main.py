@@ -151,25 +151,43 @@ if os.environ.get("AMBER_ALLOW_TESTSERVER"):
     ALLOWED_HOSTS.add("testserver")
 
 
+def _forbidden() -> JSONResponse:
+    return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
+
+
 async def reject_cross_site_writes(request: Request, call_next):
     """Refuse state-changing requests that a web page on another site started.
 
     Browsers attach Sec-Fetch-Site to every request and Origin to every
     cross-site POST, and a web page cannot forge either. A request with neither
-    (curl, scripts) is not a browser acting for another site and passes. GET
-    and HEAD are left alone so the bookmarklet, which navigates to
-    GET /save?url=..., keeps working.
+    (curl, scripts) is not a browser acting for another site and passes.
+
+    GET /save?url=... is the bookmarklet's endpoint, so it stays reachable, but
+    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document):
+    <img>, fetch() and <iframe> GETs from another site are refused.
     """
-    if request.method not in {"GET", "HEAD", "OPTIONS"}:
-        origin = request.headers.get("origin")
-        fetch_site = request.headers.get("sec-fetch-site")
-        from_extension = bool(origin) and origin.startswith("chrome-extension://")
-        own_origin = origin == f"http://{request.headers.get('host', '')}"
-        blocked = False
-        if not (from_extension or own_origin or fetch_site == "same-origin"):
-            blocked = origin is not None or fetch_site in {"cross-site", "same-site"}
-        if blocked:
-            return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
+    fetch_site = request.headers.get("sec-fetch-site")
+    if request.method in {"GET", "HEAD"}:
+        if request.url.path == "/save" and fetch_site in {"cross-site", "same-site"}:
+            if (
+                request.headers.get("sec-fetch-mode") != "navigate"
+                or request.headers.get("sec-fetch-dest") != "document"
+            ):
+                return _forbidden()
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    origin = request.headers.get("origin")
+    own_origin = origin == f"http://{request.headers.get('host', '')}"
+    if origin is not None and origin.startswith("chrome-extension://"):
+        # Only JSON, which forces a CORS preflight unless the extension holds
+        # host permission for this address.
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            return _forbidden()
+    elif not (own_origin or fetch_site == "same-origin"):
+        if origin is not None or fetch_site in {"cross-site", "same-site"}:
+            return _forbidden()
     return await call_next(request)
 
 
@@ -410,7 +428,13 @@ async def snapshot_reader(sid: str):
     return FileResponse(
         path,
         media_type="text/html; charset=utf-8",
-        headers={"X-Content-Type-Options": "nosniff"},
+        headers={
+            "Content-Security-Policy": (
+                "script-src 'none'; object-src 'none'; frame-src 'none'; "
+                "base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -429,7 +453,8 @@ async def snapshot_raw(sid: str):
             "Content-Security-Policy": (
                 "default-src 'none'; img-src 'self' data:; "
                 "style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; "
-                "font-src 'self' data:; media-src 'self' data:; frame-src 'none'; script-src 'none';"
+                "font-src 'self' data:; media-src 'self' data:; frame-src 'none'; script-src 'none'; "
+                "object-src 'none'; base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
             ),
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "SAMEORIGIN",
@@ -462,6 +487,40 @@ async def snapshot_thumb(sid: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+# Stored resources are third-party bytes served on Amber's origin. Only types a
+# browser renders passively are shown inline; everything else (including any
+# .html/.js/.xml an older capture stored by URL suffix) is a download. The
+# sandbox CSP keeps even an SVG with script from running as a document here.
+_INLINE_RESOURCE_TYPES = {
+    ".css": "text/css",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".tiff": "image/tiff",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".eot": "application/vnd.ms-fontobject",
+}
+RESOURCE_CSP = (
+    "sandbox; default-src 'none'; img-src 'self' data:; "
+    "style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+)
+# Same sandbox the viewer iframes use (no scripts), for captured markup that
+# can also be opened as a top-level page.
+DOCUMENT_SANDBOX = (
+    "sandbox allow-same-origin allow-popups allow-popups-to-escape-sandbox "
+    "allow-top-navigation-by-user-activation"
+)
+
+
 @app.get("/{sid}/r/{filename}")
 async def snapshot_resource(sid: str, filename: str):
     if not ID_RE.fullmatch(sid):
@@ -471,10 +530,16 @@ async def snapshot_resource(sid: str, filename: str):
     path = db.snap_dir(sid) / "res" / filename
     if not path.exists():
         raise HTTPException(404, "Missing resource")
+    inline_type = _INLINE_RESOURCE_TYPES.get(Path(filename).suffix.lower())
     return FileResponse(
         path,
-        media_type=mime_for_filename(filename),
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        media_type=inline_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": "inline" if inline_type else "attachment",
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Security-Policy": RESOURCE_CSP,
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
