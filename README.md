@@ -58,6 +58,26 @@ data/           SQLite index + snapshot files (gitignored)
 
 Snapshots live in `data/snaps/<id>/` as `page.html`, `screenshot.jpg`, `article.txt`, and rewritten CSS/images.
 
+## JSON API
+
+Read-only, no auth, meant for local tools. Requests must carry a `127.0.0.1`, `localhost` or `[::1]` Host header (others get 400, which blocks DNS rebinding). Only *usable* snapshots appear: status `complete`, at least 120 words, a non-empty `article.txt`, and a title that is not just the site or host name (failed paywall captures are excluded).
+
+`GET /api/snapshots?since_days=14&limit=60` lists usable snapshots saved in the last `since_days` days (default 14, clamped to 1-365), newest first, at most `limit` (default 60, clamped to 1-200):
+
+```json
+{
+  "total_usable": 42,
+  "sources": [{"site": "Financial Times", "count": 20, "latest": "2026-10-09T19:25:47Z"}],
+  "snapshots": [{"id": "K7mQp", "url": "...", "final_url": "...", "title": "...", "site": "Financial Times",
+                 "author": null, "published_at": null, "created_at": "2026-10-09T19:25:47Z",
+                 "word_count": 1200, "paywalled": false}]
+}
+```
+
+`total_usable` and `sources` cover the whole window, before `limit`. When the same URL was saved more than once, only the newest usable copy is listed. `site` is a normalized display name: the stored site name, or for bare hostnames such as `nytimes.com` the publication's name.
+
+`GET /api/snapshots/{id}/text` returns the same fields plus `text`: the article body with paragraphs separated by blank lines, rebuilt from `article.html` with site menus dropped (falls back to `article.txt`). It answers `404 {"detail": "..."}` for unknown, malformed, incomplete or unusable ids.
+
 ## Tests
 
 ```powershell

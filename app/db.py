@@ -171,6 +171,19 @@ def recent_snapshots(limit: int = 12) -> list[dict]:
     return [_as_snap(r) for r in rows]
 
 
+def complete_since(created_after: str) -> list[dict]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE status = 'complete' AND created_at >= ?
+            ORDER BY created_at DESC
+            """,
+            (created_after,),
+        ).fetchall()
+    return [_as_snap(r) for r in rows]
+
+
 def count_snapshots() -> int:
     with connect() as db:
         row = db.execute(

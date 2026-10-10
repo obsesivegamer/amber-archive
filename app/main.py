@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 MIME_BY_EXT = {
     ".css": "text/css",
@@ -45,6 +46,7 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db
+from .api import router as api_router
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
 from .ingest import ingest_html, original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
@@ -141,6 +143,10 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
+)
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=sorted({"127.0.0.1", "localhost", "[::1]", "testserver", HOST}),
 )
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
@@ -305,6 +311,9 @@ async def search(request: Request, q: str = ""):
         "search.html",
         {"q": q, "results": results},
     )
+
+
+app.include_router(api_router)
 
 
 def _require_complete(sid: str) -> dict:
