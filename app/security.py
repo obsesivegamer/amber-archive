@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -40,6 +41,14 @@ def _is_public_ip(ip: str) -> bool:
         or addr.is_unspecified
         or not addr.is_global
     )
+
+
+# Hosts written with leading zeros, hex parts, or fewer than four parts (0177.0.0.1,
+# 0x7f.0.0.1, 2130706433, 127.1) mean different things to different parsers. Only
+# plain dotted-quad addresses are accepted, so every parser reads the same address.
+_NUMERIC_LIKE_HOST = re.compile(
+    r"^(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+))*\.?$", re.IGNORECASE
+)
 
 
 def host_is_public(hostname: str) -> bool:
@@ -80,8 +89,13 @@ def _validate_public_http_url(url: str, *, enforce_length: bool) -> str:
     host = parsed.hostname
     if not host:
         raise ValueError("URL is missing a host.")
-    if host.lower() in {"localhost", "localhost.localdomain"}:
+    if host.lower().rstrip(".") in {"localhost", "localhost.localdomain"}:
         raise ValueError("Local URLs cannot be archived.")
+    if _NUMERIC_LIKE_HOST.fullmatch(host):
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            raise ValueError("Numeric hosts must be written as a plain IP address.") from None
     if not host_is_public(host):
         raise ValueError("Private or local network URLs cannot be archived.")
     return urlunparse(parsed._replace(fragment=""))
@@ -95,6 +109,52 @@ def validate_public_http_url(url: str) -> str:
 def validate_public_http_request_url(url: str) -> str:
     """Validate a browser request URL without applying the intake length limit."""
     return _validate_public_http_url(url, enforce_length=False)
+
+
+# Dropped from the lookup key only; the stored URL is never altered.
+_KEY_DROP_PARAMS = TRACKING_PARAMS | {
+    "smid", "unlocked_article_code", "accesstoken", "sharetype", "token",
+    "referringsource", "reflink", "st", "cmp", "cmpid", "ocid", "ref", "ref_src",
+    "ref_url", "taid", "partner", "guccounter", "gaa_at", "gaa_n", "gaa_sig", "gaa_ts",
+}
+
+
+def article_match_key(url: str | None) -> str:
+    """Scheme-less identity of an article URL, for finding it in the archive.
+
+    Case-folds the host, drops `www.`, default ports, the fragment, a trailing
+    slash, share/tracking parameters, and sorts what query remains. Two URLs
+    with the same key are treated as the same article.
+    """
+    if not url:
+        return ""
+    raw = url.strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = f"[{host}]"
+    if port and port not in (80, 443):
+        host = f"{host}:{port}"
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+    pairs = sorted(
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in _KEY_DROP_PARAMS and not k.lower().startswith("utm_")
+    )
+    query = urlencode(pairs)
+    return f"{host}{path}?{query}" if query else f"{host}{path}"
 
 
 def normalize_url(url: str) -> str:

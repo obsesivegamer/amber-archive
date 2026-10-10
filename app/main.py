@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 MIME_BY_EXT = {
@@ -148,6 +149,32 @@ app = FastAPI(
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", HOST}
 if os.environ.get("AMBER_ALLOW_TESTSERVER"):
     ALLOWED_HOSTS.add("testserver")
+
+
+async def reject_cross_site_writes(request: Request, call_next):
+    """Refuse state-changing requests that a web page on another site started.
+
+    Browsers attach Sec-Fetch-Site to every request and Origin to every
+    cross-site POST, and a web page cannot forge either. A request with neither
+    (curl, scripts) is not a browser acting for another site and passes. GET
+    and HEAD are left alone so the bookmarklet, which navigates to
+    GET /save?url=..., keeps working.
+    """
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        fetch_site = request.headers.get("sec-fetch-site")
+        from_extension = bool(origin) and origin.startswith("chrome-extension://")
+        own_origin = origin == f"http://{request.headers.get('host', '')}"
+        blocked = False
+        if not (from_extension or own_origin or fetch_site == "same-origin"):
+            blocked = origin is not None or fetch_site in {"cross-site", "same-site"}
+        if blocked:
+            return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
+    return await call_next(request)
+
+
+# Added before TrustedHostMiddleware so the Host header is validated first.
+app.add_middleware(BaseHTTPMiddleware, dispatch=reject_cross_site_writes)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
@@ -219,7 +246,13 @@ async def save(request: Request):
             {"url": clean, "existing": existing},
         )
 
-    job_id = await capture.enqueue_capture(clean, normalized)
+    try:
+        job_id = capture.enqueue_capture(clean, normalized)
+    except capture.QueueFull:
+        return RedirectResponse(
+            "/?error=" + quote("Too many saves are already queued. Try again shortly."),
+            status_code=303,
+        )
     return RedirectResponse(f"/saving/{job_id}", status_code=303)
 
 

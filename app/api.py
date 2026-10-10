@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from . import capture, db
 from .config import ID_ALPHABET, ID_LENGTH
-from .security import normalize_url, validate_public_http_url
+from .security import article_match_key, normalize_url, validate_public_http_url
 
 router = APIRouter(prefix="/api")
 
@@ -21,7 +21,6 @@ ID_RE = re.compile(rf"^[{re.escape(ID_ALPHABET)}]{{{ID_LENGTH}}}$")
 MIN_USABLE_WORDS = 120
 MAX_SINCE_DAYS = 365
 MAX_LIMIT = 200
-MAX_QUEUED_JOBS = 10
 MAX_SAVE_BODY_BYTES = 16 * 1024
 MAX_URL_LENGTH = 2048
 # Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
@@ -225,26 +224,56 @@ def effective_status(snap: dict) -> str:
     return status
 
 
-def _match_key(url: str | None) -> str:
-    if not url:
-        return ""
-    normalized = normalize_url(url)
-    return normalized.split("://", 1)[-1]
-
-
 def _find_matches(url: str) -> list[dict]:
     """Snapshots of any status for this article, newest first.
 
-    Matches the normalized saved URL or the post-redirect final URL, ignoring
-    the http/https difference.
+    Compares article_match_key of the saved URL, its normalized form and the
+    post-redirect final URL against the key of `url`.
     """
-    key = _match_key(url)
-    host = urlparse(url).hostname or ""
+    key = article_match_key(url)
+    if not key:
+        return []
+    parsed = urlparse(url if "://" in url else "https://" + url)
+    candidates = db.find_candidates(parsed.hostname or "", parsed.path.rstrip("/") or "/")
     return [
         snap
-        for snap in db.find_by_host(host)
-        if key in (_match_key(snap["url_normalized"]), _match_key(snap.get("final_url")))
+        for snap in candidates
+        if key
+        in (
+            article_match_key(snap["url_normalized"]),
+            article_match_key(snap["url"]),
+            article_match_key(snap.get("final_url")),
+        )
     ]
+
+
+def _best_match(matches: list[dict]) -> tuple[dict | None, str, bool]:
+    """Pick the snapshot a client should use: (snapshot, effective status, usable).
+
+    Preference: complete and usable, then in flight, then complete but
+    unusable, then failed. Each group is newest first.
+    """
+    complete: list[dict] = []
+    in_flight: dict | None = None
+    failed: dict | None = None
+    for snap in matches:
+        status = effective_status(snap)
+        if status == "complete":
+            complete.append(snap)
+        elif status in {"queued", "capturing"}:
+            in_flight = in_flight or snap
+        else:
+            failed = failed or snap
+    for snap in complete:
+        if _is_usable(snap, _site_name(snap)):
+            return snap, "complete", True
+    if in_flight:
+        return in_flight, effective_status(in_flight), False
+    if complete:
+        return complete[0], "complete", False
+    if failed:
+        return failed, "failed", False
+    return None, "", False
 
 
 def _lookup_url(raw: str) -> str:
@@ -268,19 +297,16 @@ def lookup(response: Response, url: str = ""):
         clean = _lookup_url(url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    matches = _find_matches(clean)
-    if not matches:
+    snap, status, usable = _best_match(_find_matches(clean))
+    if snap is None:
         return {"found": False}
-    snap = next((m for m in matches if m["status"] == "complete"), matches[0])
-    status = effective_status(snap)
-    site = _site_name(snap)
     return {
         "found": True,
         "id": snap["id"],
         "status": status,
-        "usable": status == "complete" and _is_usable(snap, site),
+        "usable": usable,
         "title": snap.get("title"),
-        "site": site,
+        "site": _site_name(snap),
         "url": snap["url"],
         "final_url": snap.get("final_url"),
         "created_at": snap["created_at"],
@@ -316,21 +342,20 @@ async def save(request: Request):
         raise HTTPException(400, str(exc)) from exc
     normalized = normalize_url(clean)
 
-    matches = await asyncio.to_thread(_find_matches, clean)
-    if not force:
-        complete = next((m for m in matches if m["status"] == "complete"), None)
-        if complete:
-            site = _site_name(complete)
-            return JSONResponse(
-                {"id": complete["id"], "status": "exists", "usable": _is_usable(complete, site)},
-                status_code=200,
-            )
-    for snap in matches:
-        status = effective_status(snap)
-        if status in {"queued", "capturing"}:
-            return JSONResponse({"id": snap["id"], "status": status}, status_code=202)
+    snap, status, usable = await asyncio.to_thread(
+        lambda: _best_match(_find_matches(clean))
+    )
+    if snap is not None and not force and status == "complete":
+        return JSONResponse({"id": snap["id"], "status": "exists", "usable": usable}, status_code=200)
+    if snap is not None and status in {"queued", "capturing"}:
+        return JSONResponse({"id": snap["id"], "status": status}, status_code=202)
 
-    if capture.job_queue is None or capture.job_queue.qsize() > MAX_QUEUED_JOBS:
-        raise HTTPException(429, "Too many saves are already queued. Try again shortly.")
-    job_id = await capture.enqueue_capture(clean, normalized)
-    return JSONResponse({"id": job_id, "status": "queued"}, status_code=202)
+    # No await between the in-flight check inside enqueue_capture and the
+    # enqueue itself, so parallel saves of one URL collapse into one job.
+    try:
+        job_id = capture.enqueue_capture(clean, normalized)
+    except capture.QueueFull:
+        raise HTTPException(429, "Too many saves are already queued. Try again shortly.") from None
+    return JSONResponse(
+        {"id": job_id, "status": capture.jobs[job_id]["status"]}, status_code=202
+    )
