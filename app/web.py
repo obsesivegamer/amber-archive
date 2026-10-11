@@ -167,6 +167,8 @@ def _fetch_feed(raw_url: str) -> bytes:
             deadline,
             FEED_MAX_BYTES,
             strict=True,
+            # Some publishers (the Washington Post) take 8-10 s to start answering.
+            socket_timeout=FEED_DEADLINE_S,
             on_response=on_response,
             on_first_chunk=on_first_chunk,
         )

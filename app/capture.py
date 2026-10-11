@@ -346,6 +346,7 @@ def _fetch(
     max_bytes: int,
     *,
     strict: bool = False,
+    socket_timeout: float = 10.0,
     on_response=None,
     on_first_chunk=None,
 ) -> bytes:
@@ -356,6 +357,8 @@ def _fetch(
     redirects are re-validated and proxies are ignored. A body past
     `max_bytes` is silently cut, or raises FetchTooLarge when `strict`.
     `on_response(resp)` and `on_first_chunk(bytes)` may raise to stop early.
+    `socket_timeout` is how long one connect or read may stall; `deadline`
+    still bounds the whole fetch.
     """
     req = urllib.request.Request(url, headers=headers)
     expired = threading.Event()
@@ -403,7 +406,7 @@ def _fetch(
     received = 0
     limit = max_bytes + 1 if strict else max_bytes
     try:
-        with opener.open(req, timeout=10) as resp:
+        with opener.open(req, timeout=socket_timeout) as resp:
             if on_response is not None:
                 on_response(resp)
             while received < limit:
