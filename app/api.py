@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -10,11 +11,14 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 from . import capture, db
 from .config import ID_ALPHABET, ID_LENGTH
+from .ingest import ingest_html, screenshot_reader
 from .security import article_match_key, normalize_url, validate_public_http_url
 
+log = logging.getLogger("amber.api")
 router = APIRouter(prefix="/api")
 
 ID_RE = re.compile(rf"^[{re.escape(ID_ALPHABET)}]{{{ID_LENGTH}}}$")
@@ -23,6 +27,10 @@ MAX_SINCE_DAYS = 365
 MAX_LIMIT = 200
 MAX_SAVE_BODY_BYTES = 16 * 1024
 MAX_URL_LENGTH = 2048
+MAX_IMPORT_BODY_BYTES = 12 * 1024 * 1024
+MIN_IMPORT_HTML_CHARS = 200
+MAX_IMPORT_TITLE_CHARS = 300
+MAX_IMPORTS_IN_FLIGHT = 5
 # Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
 # 150-330 words of offers. Real articles that merely mention subscribing are
 # longer, or carry the notice at the tail, so only a leading notice counts.
@@ -358,4 +366,102 @@ async def save(request: Request):
         raise HTTPException(429, "Too many saves are already queued. Try again shortly.") from None
     return JSONResponse(
         {"id": job_id, "status": capture.jobs[job_id]["status"]}, status_code=202
+    )
+
+
+_imports_in_flight = 0
+# One Chromium at a time for import thumbnails.
+_screenshot_gate = asyncio.Semaphore(1)
+
+
+async def _read_body_capped(request: Request, limit: int) -> bytes:
+    """Read the request body, refusing with 413 as soon as it passes `limit`."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise HTTPException(413, "Request body is too large.")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(413, "Request body is too large.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _screenshot_import(sid: str) -> None:
+    try:
+        async with _screenshot_gate:
+            await screenshot_reader(sid, offline=True)
+    except Exception:
+        log.exception("reader screenshot failed for imported snapshot %s", sid)
+
+
+@router.post("/import")
+async def import_page(request: Request):
+    """Store HTML a signed-in browser already rendered as a new, complete snapshot.
+
+    Nothing is fetched: the HTML is parsed and frozen exactly as posted.
+    """
+    global _imports_in_flight
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(415, "Send the request as application/json.")
+    # No await between this check and the increment.
+    if _imports_in_flight >= MAX_IMPORTS_IN_FLIGHT:
+        raise HTTPException(429, "Too many imports are already running. Try again shortly.")
+    _imports_in_flight += 1
+    try:
+        raw = await _read_body_capped(request, MAX_IMPORT_BODY_BYTES)
+        try:
+            body = json.loads(raw)
+        except ValueError as exc:
+            raise HTTPException(400, "Body must be valid JSON.") from exc
+        del raw
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(400, 'Body must be a JSON object with a string "url".')
+        html = body.get("html")
+        if not isinstance(html, str) or len(html.strip()) < MIN_IMPORT_HTML_CHARS:
+            raise HTTPException(
+                400, f'"html" must be a string of at least {MIN_IMPORT_HTML_CHARS} characters.'
+            )
+        try:
+            html.encode("utf-8")
+        except UnicodeEncodeError:
+            raise HTTPException(400, '"html" is not valid Unicode text.') from None
+        title = body.get("title")
+        if title is not None and not isinstance(title, str):
+            raise HTTPException(400, '"title" must be a string.')
+        title = " ".join((title or "").split())[:MAX_IMPORT_TITLE_CHARS]
+
+        try:
+            clean = await asyncio.to_thread(validate_public_http_url, body["url"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        try:
+            sid = await asyncio.to_thread(ingest_html, html, clean, None, title)
+        except Exception:
+            log.exception("import failed for %s", clean)
+            raise HTTPException(422, "Could not turn that HTML into a snapshot.") from None
+
+        def decide() -> tuple[dict, bool]:
+            snap = db.get_snapshot(sid)
+            return snap, _is_usable(snap, _site_name(snap))
+
+        snap, usable = await asyncio.to_thread(decide)
+    finally:
+        _imports_in_flight -= 1
+
+    snap_title = snap.get("title")
+    return JSONResponse(
+        {
+            "id": sid,
+            "status": "complete",
+            "usable": usable,
+            "word_count": int(snap.get("word_count") or 0),
+            "title": None if not snap_title or snap_title in {snap["url"], "[no-title]"} else snap_title,
+        },
+        status_code=201,
+        background=BackgroundTask(_screenshot_import, sid),
     )

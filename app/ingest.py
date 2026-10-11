@@ -103,8 +103,12 @@ def _save_jpeg(folder, screenshot_bytes: bytes) -> None:
         (folder / "screenshot.jpg").write_bytes(screenshot_bytes)
 
 
-async def screenshot_reader(sid: str) -> None:
-    """Render reader.html to screenshot.jpg. Playwright sync API cannot run under uvicorn."""
+async def screenshot_reader(sid: str, *, offline: bool = False) -> None:
+    """Render reader.html to screenshot.jpg. Playwright sync API cannot run under uvicorn.
+
+    offline=True aborts every request except data: URLs, so third-party HTML
+    cannot make this browser fetch anything (remote images are simply absent).
+    """
     folder = db.snap_dir(sid)
     path = folder / "reader.html"
     if not path.exists():
@@ -116,6 +120,14 @@ async def screenshot_reader(sid: str) -> None:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
         try:
+            if offline:
+                async def _abort_network(route):
+                    if route.request.url.startswith(("data:", "about:")):
+                        await route.continue_()
+                    else:
+                        await route.abort()
+
+                await page.route("**/*", _abort_network)
             await page.set_content(html, wait_until="domcontentloaded")
             shot = await page.screenshot(full_page=True, type="jpeg", quality=82)
         finally:
@@ -123,63 +135,84 @@ async def screenshot_reader(sid: str) -> None:
     _save_jpeg(folder, shot)
 
 
+def _title_is_missing(article: dict, url: str) -> bool:
+    """extract_article falls back to the URL (or readability's placeholder) when the page has no title."""
+    title = (article.get("title") or "").strip()
+    if not title or title == url or title == "[no-title]":
+        return True
+    host = (urlparse(url).hostname or "").lower()
+    bare = host[4:] if host.startswith("www.") else host
+    return title.lower() in {host, bare}
+
+
 def ingest_html(
     html: str,
     url: str = "",
     screenshot_bytes: bytes | None = None,
+    title_hint: str = "",
 ) -> str:
+    """Store `html` as a complete snapshot. Reads no network resource: the
+    resource map handed to freeze_html is empty and extraction is DOM-only."""
     url = (url or original_url_from_html(html)).strip()
     if "://" not in url:
         url = "https://" + url
     sid = db.allocate_id()
     db.insert_snapshot(sid, url, normalize_url(url))
-    folder = db.snap_dir(sid)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "res").mkdir(exist_ok=True)
+    try:
+        folder = db.snap_dir(sid)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "res").mkdir(exist_ok=True)
 
-    article = extract_article(html, url)
-    frozen = freeze_html(html, url, {}, sid)
-    reader = build_reader_html(article, url)
+        article = extract_article(html, url)
+        hint = " ".join((title_hint or "").split())
+        if hint and _title_is_missing(article, url):
+            article["title"] = hint
+        frozen = freeze_html(html, url, {}, sid)
+        reader = build_reader_html(article, url)
 
-    (folder / "page.html").write_text(frozen, encoding="utf-8")
-    (folder / "reader.html").write_text(reader, encoding="utf-8")
-    (folder / "article.html").write_text(article.get("article_html") or "", encoding="utf-8")
-    (folder / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
+        (folder / "page.html").write_text(frozen, encoding="utf-8")
+        (folder / "reader.html").write_text(reader, encoding="utf-8")
+        (folder / "article.html").write_text(article.get("article_html") or "", encoding="utf-8")
+        (folder / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
 
-    if screenshot_bytes:
-        _save_jpeg(folder, screenshot_bytes)
+        if screenshot_bytes:
+            _save_jpeg(folder, screenshot_bytes)
 
-    db.write_json(
-        folder / "meta.json",
-        {
-            "id": sid,
-            "url": url,
-            "final_url": url,
-            "title": article.get("title"),
-            "site_name": article.get("site_name"),
-            "author": article.get("author"),
-            "published_at": article.get("published_at"),
-            "description": article.get("description"),
-            "dek": article.get("dek"),
-            "word_count": article.get("word_count"),
-            "paywalled": article.get("paywalled"),
-            "imported": True,
-            "created_at": db.now_iso(),
-        },
-    )
-    db.update_snapshot(
-        sid,
-        final_url=url,
-        title=article.get("title"),
-        site_name=article.get("site_name"),
-        author=article.get("author"),
-        published_at=article.get("published_at"),
-        description=article.get("description"),
-        word_count=article.get("word_count"),
-        paywalled=1 if article.get("paywalled") else 0,
-        status="complete",
-        error=None,
-    )
+        db.write_json(
+            folder / "meta.json",
+            {
+                "id": sid,
+                "url": url,
+                "final_url": url,
+                "title": article.get("title"),
+                "site_name": article.get("site_name"),
+                "author": article.get("author"),
+                "published_at": article.get("published_at"),
+                "description": article.get("description"),
+                "dek": article.get("dek"),
+                "word_count": article.get("word_count"),
+                "paywalled": article.get("paywalled"),
+                "imported": True,
+                "created_at": db.now_iso(),
+            },
+        )
+        db.update_snapshot(
+            sid,
+            final_url=url,
+            title=article.get("title"),
+            site_name=article.get("site_name"),
+            author=article.get("author"),
+            published_at=article.get("published_at"),
+            description=article.get("description"),
+            word_count=article.get("word_count"),
+            paywalled=1 if article.get("paywalled") else 0,
+            status="complete",
+            error=None,
+        )
+    except Exception:
+        # A half-written import must not linger as a pending row.
+        db.delete_snapshot(sid)
+        raise
     return sid
 
 
