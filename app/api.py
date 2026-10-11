@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
-from . import db
+from . import capture, db
 from .config import ID_ALPHABET, ID_LENGTH
+from .security import article_match_key, normalize_url, validate_public_http_url
 
 router = APIRouter(prefix="/api")
 
@@ -17,6 +21,8 @@ ID_RE = re.compile(rf"^[{re.escape(ID_ALPHABET)}]{{{ID_LENGTH}}}$")
 MIN_USABLE_WORDS = 120
 MAX_SINCE_DAYS = 365
 MAX_LIMIT = 200
+MAX_SAVE_BODY_BYTES = 16 * 1024
+MAX_URL_LENGTH = 2048
 # Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
 # 150-330 words of offers. Real articles that merely mention subscribing are
 # longer, or carry the notice at the tail, so only a leading notice counts.
@@ -201,3 +207,155 @@ def snapshot_article_text(sid: str):
         if text:
             return {**_summary(snap, site), "text": text}
     raise HTTPException(404, "No usable article text for this snapshot")
+
+
+def effective_status(snap: dict) -> str:
+    """Snapshot status a client can rely on: queued, capturing, complete or failed.
+
+    Jobs live in memory, so a row still pending/capturing with no live job was
+    interrupted by a restart and will never finish.
+    """
+    status = snap["status"]
+    if status in {"pending", "capturing"}:
+        job = capture.jobs.get(snap["id"])
+        if job and job["status"] in {"queued", "capturing"}:
+            return job["status"]
+        return "failed"
+    return status
+
+
+def _find_matches(url: str) -> list[dict]:
+    """Snapshots of any status for this article, newest first.
+
+    Compares article_match_key of the saved URL, its normalized form and the
+    post-redirect final URL against the key of `url`.
+    """
+    key = article_match_key(url)
+    if not key:
+        return []
+    parsed = urlparse(url if "://" in url else "https://" + url)
+    candidates = db.find_candidates(parsed.hostname or "", parsed.path.rstrip("/") or "/")
+    return [
+        snap
+        for snap in candidates
+        if key
+        in (
+            article_match_key(snap["url_normalized"]),
+            article_match_key(snap["url"]),
+            article_match_key(snap.get("final_url")),
+        )
+    ]
+
+
+def _best_match(matches: list[dict]) -> tuple[dict | None, str, bool]:
+    """Pick the snapshot a client should use: (snapshot, effective status, usable).
+
+    Preference: complete and usable, then in flight, then complete but
+    unusable, then failed. Each group is newest first.
+    """
+    complete: list[dict] = []
+    in_flight: dict | None = None
+    failed: dict | None = None
+    for snap in matches:
+        status = effective_status(snap)
+        if status == "complete":
+            complete.append(snap)
+        elif status in {"queued", "capturing"}:
+            in_flight = in_flight or snap
+        else:
+            failed = failed or snap
+    for snap in complete:
+        if _is_usable(snap, _site_name(snap)):
+            return snap, "complete", True
+    if in_flight:
+        return in_flight, effective_status(in_flight), False
+    if complete:
+        return complete[0], "complete", False
+    if failed:
+        return failed, "failed", False
+    return None, "", False
+
+
+def _lookup_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Pass the article URL in ?url=.")
+    if len(raw) > MAX_URL_LENGTH:
+        raise ValueError("URL is too long.")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only http and https URLs can be looked up.")
+    return raw
+
+
+@router.get("/lookup")
+def lookup(response: Response, url: str = ""):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        clean = _lookup_url(url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    snap, status, usable = _best_match(_find_matches(clean))
+    if snap is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "id": snap["id"],
+        "status": status,
+        "usable": usable,
+        "title": snap.get("title"),
+        "site": _site_name(snap),
+        "url": snap["url"],
+        "final_url": snap.get("final_url"),
+        "created_at": snap["created_at"],
+    }
+
+
+@router.post("/save")
+async def save(request: Request):
+    # Only a JSON body is accepted. A cross-site <form> cannot send
+    # application/json, and a cross-site fetch() that does needs a CORS
+    # preflight, which this app never grants.
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(415, "Send the request as application/json.")
+    raw = await request.body()
+    if len(raw) > MAX_SAVE_BODY_BYTES:
+        raise HTTPException(413, "Request body is too large.")
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(400, "Body must be valid JSON.") from exc
+    if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+        raise HTTPException(400, 'Body must be a JSON object with a string "url".')
+    force = body.get("force", False)
+    if force is None:
+        force = False
+    if not isinstance(force, bool):
+        raise HTTPException(400, '"force" must be true or false.')
+
+    try:
+        clean = await asyncio.to_thread(validate_public_http_url, body["url"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    normalized = normalize_url(clean)
+
+    snap, status, usable = await asyncio.to_thread(
+        lambda: _best_match(_find_matches(clean))
+    )
+    if snap is not None and not force and status == "complete":
+        return JSONResponse({"id": snap["id"], "status": "exists", "usable": usable}, status_code=200)
+    if snap is not None and status in {"queued", "capturing"}:
+        return JSONResponse({"id": snap["id"], "status": status}, status_code=202)
+
+    # No await between the in-flight check inside enqueue_capture and the
+    # enqueue itself, so parallel saves of one URL collapse into one job.
+    try:
+        job_id = capture.enqueue_capture(clean, normalized)
+    except capture.QueueFull:
+        raise HTTPException(429, "Too many saves are already queued. Try again shortly.") from None
+    return JSONResponse(
+        {"id": job_id, "status": capture.jobs[job_id]["status"]}, status_code=202
+    )

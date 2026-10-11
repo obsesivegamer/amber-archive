@@ -139,6 +139,37 @@ def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
     return [_as_snap(r) for r in rows]
 
 
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def find_candidates(host: str, path: str = "/", limit: int = 2000) -> list[dict]:
+    """Snapshots of any status whose url, url_normalized or final_url could be this article.
+
+    A superset: LIKE narrows by host and path in SQL so a large archive is not
+    cut off by a row cap; the caller makes the exact comparison. Newest first,
+    ties broken by insertion order.
+    """
+    bare = host[4:] if host.startswith("www.") else host
+    host_pat = f"%{_like_escape(bare)}%"
+    path_pat = f"%{_like_escape(path)}%" if len(path) > 1 else "%"
+    clauses = " OR ".join(
+        f"({col} LIKE ? ESCAPE '\\' AND {col} LIKE ? ESCAPE '\\')"
+        for col in ("url_normalized", "url", "final_url")
+    )
+    with connect() as db:
+        rows = db.execute(
+            f"""
+            SELECT * FROM snapshots
+            WHERE {clauses}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (host_pat, path_pat) * 3 + (limit,),
+        ).fetchall()
+    return [_as_snap(r) for r in rows]
+
+
 def search_snapshots(query: str, limit: int = 50) -> list[dict]:
     q = f"%{query.strip()}%"
     with connect() as db:
