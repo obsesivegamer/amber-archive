@@ -170,7 +170,7 @@ The Host header is then your machine's tailnet name, for example `macbook.tail12
 
 | Variable | Meaning |
 |---|---|
-| `AMBER_ALLOWED_HOSTS` | Comma-separated bare hostnames (case-insensitive) added to the Host allow-list, e.g. `macbook.tail1234.ts.net`. No scheme, port, path or `*` wildcard: such entries are ignored with a warning, because the allow-list is what blocks DNS rebinding. Unset, Amber behaves exactly as before. Startup logs one line listing the extra hosts. |
+| `AMBER_ALLOWED_HOSTS` | Comma-separated bare hostnames (case-insensitive) added to the Host allow-list, e.g. `macbook.tail1234.ts.net`. No scheme, port, path, `*` wildcard or single-label name (use the full `*.ts.net` name): such entries are ignored with a warning, because the allow-list is what blocks DNS rebinding. Unset, Amber behaves exactly as before. Startup logs one line listing the extra hosts. |
 | `AMBER_WEBAPP_DIR` | Path to a built web app folder (a Vite `dist`), served at `/app/`. Unset, `/app/` answers `404` with a one-line hint. |
 
 With launchd, add both to the job's plist and restart it (`launchctl kickstart -k gui/$(id -u)/<your job label>`):
@@ -194,7 +194,7 @@ Keep any existing keys (such as `AMBER_EXTENSION_IDS`) in the same dict. Hosts a
 - `index.html` and every non-hashed file: `Cache-Control: no-cache`. Files under `assets/` whose name ends in a Vite content hash (`name-AbCd1234.js`): `public, max-age=31536000, immutable`.
 - Every response carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-src https://*.codesandbox.io; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
 - No directory traversal: a path containing a `..` or any other dot segment (`.env`, `.vite/`), a backslash or a NUL byte, or starting with `/`, is `404`, and a file is served only when its fully resolved path (symlinks followed) is inside `AMBER_WEBAPP_DIR`.
-- Archived snapshots keep their own, stricter CSPs and sandbox; the app embeds them from `/{id}/reader` and `/{id}/raw` in sandboxed iframes like the viewer does.
+- Archived snapshots keep their own, stricter CSPs and sandbox; the app links to the viewer instead of embedding them.
 
 #### `GET /api/feedproxy?url=<feed address>`
 
@@ -202,16 +202,16 @@ Fetches a publisher feed for the web app (publisher feeds have no CORS headers).
 
 - The address goes through the same checks as `/api/save` (public http(s), no credentials, no private or local hosts, no numeric-host tricks); a rejected one is `400 {"detail"}`.
 - It is fetched with the crawler's fetch machinery: the connected peer address is checked before anything is sent (so DNS rebinding is refused), every redirect is re-validated, proxy environment variables are ignored, at most 5 MB of body is read (more is refused, not truncated) and one 15 s wall-clock budget covers connect, TLS, headers and body, so a slow drip cannot hold it open. `User-Agent` is the browser-like one used for page captures (never Googlebot); `Accept` is `application/rss+xml, application/atom+xml, application/xml, text/xml, */*`; no `Referer` is sent.
-- It cannot be used to read pages: the response `Content-Type` must contain `xml`, `rss`, `atom`, `text/plain` or `text/html`, its first non-whitespace bytes must be `<?xml`, `<rss`, `<feed`, `<rdf` or `<urlset`, and the document element, after the prolog, must be `rss`, `feed`, `rdf`, `urlset` or `sitemapindex` (a sitemap index is accepted because it begins `<?xml` like any sitemap; an XHTML page that starts with `<?xml` is not). A document declaring an internal DTD subset (`<!DOCTYPE x [...]`, the way entity bombs are written) is refused. The body is converted to UTF-8 (BOM, then the XML declaration's `encoding`, then the `Content-Type` charset) and the declaration is rewritten to `utf-8`.
+- It cannot be used to read pages: the response `Content-Type` must contain `xml`, `rss`, `atom`, `text/plain` or `text/html`, its first non-whitespace byte must be `<` (but not `<html` or `<!doctype html`), and the document element, after the prolog, must be `rss`, `feed`, `rdf`, `urlset` or `sitemapindex` (a sitemap index is accepted because it begins `<?xml` like any sitemap; an XHTML page that starts with `<?xml` is not). A document declaring an internal DTD subset (`<!DOCTYPE x [...]`, the way entity bombs are written, found with quoted literals skipped) is refused. The body is converted to UTF-8 (BOM, then the XML declaration's `encoding`, then the `Content-Type` charset) and the declaration is rewritten to `utf-8`.
 - Only the app's own `fetch()` may use it: `Sec-Fetch-Site: cross-site` or `same-site` is `403`, and so is any request whose `Sec-Fetch-Dest` is not `empty` or whose `Sec-Fetch-Mode` is `no-cors` or `navigate` (an `<img>`, `<iframe>` or top-level navigation, including one from a snapshot served on this origin). Requests without Fetch Metadata headers (curl) pass.
-- At most 8 feeds are fetched at once; the ninth gets `429` with `Retry-After`. A slot is freed when the fetch really ends, even if the client disconnected.
+- At most 8 feeds are fetched at once; further requests wait up to 20 s for a slot (up to 64 waiting), then get `429` with `Retry-After`. A slot is freed when the fetch really ends, even if the client disconnected.
 
 | Response | Meaning |
 |---|---|
 | `200` | The feed, `Content-Type: application/xml; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` (feed XML can carry XHTML-namespace `<script>`, so it stays inert if something ever opens it as a page). |
 | `400 {"detail"}` | No `url`, or the address was rejected. |
 | `403` | Cross-site, or not a `fetch()` from the app. |
-| `429` | 8 feeds are already being fetched. |
+| `429` | 8 feeds are being fetched and no slot freed up within 20 s (or 64 requests are already waiting). |
 | `502 {"detail"}` | Not a feed, over 5 MB, the server answered an error status, or the address resolves or redirects to a private address. |
 | `504 {"detail"}` | The feed took longer than the 15 s budget. |
 

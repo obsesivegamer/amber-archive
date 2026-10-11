@@ -19,7 +19,8 @@ _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*
 def parse_allowed_hosts(raw: str) -> tuple[frozenset[str], list[str]]:
     """Split AMBER_ALLOWED_HOSTS into (bare lower-case hostnames, rejected entries).
 
-    Only plain names are accepted: no scheme, port, path or wildcard, because
+    Only plain dotted names are accepted: no scheme, port, path, wildcard or
+    single label (a local resolver could answer one), because
     the Host allow-list is what stops DNS rebinding.
     """
     hosts: set[str] = set()
@@ -28,7 +29,7 @@ def parse_allowed_hosts(raw: str) -> tuple[frozenset[str], list[str]]:
         name = part.strip().lower()
         if not name:
             continue
-        if _HOSTNAME_RE.fullmatch(name):
+        if "." in name and _HOSTNAME_RE.fullmatch(name):
             hosts.add(name)
         else:
             rejected.append(part.strip())

@@ -35,9 +35,11 @@ router = APIRouter()
 FEED_MAX_BYTES = 5 * 1024 * 1024
 FEED_DEADLINE_S = 15.0
 FEED_MAX_IN_FLIGHT = 8
+FEED_MAX_WAITING = 64
+FEED_SLOT_WAIT_S = 20.0
+_feed_waiting = 0
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
 _FEED_TYPE_HINTS = ("xml", "rss", "atom", "text/plain", "text/html")
-_FEED_START = (b"<?xml", b"<rss", b"<feed", b"<rdf", b"<urlset")
 _FEED_ROOTS = {"rss", "feed", "rdf", "urlset", "sitemapindex"}
 _feed_slots = threading.BoundedSemaphore(FEED_MAX_IN_FLIGHT)
 
@@ -90,10 +92,20 @@ def _feed_root(text: str) -> str | None:
             j = text.find("-->", i + 4)
             i = n if j < 0 else j + 3
         elif text[i : i + 9].upper() == "<!DOCTYPE":
-            j = text.find(">", i)
-            if j < 0:
-                return None
-            if "[" in text[i:j]:
+            j, quote = i + 9, ""
+            while j < n:
+                ch = text[j]
+                if quote:
+                    if ch == quote:
+                        quote = ""
+                elif ch in "\"'":
+                    quote = ch
+                elif ch == "[":
+                    return None
+                elif ch == ">":
+                    break
+                j += 1
+            if j >= n:
                 return None
             i = j + 1
         else:
@@ -112,7 +124,7 @@ def _feed_to_utf8(body: bytes, header_charset: str | None) -> str:
         encoding = declared.group(1).decode("ascii") if declared else (header_charset or "utf-8")
     try:
         text = body.decode(encoding, errors="replace")
-    except LookupError:
+    except (LookupError, ValueError):
         text = body.decode("utf-8", errors="replace")
     # The bytes we send are UTF-8 whatever the feed declared.
     return re.sub(r"(\A\s*<\?xml[^>]*?encoding\s*=\s*)([\"'])[^\"']*\2", r"\1\2utf-8\2", text, count=1)
@@ -134,8 +146,12 @@ def _fetch_feed(raw_url: str) -> bytes:
         seen["charset"] = resp.headers.get_content_charset()
 
     def on_first_chunk(chunk: bytes) -> None:
+        # Cheap early refusal of HTML/JSON/binary; whether the document element
+        # is a feed's is decided on the whole body by _feed_root.
         head = chunk.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
-        if head and not head.startswith(_FEED_START) and not chunk.startswith((b"\xff\xfe", b"\xfe\xff")):
+        if not head or head.startswith(b"<") and not head.startswith((b"<html", b"<!doctype html")):
+            return
+        if not chunk.startswith((b"\xff\xfe", b"\xfe\xff")):
             raise _FeedError(502, "That address did not return a feed.")
 
     try:
@@ -192,11 +208,26 @@ async def feedproxy(request: Request, url: str = ""):
         return refused
     if not url.strip():
         return _json_error(400, "Pass the feed address in ?url=.")
-    # Not awaited between acquire and the executor hand-off, so 8 is a hard cap.
-    # The slot is freed when the thread really ends, even if this request is
-    # cancelled or times out first.
+    # The app asks for every feed of every source at once, so wait a little for
+    # a slot rather than failing the overflow. At most 8 fetches run; the number
+    # of waiters is capped too. Not awaited between acquire and the executor
+    # hand-off, so 8 is a hard cap. The slot is freed when the thread really
+    # ends, even if this request is cancelled or times out first.
+    global _feed_waiting
     if not _feed_slots.acquire(blocking=False):
-        return _json_error(429, "Too many feeds are being fetched. Try again shortly.", **{"Retry-After": "2"})
+        if _feed_waiting >= FEED_MAX_WAITING:
+            return _json_error(429, "Too many feeds are being fetched. Try again shortly.", **{"Retry-After": "2"})
+        _feed_waiting += 1
+        try:
+            give_up = time.monotonic() + FEED_SLOT_WAIT_S
+            while not _feed_slots.acquire(blocking=False):
+                if time.monotonic() >= give_up:
+                    return _json_error(
+                        429, "Too many feeds are being fetched. Try again shortly.", **{"Retry-After": "2"}
+                    )
+                await asyncio.sleep(0.05)
+        finally:
+            _feed_waiting -= 1
     loop = asyncio.get_running_loop()
     try:
         fut = loop.run_in_executor(None, _fetch_feed, url)
@@ -358,6 +389,10 @@ def _clean_sources(raw: object) -> list[dict]:
         if not isinstance(enabled, bool):
             raise HTTPException(400, f"{where}.enabled must be true or false.")
         cleaned.append({"id": sid, "name": name, "feedUrls": list(feeds), "enabled": enabled})
+    try:
+        json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise HTTPException(400, '"sources" holds text that is not valid Unicode.') from None
     return cleaned
 
 
