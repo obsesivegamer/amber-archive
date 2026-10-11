@@ -135,7 +135,7 @@ def freeze_html(
 
     for tag in soup.find_all(True):
         for attr in list(tag.attrs):
-            if attr.lower().startswith("on"):
+            if attr.lower().startswith("on") or attr.lower() in {"ping", "attributionsrc"}:
                 del tag.attrs[attr]
         href = tag.get("href")
         if isinstance(href, str) and href.strip().lower().startswith("javascript:"):

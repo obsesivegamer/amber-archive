@@ -378,7 +378,9 @@ def strip_active_content(root) -> None:
             tag.decompose()
     for tag in root.find_all(True):
         for attr in list(tag.attrs):
-            if attr.lower().startswith("on") or attr.lower() in {"srcdoc", "formaction"}:
+            if attr.lower().startswith("on") or attr.lower() in {
+                "srcdoc", "formaction", "ping", "attributionsrc",
+            }:
                 del tag.attrs[attr]
                 continue
             value = tag.attrs[attr]

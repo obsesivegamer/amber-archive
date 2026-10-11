@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from collections import deque
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,7 @@ from fastapi.responses import JSONResponse
 
 from . import capture, db
 from .config import ID_ALPHABET, ID_LENGTH
-from .import_child import TooComplex, ingest_in_child
+from .import_child import TooComplex, blocked_for, importing, ingest_in_child
 from .ingest import screenshot_reader
 from .security import article_match_key, normalize_url, validate_public_http_url
 
@@ -35,6 +36,7 @@ MIN_IMPORT_HTML_CHARS = 200
 MAX_IMPORT_TITLE_CHARS = 300
 MAX_IMPORTS_IN_FLIGHT = 2
 MAX_THUMBNAILS_WAITING = 3
+MAX_BODY_SECONDS = 60.0
 MAX_IMPORT_BYTES_PER_DAY = 300 * 1024 * 1024
 # Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
 # 150-330 words of offers. Real articles that merely mention subscribing are
@@ -230,6 +232,8 @@ def effective_status(snap: dict) -> str:
     """
     status = snap["status"]
     if status in {"pending", "capturing"}:
+        if snap["id"] in importing:
+            return "capturing"
         job = capture.jobs.get(snap["id"])
         if job and job["status"] in {"queued", "capturing"}:
             return job["status"]
@@ -383,33 +387,57 @@ _import_ledger: deque[tuple[float, int]] = deque()
 # One Chromium at a time for import thumbnails.
 _screenshot_gate = asyncio.Semaphore(1)
 
-_TWO_LEVEL_SUFFIXES = frozenset(
+# Public suffixes (registrable domain = suffix plus one label), including
+# shared-hosting suffixes where every subdomain belongs to a different owner.
+_PUBLIC_SUFFIXES = frozenset(
     "co.uk org.uk ac.uk gov.uk me.uk ltd.uk plc.uk com.au net.au org.au edu.au gov.au "
     "co.nz org.nz govt.nz co.jp or.jp ne.jp ac.jp go.jp com.br net.br org.br com.cn net.cn "
     "org.cn com.hk com.sg com.tw com.mx com.ar com.tr com.ua co.in net.in org.in co.za "
-    "co.kr or.kr co.il co.id com.my com.ph com.pk com.eg com.sa com.ng".split()
+    "co.kr or.kr co.il co.id com.my com.ph com.pk com.eg com.sa com.ng "
+    "github.io gitlab.io blogspot.com herokuapp.com vercel.app netlify.app pages.dev "
+    "workers.dev web.app firebaseapp.com azurewebsites.net cloudfront.net "
+    "s3.amazonaws.com appspot.com wordpress.com".split()
 )
 
 
+def _host_key(url: str) -> str:
+    """Lower-cased IDNA (A-label) host, after NFKC so full-width forms compare equal."""
+    host = unicodedata.normalize("NFKC", urlparse(url).hostname or "").lower().rstrip(".")
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
+
+
 def _registrable_domain(host: str) -> str:
-    host = host.lower().rstrip(".")
     try:
         ipaddress.ip_address(host)
         return host
     except ValueError:
         pass
     labels = host.split(".")
-    if len(labels) <= 2:
-        return host
-    if ".".join(labels[-2:]) in _TWO_LEVEL_SUFFIXES:
-        return ".".join(labels[-3:])
+    for i in range(1, len(labels)):
+        if ".".join(labels[i:]) in _PUBLIC_SUFFIXES:
+            return ".".join(labels[i - 1:])
     return ".".join(labels[-2:])
 
 
+def _port_class(url: str) -> int | str:
+    try:
+        port = urlparse(url).port
+    except ValueError:
+        return "invalid"
+    return "default" if port in (None, 80, 443) else port
+
+
 def _same_site(a: str, b: str) -> bool:
-    host_a = (urlparse(a).hostname or "").lower()
-    host_b = (urlparse(b).hostname or "").lower()
-    return bool(host_a) and (host_a == host_b or _registrable_domain(host_a) == _registrable_domain(host_b))
+    try:
+        host_a, host_b = _host_key(a), _host_key(b)
+        if not host_a or not host_b or _port_class(a) != _port_class(b):
+            return False
+    except ValueError:
+        return False
+    return host_a == host_b or _registrable_domain(host_a) == _registrable_domain(host_b)
 
 
 def claim_import_slot() -> None:
@@ -418,6 +446,13 @@ def claim_import_slot() -> None:
     Synchronous on purpose: no await between the check and the increment.
     """
     global _imports_in_flight
+    paused = blocked_for()
+    if paused > 0:
+        raise HTTPException(
+            429,
+            f"Imports are paused for {int(paused) + 1} s after repeated failures.",
+            headers={"Retry-After": str(int(paused) + 1)},
+        )
     if _imports_in_flight >= MAX_IMPORTS_IN_FLIGHT:
         raise HTTPException(429, "Too many imports are already running. Try again shortly.")
     _imports_in_flight += 1
@@ -448,26 +483,40 @@ def _imported_bytes_today() -> int:
     return sum(size for _, size in _import_ledger)
 
 
-async def _read_body_capped(request: Request, limit: int) -> bytes:
-    """Read the request body, refusing with 413 as soon as it passes `limit`."""
+async def _read_body_capped(request: Request, limit: int, deadline: float = MAX_BODY_SECONDS) -> bytes:
+    """Read the request body: 413 as soon as it passes `limit`, 408 past `deadline` seconds."""
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > limit:
         raise HTTPException(413, "Request body is too large.")
     chunks: list[bytes] = []
     total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(413, "Request body is too large.")
-        chunks.append(chunk)
+    try:
+        async with asyncio.timeout(deadline):
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(413, "Request body is too large.")
+                chunks.append(chunk)
+    except TimeoutError:
+        raise HTTPException(408, "The request body took too long to arrive.") from None
     return b"".join(chunks)
 
 
-async def _screenshot_import(sid: str) -> None:
+def reserve_thumbnail() -> bool:
+    """Count one thumbnail as waiting, or say there are already too many."""
+    global _thumbnails_waiting
+    if _thumbnails_waiting >= MAX_THUMBNAILS_WAITING:
+        return False
+    _thumbnails_waiting += 1
+    return True
+
+
+async def run_reserved_thumbnail(sid: str, render) -> None:
+    """Render under the one-Chromium-at-a-time gate; never raises."""
     global _thumbnails_waiting
     try:
         async with _screenshot_gate:
-            await screenshot_reader(sid)
+            await render(sid)
     except Exception:
         log.exception("reader screenshot failed for imported snapshot %s", sid)
     finally:
@@ -481,7 +530,6 @@ async def import_page(request: Request):
     Nothing is fetched: the HTML is parsed and frozen exactly as posted, in a
     child process with a deadline and a memory cap.
     """
-    global _thumbnails_waiting
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
     if content_type != "application/json":
         raise HTTPException(415, "Send the request as application/json.")
@@ -531,15 +579,23 @@ async def import_page(request: Request):
                 raise HTTPException(400, "final_url is a different site")
 
         if not force:
-            existing, status, usable = await asyncio.to_thread(
-                lambda: _best_match(_find_matches(clean))
-            )
-            if existing is not None and status == "complete" and usable:
+            def usable_copy() -> dict | None:
+                for address in dict.fromkeys((clean, final)):
+                    found, status, usable = _best_match(_find_matches(address))
+                    if found is not None and status == "complete" and usable:
+                        return found
+                return None
+
+            existing = await asyncio.to_thread(usable_copy)
+            if existing is not None:
                 return JSONResponse(
                     {"detail": "already archived", "id": existing["id"]}, status_code=409
                 )
 
+        # Charged before parsing and kept charged on failure: a page that
+        # makes the parser burn CPU or time out still used the budget.
         check_import_budget(html_bytes)
+        record_import_bytes(html_bytes)
 
         try:
             sid = await ingest_in_child(html, clean, title, final)
@@ -548,7 +604,6 @@ async def import_page(request: Request):
         except Exception:
             log.exception("import failed for %s", clean)
             raise HTTPException(422, "Could not turn that HTML into a snapshot.") from None
-        record_import_bytes(html_bytes)
 
         def decide() -> tuple[dict, bool]:
             snap = db.get_snapshot(sid)
@@ -558,9 +613,8 @@ async def import_page(request: Request):
     finally:
         release_import_slot()
 
-    if _thumbnails_waiting < MAX_THUMBNAILS_WAITING:
-        _thumbnails_waiting += 1
-        task = asyncio.create_task(_screenshot_import(sid))
+    if reserve_thumbnail():
+        task = asyncio.create_task(run_reserved_thumbnail(sid, screenshot_reader))
         _thumbnail_tasks.add(task)
         task.add_done_callback(_thumbnail_tasks.discard)
     snap_title = snap.get("title")

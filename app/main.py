@@ -56,7 +56,9 @@ from .api import (
     effective_status,
     record_import_bytes,
     release_import_slot,
+    reserve_thumbnail,
     router as api_router,
+    run_reserved_thumbnail,
 )
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
 from .import_child import TooComplex, check_complexity, ingest_in_child
@@ -202,6 +204,14 @@ async def reject_cross_site_writes(request: Request, call_next):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
+    # <a ping> posts with this type and header. Amber's own pages have no use
+    # for it, and a captured page must not be able to fire a state-changing
+    # POST (such as /saved/{id}/delete) from inside the viewer's iframe.
+    if (
+        request.headers.get("content-type", "").split(";")[0].strip().lower() == "text/ping"
+        or "ping-to" in request.headers
+    ):
+        return _forbidden()
     origin = request.headers.get("origin")
     own_origin = origin == f"http://{request.headers.get('host', '')}"
     if origin is not None and origin.startswith("chrome-extension://"):
@@ -260,7 +270,9 @@ async def import_html(request: Request):
     try:
         try:
             raw_body = await _read_body_capped(request, MAX_IMPORT_BODY_BYTES)
-        except HTTPException:
+        except HTTPException as exc:
+            if exc.status_code == 408:
+                return _import_error("The upload took too long. Try again.")
             return _import_error("That file is too large to import (12 MB limit).")
 
         async def _replay():
@@ -278,6 +290,8 @@ async def import_html(request: Request):
             check_import_budget(len(raw))
         except HTTPException as exc:
             return _import_error(exc.detail)
+        # Charged before parsing and kept charged if the import fails.
+        record_import_bytes(len(raw))
         html = raw.decode("utf-8", errors="replace")
         try:
             await asyncio.to_thread(check_complexity, html)
@@ -289,13 +303,10 @@ async def import_html(request: Request):
         except Exception:
             log.exception("HTML import failed")
             return _import_error("Could not turn that HTML into a snapshot.")
-        record_import_bytes(len(raw))
     finally:
         release_import_slot()
-    try:
-        await screenshot_reader(sid)
-    except Exception:
-        log.exception("reader screenshot failed for %s", sid)
+    if reserve_thumbnail():
+        await run_reserved_thumbnail(sid, screenshot_reader)
     return RedirectResponse(f"/{sid}", status_code=303)
 
 
@@ -491,7 +502,9 @@ async def snapshot_reader(sid: str):
         media_type="text/html; charset=utf-8",
         headers={
             "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; "
                 "img-src 'self' data: https:; media-src 'self' data: https:; "
+                "font-src 'self' data:; connect-src 'none'; "
                 "script-src 'none'; object-src 'none'; frame-src 'none'; "
                 "base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
             ),
