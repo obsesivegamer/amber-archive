@@ -39,6 +39,7 @@ from .config import (
 from . import db
 from .extract import extract_article
 from .freeze import freeze_html, rewrite_css
+from .ingest import render_reader_jpeg
 from .reader import build_reader_html
 from .security import (
     _is_public_ip,
@@ -952,11 +953,13 @@ async def run_job(job_id: str) -> None:
             resource_bodies = visit.resource_bodies
             bounce_used = visit.bounce_origin
             reader = build_reader_html(article, url)
-            if article.get("paywalled"):
-                await visit.page.set_content(reader, wait_until="domcontentloaded")
-                await visit.page.wait_for_timeout(250)
             try:
-                screenshot = await visit.page.screenshot(full_page=True, type="jpeg", quality=82)
+                if article.get("paywalled"):
+                    # The reader is rebuilt from page markup, so it is rendered
+                    # in an offline, script-free context, never in the visit.
+                    screenshot = await render_reader_jpeg(browser, reader)
+                else:
+                    screenshot = await visit.page.screenshot(full_page=True, type="jpeg", quality=82)
             except Exception:
                 screenshot = await visit.page.screenshot(full_page=False, type="jpeg", quality=82)
         finally:
@@ -971,14 +974,14 @@ async def run_job(job_id: str) -> None:
             css_url = next((u for u, n in resource_map.items() if n == filename), final_url)
             try:
                 text = body.decode("utf-8", errors="replace")
-                text = rewrite_css(text, css_url, resource_map, sid)
+                text = await asyncio.to_thread(rewrite_css, text, css_url, resource_map, sid)
                 saved_bytes += target.write_bytes(text.encode("utf-8"))
                 continue
             except Exception:
                 pass
         saved_bytes += target.write_bytes(body)
 
-    frozen = freeze_html(html, final_url, resource_map, sid)
+    frozen = await asyncio.to_thread(freeze_html, html, final_url, resource_map, sid)
 
     (folder / "page.html").write_text(frozen, encoding="utf-8")
     (folder / "reader.html").write_text(reader, encoding="utf-8")

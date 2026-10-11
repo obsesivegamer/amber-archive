@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
-from html import unescape
+from html import escape, unescape
 from typing import Any
 
 from bs4 import BeautifulSoup
 from readability import Document
 from readability.readability import REGEXES as _READABILITY_REGEXES
+
+from .freeze import rewrite_media_urls
 
 _WS = re.compile(r"\s+")
 
@@ -363,12 +365,40 @@ def _strip_publisher_layout(root) -> None:
                 elem.attrs.pop(attr, None)
 
 
+_ACTIVE_TAGS = ["script", "style", "link", "meta", "base", "form", "iframe", "object", "embed", "applet", "frame", "frameset"]
+_CTRL_WS_RE = re.compile(r"[\x00-\x20]+")
+_ACTIVE_URL_PREFIXES = ("javascript:", "vbscript:", "data:text/html")
+
+
+def strip_active_content(root) -> None:
+    """Drop elements that can run or load code and every handler/script-URL attribute."""
+    for tag in root.find_all(_ACTIVE_TAGS):
+        if tag.name == "embed":
+            # <embed> is void, but the parser can nest following siblings in it.
+            tag.unwrap()
+        else:
+            tag.decompose()
+    for tag in root.find_all(True):
+        for attr in list(tag.attrs):
+            if attr.lower().startswith("on") or attr.lower() in {
+                "srcdoc", "formaction", "ping", "attributionsrc",
+            }:
+                del tag.attrs[attr]
+                continue
+            value = tag.attrs[attr]
+            if isinstance(value, str):
+                flat = _CTRL_WS_RE.sub("", value).lower()
+                if flat.startswith(_ACTIVE_URL_PREFIXES):
+                    del tag.attrs[attr]
+
+
 def sanitize_article_html(html: str) -> str:
     """Remove site chrome from an extract; keep prose, figures, and captions."""
     if not html or not str(html).strip():
         return html
     soup = BeautifulSoup(html, "lxml")
     root = soup.body or soup
+    strip_active_content(root)
 
     # A stored article.html is sanitized rather than re-extracted, so freeze()'s
     # own markers have to be dropped here too or a body of nothing but embed
@@ -642,7 +672,7 @@ def _paragraphs_to_html(text: str) -> str:
     parts = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     if not parts:
         parts = [text.strip()]
-    return "".join(f"<p>{p}</p>" for p in parts)
+    return "".join(f"<p>{escape(p)}</p>" for p in parts)
 
 
 def _first_h1(soup: BeautifulSoup) -> tuple[str | None, Any]:
@@ -673,8 +703,12 @@ def _dek_near_h1(h1) -> str | None:
     return t
 
 
-def extract_article(html: str, url: str) -> dict:
+def extract_article(html: str, url: str, *, scrub_secrets: bool = False) -> dict:
     soup = BeautifulSoup(html, "lxml")
+    if scrub_secrets:
+        from .freeze import strip_secrets
+
+        strip_secrets(soup)
     # freeze() leaves these markers where an embed used to be. They are Amber's
     # own text, so they must not score as the body or pad the word count.
     for note in soup.select("p.amber-removed"):
@@ -798,6 +832,11 @@ def extract_article(html: str, url: str) -> dict:
         inner = art.body
         article_html = inner.decode_contents() if inner else str(art)
         article_html = sanitize_article_html(article_html)
+        # After sanitising, which promotes lazy data-src into src: nothing a
+        # page wrote may resolve against Amber's own origin when it is viewed.
+        media = BeautifulSoup(article_html, "lxml")
+        rewrite_media_urls(media, url, {}, "")
+        article_html = media.body.decode_contents() if media.body else article_html
 
     if article_html:
         article_text = BeautifulSoup(article_html, "lxml").get_text("\n", strip=True)

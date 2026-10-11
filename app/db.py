@@ -69,6 +69,50 @@ def init_db() -> None:
         db.commit()
 
 
+_instance_lock = None
+
+
+def hold_instance_lock() -> bool:
+    """Take an exclusive lock on DATA_DIR/amber.lock for this process's life.
+
+    False means another Amber process already owns this data directory, so
+    its in-flight jobs are not ours to touch.
+    """
+    global _instance_lock
+    if _instance_lock is not None:
+        return True
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(DATA_DIR / "amber.lock", "a+")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return False
+    _instance_lock = handle
+    return True
+
+
+def fail_interrupted() -> int:
+    """Mark rows left pending/capturing by a previous process as failed."""
+    with connect() as db:
+        cur = db.execute(
+            """
+            UPDATE snapshots
+            SET status = 'failed', error = 'Interrupted before it finished.'
+            WHERE status IN ('pending', 'capturing')
+            """
+        )
+        db.commit()
+        return cur.rowcount
+
+
 def _as_snap(row: sqlite3.Row) -> dict:
     snap = dict(row)
     flag = snap.get("paywalled")
