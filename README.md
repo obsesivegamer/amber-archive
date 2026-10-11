@@ -72,7 +72,7 @@ Snapshots live in `data/snaps/<id>/` as `page.html`, `screenshot.jpg`, `article.
 
 ## JSON API
 
-No auth, meant for local tools. The `GET` routes are read-only; `POST /api/save` queues a capture. Every route only answers requests whose Host header is `127.0.0.1`, `localhost`, `[::1]` or the configured `AMBER_HOST` (anything else gets 400, which blocks DNS rebinding). If you bind to a non-loopback address (`AMBER_HOST` or `--host`), set `AMBER_HOST` to the name or address clients use, otherwise LAN clients get 400.
+No auth, meant for local tools. The `GET` routes are read-only; `POST /api/save` queues a capture. Every route only answers requests whose Host header is `127.0.0.1`, `localhost`, `[::1]` or the configured `AMBER_HOST` (anything else gets 400, which blocks DNS rebinding). If you bind to a non-loopback address (`AMBER_HOST` or `--host`), set `AMBER_HOST` to the name or address clients use, otherwise LAN clients get 400. To answer on additional names (for example a tailnet name behind `tailscale serve`), use `AMBER_ALLOWED_HOSTS`, below.
 
 Only *usable* snapshots appear: status `complete`, a stored `word_count` of at least 120, a title that is not just the site or host name, and article text of at least 120 words after extraction (see `/text` below). Paywall stubs are excluded too: text under 400 words that opens with a "Subscribe to unlock/read" or "Already a subscriber" notice. Failed paywall captures are excluded by these rules.
 
@@ -168,9 +168,100 @@ Chrome sends `Origin: chrome-extension://<id>` for an extension's requests, and 
 
 `launchctl kickstart -k gui/$(id -u)/<your job label>` restarts it. The allowlist only gates requests that carry a `chrome-extension://` Origin; `GET`s are read-only and unaffected, and curl or scripts (no Origin) are unchanged.
 
+### Phone web app over Tailscale
+
+Amber can serve the new-tab's Latest, Library and Reader views as a web app, so they open in a phone browser on your own tailnet. Everything below is same-origin only: Amber still sends no CORS headers, and the Host allow-list and cross-site rules above run first.
+
+**Expose it to your own devices only.** Keep Amber listening on `127.0.0.1` and let Tailscale reverse-proxy to it. Do not use `tailscale funnel` (that is the public internet), and do not bind Amber to `0.0.0.0`. Everything Amber does (`/save`, `/api/import`, delete, the stores below) becomes reachable by every device on the tailnet, so use Tailscale ACLs if the tailnet is shared. Amber has no login of its own.
+
+```sh
+tailscale serve --bg --https=443 localhost:8080
+```
+
+The Host header is then your machine's tailnet name, for example `macbook.tail1234.ts.net`, and browsers send `Origin: https://macbook.tail1234.ts.net`.
+
+| Variable | Meaning |
+|---|---|
+| `AMBER_ALLOWED_HOSTS` | Comma-separated bare hostnames (case-insensitive) added to the Host allow-list, e.g. `macbook.tail1234.ts.net`. No scheme, port, path, `*` wildcard or single-label name (use the full `*.ts.net` name): such entries are ignored with a warning, because the allow-list is what blocks DNS rebinding. Unset, Amber behaves exactly as before. Startup logs one line listing the extra hosts. |
+| `AMBER_WEBAPP_DIR` | Path to a built web app folder (a Vite `dist`), served at `/app/`. Unset, `/app/` answers `404` with a one-line hint. |
+
+With launchd, add both to the job's plist and restart it (`launchctl kickstart -k gui/$(id -u)/<your job label>`):
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>AMBER_ALLOWED_HOSTS</key>
+  <string>macbook.tail1234.ts.net</string>
+  <key>AMBER_WEBAPP_DIR</key>
+  <string>/Users/you/Documents/ai-newtab/apps/web/dist</string>
+</dict>
+```
+
+Keep any existing keys (such as `AMBER_EXTENSION_IDS`) in the same dict. Hosts are matched case-sensitively as the browser sends them (always lower-case); the variable itself is lower-cased when read.
+
+#### `/app/`: the static app
+
+`GET /app/` serves `index.html` from `AMBER_WEBAPP_DIR`; `/app/assets/*` and other files are served as they are, with a correct `Content-Type` (including `application/manifest+json` for `/app/manifest.webmanifest`). A path with no file extension that matches no file (a client-side route such as `/app/library/K7mQp`) answers `index.html` so the app's router can handle it; a missing `assets/...` file or a missing file with an extension answers `404`. `/app` redirects to `/app/`.
+
+- `index.html` and every non-hashed file: `Cache-Control: no-cache`. Files under `assets/` whose name ends in a Vite content hash (`name-AbCd1234.js`): `public, max-age=31536000, immutable`.
+- Every response carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-src https://*.codesandbox.io; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+- No directory traversal: a path containing a `..` or any other dot segment (`.env`, `.vite/`), a backslash or a NUL byte, or starting with `/`, is `404`, and a file is served only when its fully resolved path (symlinks followed) is inside `AMBER_WEBAPP_DIR`.
+- Archived snapshots keep their own, stricter CSPs and sandbox; the app links to the viewer instead of embedding them.
+
+#### `GET /api/feedproxy?url=<feed address>`
+
+Fetches a publisher feed for the web app (publisher feeds have no CORS headers). `GET` only.
+
+- The address goes through the same checks as `/api/save` (public http(s), no credentials, no private or local hosts, no numeric-host tricks); a rejected one is `400 {"detail"}`.
+- It is fetched with the crawler's fetch machinery: the connected peer address is checked before anything is sent (so DNS rebinding is refused), every redirect is re-validated, proxy environment variables are ignored, at most 5 MB of body is read (more is refused, not truncated) and one 15 s wall-clock budget covers connect, TLS, headers and body, so a slow drip cannot hold it open. `User-Agent` is the browser-like one used for page captures (never Googlebot); `Accept` is `application/rss+xml, application/atom+xml, application/xml, text/xml, */*`; no `Referer` is sent.
+- It cannot be used to read pages: the response `Content-Type` must contain `xml`, `rss`, `atom`, `text/plain` or `text/html`, its first non-whitespace byte must be `<` (but not `<html` or `<!doctype html`), and the document element, after the prolog, must be `rss`, `feed`, `rdf`, `urlset` or `sitemapindex` (a sitemap index is accepted because it begins `<?xml` like any sitemap; an XHTML page that starts with `<?xml` is not). A document declaring an internal DTD subset (`<!DOCTYPE x [...]`, the way entity bombs are written, found with quoted literals skipped) is refused. The body is converted to UTF-8 (BOM, then the XML declaration's `encoding`, then the `Content-Type` charset) and the declaration is rewritten to `utf-8`.
+- Only the app's own `fetch()` may use it: `Sec-Fetch-Site: cross-site` or `same-site` is `403`, and so is any request whose `Sec-Fetch-Dest` is not `empty` or whose `Sec-Fetch-Mode` is `no-cors` or `navigate` (an `<img>`, `<iframe>` or top-level navigation, including one from a snapshot served on this origin). Requests without Fetch Metadata headers (curl) pass.
+- At most 8 feeds are fetched at once; further requests wait up to 8 s for a slot (up to 64 waiting), then get `429` with `Retry-After`. A slot is freed when the fetch really ends, even if the client disconnected.
+
+| Response | Meaning |
+|---|---|
+| `200` | The feed, `Content-Type: application/xml; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` (feed XML can carry XHTML-namespace `<script>`, so it stays inert if something ever opens it as a page). |
+| `400 {"detail"}` | No `url`, or the address was rejected. |
+| `403` | Cross-site, or not a `fetch()` from the app. |
+| `429` | 8 feeds are being fetched and no slot freed up within 20 s (or 64 requests are already waiting). |
+| `502 {"detail"}` | Not a feed, over 5 MB, the server answered an error status, or the address resolves or redirects to a private address. |
+| `504 {"detail"}` | The feed took longer than the 15 s budget. |
+
+#### `GET` and `PUT /api/homepage`
+
+Holds the newest model-built "Today" page that the Mac extension uploads, so the phone app can show it.
+
+`PUT` takes `Content-Type: application/json` (`415` otherwise) and, with `code` required and `timestamp` optional:
+
+```json
+{"code": "export default function App() { ... }", "timestamp": "2026-10-11T08:00:00Z"}
+```
+
+`code` is a non-empty string of at most 2 MiB (2,097,152 bytes of UTF-8; `413` beyond, `400` when empty or not a string or not valid Unicode). `timestamp` is an ISO 8601 string (a missing zone means UTC; `400` when it does not parse) and is stored normalised to `YYYY-MM-DDTHH:MM:SSZ`; omitted, it is the server's time. The request body is read in chunks and refused with `413` once it passes 4 MiB (`408` after 60 s), so a bigger body is never held in memory. The newest `PUT` wins; Amber does not compare timestamps. It is written atomically as `data/homepage.json` (a temp file in the same folder, `fsync`, then `os.replace`; mode `0600`).
+
+```json
+{"bytes": 2097152, "timestamp": "2026-10-11T08:00:00Z"}
+```
+
+`GET` answers `200 {"code": "...", "timestamp": "2026-10-11T08:00:00Z", "bytes": 1234}` (`bytes` is the UTF-8 size of `code`), or `404 {"detail": "No homepage yet"}`. Both carry `Cache-Control: no-store`. The existing extension-origin rule applies to `PUT`: with `AMBER_EXTENSION_IDS` set, other extension ids get `403`, and an extension must send `application/json`.
+
+The code is stored and returned as text. Amber never executes it; the web app renders it in a sandboxed iframe.
+
+#### `GET` and `PUT /api/sources`
+
+Holds the sources catalog (which feeds each publisher has, and whether it is on). `PUT` takes `application/json`:
+
+```json
+{"sources": [{"id": "ft", "name": "Financial Times", "feedUrls": ["https://www.ft.com/rss/home"], "enabled": true}]}
+```
+
+At most 200 sources. `id` is a string of 1 to 64 characters and unique; `name` a string of at most 120; `feedUrls` a list of at most 10 `http://` or `https://` addresses of at most 2000 characters each, with no whitespace; `enabled` a boolean. Every field is required and its type is checked exactly; keys other than these four are dropped, never stored. Violations answer `400 {"detail": "sources[2].enabled must be true or false."}` (and `415`, `413` past 5 MiB, `408` as above). Stored atomically as `data/sources.json`. Response: `200 {"count": 1, "updated_at": "2026-10-11T08:00:00.123456Z"}` (a UTC stamp with microseconds, an opaque version; compare it as a string). Optionally add `"if_updated_at": "<stamp>"` (the `updated_at` the client last saw): when the stored list has a different stamp nothing is written and the answer is `409 {"detail": ..., "updated_at": ..., "sources": [...]}` with the stored list, so a stale device cannot overwrite a newer edit (`""` means "only if nothing is stored yet"). Compare and write happen under one lock.
+
+`GET` answers `200 {"sources": [...], "updated_at": "2026-10-11T08:00:00Z"}` or `404 {"detail": "No sources yet"}`, with `Cache-Control: no-store`. The feed addresses are not fetched or validated for reachability here; `/api/feedproxy` applies its own checks to each one when used.
+
 ### Cross-site requests
 
-Every request other than `GET`, `HEAD` and `OPTIONS` is refused with `403 {"detail": ...}` when a web page on another site started it: when the browser sent `Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header that is neither this server's own origin nor `chrome-extension://...`. This covers `POST /save`, `/import`, `/saved/{id}/delete`, `/api/save` and `/api/import`. Requests with neither header (curl, scripts) pass.
+Every request other than `GET`, `HEAD` and `OPTIONS` is refused with `403 {"detail": ...}` when a web page on another site started it: when the browser sent `Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header that is neither this server's own origin nor `chrome-extension://...`. This covers `POST /save`, `/import`, `/saved/{id}/delete`, `/api/save`, `/api/import` and the `PUT` routes below (every method other than `GET`, `HEAD` and `OPTIONS` is treated the same). With `AMBER_ALLOWED_HOSTS` set, an `Origin` of `https://<that host>` (or `http://`, with the same port as the `Host` header) also counts as this server's own origin, but only when the request's `Host` is one of the listed names; for `127.0.0.1` and `localhost` an `https://` origin is still cross-site. Requests with neither header (curl, scripts) pass.
 
 The browser extension is allowed, but only with `Content-Type: application/json`: Chrome sends `Origin: chrome-extension://<id>` and `Sec-Fetch-Site: none` for its fetches (observed with a real MV3 service worker), and a JSON body forces a CORS preflight unless the extension holds host permission for `127.0.0.1`. A form-encoded or `text/plain` post from an extension origin gets 403. Any installed extension with host access to `127.0.0.1` can therefore post JSON, which is the intended trust boundary.
 
