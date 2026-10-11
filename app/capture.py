@@ -335,19 +335,29 @@ class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
-def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
-    """Fetch HTML within one wall-clock budget covering connect, TLS, headers and body."""
-    if deadline is None:
-        deadline = time.monotonic() + CRAWLER_DEADLINE_S
-    req = urllib.request.Request(
-        validate_public_http_url(url),
-        headers={
-            "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/",
-        },
-    )
+class FetchTooLarge(Exception):
+    """A strict fetch's body passed its byte limit."""
+
+
+def _fetch(
+    url: str,
+    headers: dict[str, str],
+    deadline: float,
+    max_bytes: int,
+    *,
+    strict: bool = False,
+    on_response=None,
+    on_first_chunk=None,
+) -> bytes:
+    """GET an already-validated public URL within one wall-clock budget
+    covering connect, TLS, headers and body.
+
+    The connected peer is checked on every connection (redirects included),
+    redirects are re-validated and proxies are ignored. A body past
+    `max_bytes` is silently cut, or raises FetchTooLarge when `strict`.
+    `on_response(resp)` and `on_first_chunk(bytes)` may raise to stop early.
+    """
+    req = urllib.request.Request(url, headers=headers)
     expired = threading.Event()
     lock = threading.Lock()
     shutdowns: list[socket.socket] = []
@@ -391,19 +401,26 @@ def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
         opener.add_handler(handler)
     chunks: list[bytes] = []
     received = 0
+    limit = max_bytes + 1 if strict else max_bytes
     try:
         with opener.open(req, timeout=10) as resp:
-            while received < MAX_CRAWLER_BYTES:
+            if on_response is not None:
+                on_response(resp)
+            while received < limit:
                 if expired.is_set() or time.monotonic() > deadline:
                     raise TimeoutError("crawler fetch took too long")
-                chunk = resp.read1(min(65536, MAX_CRAWLER_BYTES - received))
+                chunk = resp.read1(min(65536, limit - received))
                 if not chunk:
                     break
+                if on_first_chunk is not None and not chunks:
+                    on_first_chunk(chunk)
                 chunks.append(chunk)
                 received += len(chunk)
+            if strict and received > max_bytes:
+                raise FetchTooLarge()
             # A socket cut by the deadline reads as a quiet end of file; a body
             # that promised more bytes than arrived is a truncated fetch.
-            if expired.is_set() or (received < MAX_CRAWLER_BYTES and getattr(resp, "length", None)):
+            if expired.is_set() or (received < limit and getattr(resp, "length", None)):
                 raise TimeoutError("crawler fetch took too long")
     except Exception as exc:
         if expired.is_set() and not isinstance(exc, TimeoutError):
@@ -414,7 +431,25 @@ def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
         with lock:
             for sock in shutdowns:
                 sock.close()
-    return b"".join(chunks).decode("utf-8", errors="replace")
+    return b"".join(chunks)
+
+
+def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
+    """Fetch HTML within one wall-clock budget covering connect, TLS, headers and body."""
+    if deadline is None:
+        deadline = time.monotonic() + CRAWLER_DEADLINE_S
+    body = _fetch(
+        validate_public_http_url(url),
+        {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+        },
+        deadline,
+        MAX_CRAWLER_BYTES,
+    )
+    return body.decode("utf-8", errors="replace")
 
 
 async def fetch_crawler_html(url: str) -> str | None:

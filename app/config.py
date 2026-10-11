@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,6 +12,36 @@ DB_PATH = DATA_DIR / "amber.sqlite3"
 
 HOST = os.environ.get("AMBER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AMBER_PORT", "8080"))
+
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+
+
+def parse_allowed_hosts(raw: str) -> tuple[frozenset[str], list[str]]:
+    """Split AMBER_ALLOWED_HOSTS into (bare lower-case hostnames, rejected entries).
+
+    Only plain names are accepted: no scheme, port, path or wildcard, because
+    the Host allow-list is what stops DNS rebinding.
+    """
+    hosts: set[str] = set()
+    rejected: list[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if _HOSTNAME_RE.fullmatch(name):
+            hosts.add(name)
+        else:
+            rejected.append(part.strip())
+    return frozenset(hosts), rejected
+
+
+# Extra Host names Amber answers to, e.g. the tailnet name that
+# `tailscale serve` proxies from. Empty unless AMBER_ALLOWED_HOSTS is set.
+EXTRA_HOSTS, REJECTED_EXTRA_HOSTS = parse_allowed_hosts(os.environ.get("AMBER_ALLOWED_HOSTS", ""))
+
+# Directory of a built web app (Vite dist) served at /app/.
+_webapp = os.environ.get("AMBER_WEBAPP_DIR", "").strip()
+WEBAPP_DIR = Path(_webapp).expanduser().resolve() if _webapp else None
 
 VIEWPORT = {"width": 1280, "height": 900}
 NAV_TIMEOUT_MS = 45_000

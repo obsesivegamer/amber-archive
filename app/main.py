@@ -60,10 +60,20 @@ from .api import (
     router as api_router,
     run_reserved_thumbnail,
 )
-from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
+from .config import (
+    EXTRA_HOSTS,
+    HOST,
+    ID_ALPHABET,
+    ID_LENGTH,
+    PORT,
+    REJECTED_EXTRA_HOSTS,
+    ROOT,
+    WEBAPP_DIR,
+)
 from .import_child import TooComplex, check_complexity, import_failure, ingest_in_child
 from .ingest import original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
+from .web import router as web_router
 
 log = logging.getLogger("amber")
 
@@ -79,6 +89,7 @@ RESERVED = {
     "about",
     "static",
     "api",
+    "app",
     "exists",
     "saved",
     "delete",
@@ -160,6 +171,19 @@ async def lifespan(app: FastAPI):
             "AMBER_EXTENSION_IDS is not set: any installed Chrome extension with access to "
             "this address may POST JSON to Amber. Set it to your extension id(s) to restrict this."
         )
+    if EXTRA_HOSTS:
+        log.warning(
+            "AMBER_ALLOWED_HOSTS: also answering to Host %s (https Origin accepted as same-origin). "
+            "Expose Amber only to your own devices, for example with `tailscale serve`.",
+            ", ".join(sorted(EXTRA_HOSTS)),
+        )
+    for entry in REJECTED_EXTRA_HOSTS:
+        log.warning(
+            "AMBER_ALLOWED_HOSTS: ignoring %r (use bare hostnames: no scheme, port, path or wildcard).",
+            entry,
+        )
+    if WEBAPP_DIR is not None:
+        log.warning("AMBER_WEBAPP_DIR: serving the web app from %s at /app/", WEBAPP_DIR)
     capture.job_queue = asyncio.Queue()
     worker = asyncio.create_task(capture.worker())
     yield
@@ -177,7 +201,7 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", HOST}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", HOST} | set(EXTRA_HOSTS)
 if os.environ.get("AMBER_ALLOW_TESTSERVER"):
     ALLOWED_HOSTS.add("testserver")
 
@@ -228,7 +252,12 @@ async def reject_cross_site_writes(request: Request, call_next):
     ):
         return _forbidden()
     origin = request.headers.get("origin")
-    own_origin = origin == f"http://{request.headers.get('host', '')}"
+    host_header = request.headers.get("host", "")
+    own_origin = origin == f"http://{host_header}"
+    if not own_origin and origin is not None and host_header.split(":")[0].lower() in EXTRA_HOSTS:
+        # Behind `tailscale serve` the browser's origin is https://<tailnet name>.
+        lowered = host_header.lower()
+        own_origin = origin.lower() in {f"http://{lowered}", f"https://{lowered}"}
     if origin is not None and origin.startswith("chrome-extension://"):
         allowed_ids = _allowed_extension_ids()
         if allowed_ids and origin[len("chrome-extension://"):].split("/")[0].lower() not in allowed_ids:
@@ -455,6 +484,7 @@ async def search(request: Request, q: str = ""):
 
 
 app.include_router(api_router)
+app.include_router(web_router)
 
 
 def _require_complete(sid: str) -> dict:
