@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
+import time
+from collections import deque
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -11,11 +14,11 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from starlette.background import BackgroundTask
 
 from . import capture, db
 from .config import ID_ALPHABET, ID_LENGTH
-from .ingest import ingest_html, screenshot_reader
+from .import_child import TooComplex, ingest_in_child
+from .ingest import screenshot_reader
 from .security import article_match_key, normalize_url, validate_public_http_url
 
 log = logging.getLogger("amber.api")
@@ -30,7 +33,9 @@ MAX_URL_LENGTH = 2048
 MAX_IMPORT_BODY_BYTES = 12 * 1024 * 1024
 MIN_IMPORT_HTML_CHARS = 200
 MAX_IMPORT_TITLE_CHARS = 300
-MAX_IMPORTS_IN_FLIGHT = 5
+MAX_IMPORTS_IN_FLIGHT = 2
+MAX_THUMBNAILS_WAITING = 3
+MAX_IMPORT_BYTES_PER_DAY = 300 * 1024 * 1024
 # Paywall stubs (FT "Subscribe to unlock this article" plus the price list) are
 # 150-330 words of offers. Real articles that merely mention subscribing are
 # longer, or carry the notice at the tail, so only a leading notice counts.
@@ -334,7 +339,7 @@ async def save(request: Request):
         raise HTTPException(413, "Request body is too large.")
     try:
         body = json.loads(raw)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise HTTPException(400, "Body must be valid JSON.") from exc
     if not isinstance(body, dict) or not isinstance(body.get("url"), str):
         raise HTTPException(400, 'Body must be a JSON object with a string "url".')
@@ -370,8 +375,77 @@ async def save(request: Request):
 
 
 _imports_in_flight = 0
+_thumbnails_waiting = 0
+_thumbnail_tasks: set[asyncio.Task] = set()
+# (time, bytes) of accepted imports in the last 24 hours. In memory: a restart
+# forgets it, which is fine for a soft limit.
+_import_ledger: deque[tuple[float, int]] = deque()
 # One Chromium at a time for import thumbnails.
 _screenshot_gate = asyncio.Semaphore(1)
+
+_TWO_LEVEL_SUFFIXES = frozenset(
+    "co.uk org.uk ac.uk gov.uk me.uk ltd.uk plc.uk com.au net.au org.au edu.au gov.au "
+    "co.nz org.nz govt.nz co.jp or.jp ne.jp ac.jp go.jp com.br net.br org.br com.cn net.cn "
+    "org.cn com.hk com.sg com.tw com.mx com.ar com.tr com.ua co.in net.in org.in co.za "
+    "co.kr or.kr co.il co.id com.my com.ph com.pk com.eg com.sa com.ng".split()
+)
+
+
+def _registrable_domain(host: str) -> str:
+    host = host.lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    if ".".join(labels[-2:]) in _TWO_LEVEL_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _same_site(a: str, b: str) -> bool:
+    host_a = (urlparse(a).hostname or "").lower()
+    host_b = (urlparse(b).hostname or "").lower()
+    return bool(host_a) and (host_a == host_b or _registrable_domain(host_a) == _registrable_domain(host_b))
+
+
+def claim_import_slot() -> None:
+    """Take one of the MAX_IMPORTS_IN_FLIGHT slots, or refuse with 429.
+
+    Synchronous on purpose: no await between the check and the increment.
+    """
+    global _imports_in_flight
+    if _imports_in_flight >= MAX_IMPORTS_IN_FLIGHT:
+        raise HTTPException(429, "Too many imports are already running. Try again shortly.")
+    _imports_in_flight += 1
+
+
+def release_import_slot() -> None:
+    global _imports_in_flight
+    _imports_in_flight -= 1
+
+
+def check_import_budget(nbytes: int) -> None:
+    if _imported_bytes_today() + nbytes > MAX_IMPORT_BYTES_PER_DAY:
+        raise HTTPException(
+            429,
+            f"Daily import budget used up ({MAX_IMPORT_BYTES_PER_DAY // (1024 * 1024)} MB "
+            "of HTML per 24 hours). Try again later.",
+        )
+
+
+def record_import_bytes(nbytes: int) -> None:
+    _import_ledger.append((time.time(), nbytes))
+
+
+def _imported_bytes_today() -> int:
+    cutoff = time.time() - 24 * 3600
+    while _import_ledger and _import_ledger[0][0] < cutoff:
+        _import_ledger.popleft()
+    return sum(size for _, size in _import_ledger)
 
 
 async def _read_body_capped(request: Request, limit: int) -> bytes:
@@ -390,32 +464,33 @@ async def _read_body_capped(request: Request, limit: int) -> bytes:
 
 
 async def _screenshot_import(sid: str) -> None:
+    global _thumbnails_waiting
     try:
         async with _screenshot_gate:
-            await screenshot_reader(sid, offline=True)
+            await screenshot_reader(sid)
     except Exception:
         log.exception("reader screenshot failed for imported snapshot %s", sid)
+    finally:
+        _thumbnails_waiting -= 1
 
 
 @router.post("/import")
 async def import_page(request: Request):
     """Store HTML a signed-in browser already rendered as a new, complete snapshot.
 
-    Nothing is fetched: the HTML is parsed and frozen exactly as posted.
+    Nothing is fetched: the HTML is parsed and frozen exactly as posted, in a
+    child process with a deadline and a memory cap.
     """
-    global _imports_in_flight
+    global _thumbnails_waiting
     content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
     if content_type != "application/json":
         raise HTTPException(415, "Send the request as application/json.")
-    # No await between this check and the increment.
-    if _imports_in_flight >= MAX_IMPORTS_IN_FLIGHT:
-        raise HTTPException(429, "Too many imports are already running. Try again shortly.")
-    _imports_in_flight += 1
+    claim_import_slot()
     try:
         raw = await _read_body_capped(request, MAX_IMPORT_BODY_BYTES)
         try:
             body = json.loads(raw)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise HTTPException(400, "Body must be valid JSON.") from exc
         del raw
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
@@ -426,24 +501,54 @@ async def import_page(request: Request):
                 400, f'"html" must be a string of at least {MIN_IMPORT_HTML_CHARS} characters.'
             )
         try:
-            html.encode("utf-8")
+            html_bytes = len(html.encode("utf-8"))
         except UnicodeEncodeError:
             raise HTTPException(400, '"html" is not valid Unicode text.') from None
         title = body.get("title")
         if title is not None and not isinstance(title, str):
             raise HTTPException(400, '"title" must be a string.')
         title = " ".join((title or "").split())[:MAX_IMPORT_TITLE_CHARS]
+        force = body.get("force", False)
+        if force is None:
+            force = False
+        if not isinstance(force, bool):
+            raise HTTPException(400, '"force" must be true or false.')
+        final_raw = body.get("final_url")
+        if final_raw is not None and not isinstance(final_raw, str):
+            raise HTTPException(400, '"final_url" must be a string.')
 
         try:
             clean = await asyncio.to_thread(validate_public_http_url, body["url"])
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        final = clean
+        if final_raw is not None and final_raw.strip():
+            try:
+                final = await asyncio.to_thread(validate_public_http_url, final_raw)
+            except ValueError as exc:
+                raise HTTPException(400, f"final_url: {exc}") from exc
+            if not _same_site(clean, final):
+                raise HTTPException(400, "final_url is a different site")
+
+        if not force:
+            existing, status, usable = await asyncio.to_thread(
+                lambda: _best_match(_find_matches(clean))
+            )
+            if existing is not None and status == "complete" and usable:
+                return JSONResponse(
+                    {"detail": "already archived", "id": existing["id"]}, status_code=409
+                )
+
+        check_import_budget(html_bytes)
 
         try:
-            sid = await asyncio.to_thread(ingest_html, html, clean, None, title)
+            sid = await ingest_in_child(html, clean, title, final)
+        except TooComplex as exc:
+            raise HTTPException(422, f"Page too complex to import: {exc}") from None
         except Exception:
             log.exception("import failed for %s", clean)
             raise HTTPException(422, "Could not turn that HTML into a snapshot.") from None
+        record_import_bytes(html_bytes)
 
         def decide() -> tuple[dict, bool]:
             snap = db.get_snapshot(sid)
@@ -451,8 +556,13 @@ async def import_page(request: Request):
 
         snap, usable = await asyncio.to_thread(decide)
     finally:
-        _imports_in_flight -= 1
+        release_import_slot()
 
+    if _thumbnails_waiting < MAX_THUMBNAILS_WAITING:
+        _thumbnails_waiting += 1
+        task = asyncio.create_task(_screenshot_import(sid))
+        _thumbnail_tasks.add(task)
+        task.add_done_callback(_thumbnail_tasks.discard)
     snap_title = snap.get("title")
     return JSONResponse(
         {
@@ -463,5 +573,4 @@ async def import_page(request: Request):
             "title": None if not snap_title or snap_title in {snap["url"], "[no-title]"} else snap_title,
         },
         status_code=201,
-        background=BackgroundTask(_screenshot_import, sid),
     )

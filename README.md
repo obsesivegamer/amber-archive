@@ -105,27 +105,47 @@ When several snapshots match, the answer prefers a complete and usable one, then
 
 ### Importing a page from a signed-in browser
 
-`POST /api/import` with `Content-Type: application/json` stores HTML that a browser (typically the Amber extension, in a Chrome where the user is signed in to a publisher) already rendered, so the Reader can show text Amber's own fresh-visitor capture never gets. It queues nothing and fetches nothing: the HTML is parsed, frozen and extracted exactly as posted.
+`POST /api/import` with `Content-Type: application/json` stores HTML that a browser (typically the Amber extension, in a Chrome where the user is signed in to a publisher) already rendered, so the Reader can show text Amber's own fresh-visitor capture never gets. It queues no capture and fetches nothing: the HTML is parsed, frozen and extracted exactly as posted.
 
 ```json
-{"url": "https://www.ft.com/content/...", "html": "<!doctype html>...", "title": "optional"}
+{"url": "https://www.ft.com/content/...", "html": "<!doctype html>...", "title": "optional",
+ "final_url": "optional, same site as url", "force": false}
 ```
 
-`url` follows the same rules as `/api/save` (public http(s), no credentials, no private or local hosts, no numeric-host tricks, at most 2048 characters). The fragment is dropped and a missing scheme becomes `https://`; the stored `url` and `final_url` are that value. `html` is the page's HTML and must be a string of at least 200 characters. `title` is optional and used only when the page itself has no title (or only its host name); it never overrides a title the page declares.
+`url` follows the same rules as `/api/save` (public http(s), no credentials, no private or local hosts, no numeric-host tricks, at most 2048 characters). The fragment is dropped and a missing scheme becomes `https://`; the stored `url` is that value. `html` is the page's HTML and must be a string of at least 200 characters. `title` is optional and used only when the page itself has no title (or only its host name); it never overrides a title the page declares. `final_url` is optional (the address the browser ended up on after redirects). It goes through the same public-address checks as `url` (a rejected one is a 400, DNS included) and must be on the same site: the same host or the same registrable domain (last two labels, last three under common suffixes such as `co.uk`), otherwise `400 {"detail": "final_url is a different site"}`. It is stored as the snapshot's `final_url`, and lookups match on it; without it `final_url` equals `url`.
 
 | Response | Meaning |
 |---|---|
 | `201 {"id": "K7mQp", "status": "complete", "usable": true, "word_count": 1200, "title": "..."}` | Stored as a new snapshot. `title` is `null` when neither the page nor the request had one. |
-| `400 {"detail"}` | Rejected URL, invalid JSON, missing or too-short `html`, non-string `title`. |
+| `409 {"detail": "already archived", "id": "..."}` | A complete, usable snapshot of this article already exists and `force` is not `true`. Nothing was stored. |
+| `400 {"detail"}` | Rejected URL or `final_url`, invalid JSON, missing or too-short `html`, non-string `title`/`final_url`, non-boolean `force`. |
 | `413` | Body over 12 MiB. The body is read in chunks and refused as soon as it passes the limit. |
 | `415` | Not `application/json`. |
-| `403` | Cross-site request (see below). |
-| `422` | The HTML could not be processed; nothing is left behind. |
-| `429` | Five imports are already running. |
+| `403` | Cross-site request, or an extension not on the allowlist (see below). |
+| `422` | The HTML could not be processed, or is too complex (see below); nothing is left behind. |
+| `429` | Two imports are already running, or 300 MB of HTML was already imported in the last 24 hours (counted in memory, so a restart resets it). |
 
-Every import creates a new snapshot, even when the URL already has one: the new copy is the signed-in one. `usable` applies the same rules as `/api/snapshots` (complete, at least 120 words, a real title, not a paywall stub). `GET /api/lookup` and `POST /api/save` prefer the newest complete and usable copy, so a usable import wins immediately, while an unusable one (the page was still a paywall stub) never displaces an older usable snapshot. Once `usable` is true, `GET /api/snapshots/{id}/text` answers 200 with the paragraphs. The snapshot is marked `"imported": true` in its `meta.json`.
+An import never displaces a usable copy: with an existing usable snapshot of the same article (matched like `/api/lookup`), the answer is `409` unless the body says `"force": true`, which stores a new snapshot that then becomes the newest. Otherwise (nothing archived, or only stubs, failures or in-flight captures) the import creates a new snapshot. `usable` applies the same rules as `/api/snapshots` (complete, at least 120 words, a real title, not a paywall stub). `GET /api/lookup` and `POST /api/save` prefer the newest complete and usable copy, so a usable import wins immediately, while an unusable one never displaces an older usable snapshot. Once `usable` is true, `GET /api/snapshots/{id}/text` answers 200 with the paragraphs. The snapshot is marked `"imported": true` in its `meta.json`.
 
-An imported snapshot has no stored resources, so its Webpage view shows the page without remote images or stylesheets (the page's CSP blocks them); the Reader view is the full text. The Reader thumbnail is rendered in the background after the response, in a Chromium that is blocked from any network request (remote images are blank in the thumbnail); a failure there is logged and never affects the import.
+An imported snapshot has no stored resources, so its Webpage view shows the page without remote images or stylesheets (the page's own CSP blocks them); the Reader view carries the full text and, under its CSP, shows `https:` images from the publisher. Form values, CSRF/token `<meta>` tags and long opaque-token `data-*` values are dropped from imported pages (not from captures). The thumbnail is rendered in the background after the response, offline and without JavaScript, only when fewer than 3 thumbnails are waiting, and clipped to the top 8000 px; a failure there is logged and never affects the import.
+
+#### Page limits
+
+Pasted HTML can be shaped to make a parser spend minutes or gigabytes, so before parsing the page is refused with `422 {"detail": "Page too complex to import: ..."}` when it has more than 60,000 `<` characters, nests deeper than 400 elements, or has a tag with more than 1,000 attributes. Everything else is parsed in a child process that is killed after 45 seconds or at about 1.5 GB (also `422`), so the server stays responsive. Ordinary articles import in well under a second. The homepage's HTML-file form (`POST /import`) goes through the same pre-check, child process, 12 MiB streaming body cap and in-flight and daily limits; it keeps its redirect behaviour and reports a refusal as the usual `/?error=...` redirect.
+
+#### Which extensions may import
+
+Chrome sends `Origin: chrome-extension://<id>` for an extension's requests, and by default any installed extension that holds host access to Amber's address may POST JSON (`/api/save`, `/api/import`, ...). Amber logs a warning at startup while that is the case. To allow only your own extension, set `AMBER_EXTENSION_IDS` to its id (comma-separated for several): other extension origins then get `403` on every non-GET request. Find the id at `chrome://extensions` with Developer mode on (the "ID" line under the extension's name; unpacked extensions keep a stable id as long as the folder path stays the same). With launchd, add it to the job's plist and reload:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>AMBER_EXTENSION_IDS</key>
+  <string>abcdefghijklmnopabcdefghijklmnop</string>
+</dict>
+```
+
+`launchctl kickstart -k gui/$(id -u)/<your job label>` restarts it. The allowlist only gates requests that carry a `chrome-extension://` Origin; `GET`s are read-only and unaffected, and curl or scripts (no Origin) are unchanged.
 
 ### Cross-site requests
 
@@ -141,17 +161,18 @@ Everything stored under a snapshot is third-party bytes served on Amber's origin
 
 - Stored resources get their file extension from the response MIME type only (a fixed table of image, font and CSS types, anything else `.bin`), never from the URL. A response typed `image/x-evil` from `/a.html` is stored as `<hash>.bin`.
 - `/{id}/r/<file>` serves a fixed set of passive types inline (CSS, images including SVG, fonts); everything else, including `.html`, `.js` or `.xml` files that older captures stored by URL suffix, is `application/octet-stream` with `Content-Disposition: attachment`. All of them carry `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox; default-src 'none'; ...`, so even an SVG with script opened directly cannot run script or reach Amber's origin.
-- `/{id}/raw` and `/{id}/reader` carry a CSP with `script-src 'none'` and the same `sandbox` flags the viewer iframes use (no scripts, `allow-same-origin` so fonts and images load), so captured markup cannot execute script when opened as a top-level page either.
+- `/{id}/raw` and `/{id}/reader` carry a CSP with `script-src 'none'` and the same `sandbox` flags the viewer iframes use (no scripts, `allow-same-origin` so fonts and images load), so captured markup cannot execute script when opened as a top-level page either. `/raw` restricts images to `'self'` and `data:`; the reader also allows `https:` images (captured readers keep their publisher image URLs).
 
 ### Imported pages
 
-The posted HTML is untrusted third-party content, handled exactly like a captured page.
+The posted HTML is untrusted third-party content, handled like a captured page, and more strictly where it is cheap to be.
 
 - Nothing is fetched while importing. `freeze_html` is given an empty resource map and extraction is DOM-only; verified by running the import path with a socket guard and a listening canary against a page full of external `<img>`, `<link>`, `@import`, `<iframe>`, `<!DOCTYPE ... SYSTEM>` and XML entity references: no connection was attempted.
-- `freeze_html` removes `<script>`, `<noscript>` and `<template>`, replaces `<iframe>`, `<object>`, `<embed>` with a note, strips every `on*` attribute and `javascript:` URL, disables forms and drops `<meta http-equiv=refresh>`. The reader extract drops the same active elements and `on*` attributes, and escapes the title, author and site name.
-- `/{id}/raw` and `/{id}/reader` carry the CSP and `sandbox` described under "Captured content", so a page opened top-level, or in the viewer's sandboxed iframes, cannot run script or load remote subresources. An import stores no files under `/{id}/r/`.
-- The reader thumbnail is rendered with every non-`data:` request aborted.
-- The body is capped at 12 MiB and at most five imports run at once; the existing cross-site rules apply (an extension origin is accepted only for `application/json`, and Host is checked first).
+- `freeze_html` removes `<script>`, `<noscript>` and `<template>`, replaces `<iframe>`, `<object>`, `<embed>` with a note, strips every `on*` attribute and `javascript:` URL, disables forms and drops `<meta http-equiv=refresh>`. The reader extract drops `script`, `style`, `link`, `meta`, `base`, `form`, `iframe`, `object` and `embed` elements, every `on*` attribute, `srcdoc`, `formaction` and `javascript:`/`vbscript:`/`data:text/html` URLs, escapes the text it builds from `og:description`, and escapes title, author and site name.
+- `/{id}/raw` carries `default-src 'none'` with `img-src 'self' data:`, `script-src 'none'` and the viewer's `sandbox` flags: no script and no remote subresource. `/{id}/reader` carries `script-src 'none'`, the same `sandbox` flags and `img-src 'self' data: https:` (and the same for media), so publisher images show but `http:` addresses, including loopback ones, are not fetched. An import stores no files under `/{id}/r/`.
+- Every Amber-side rendering of third-party markup (the reader thumbnails of imports and HTML imports, and the paywalled-capture reader screenshot) uses a Chromium context with JavaScript off, service workers blocked and every request except `data:`/`about:` aborted at context level, so remote images are blank in those screenshots.
+- The body is capped at 12 MiB; page complexity, wall-clock and memory are capped as described above; at most two imports run at once; 300 MB of HTML per rolling day. The existing cross-site rules apply (an extension origin is accepted only for `application/json`, and only for listed ids when `AMBER_EXTENSION_IDS` is set; Host is checked first).
+- JSON bodies nested deep enough to exhaust the parser's recursion answer `400`, not `500`.
 
 ### Capture-time protections
 

@@ -103,11 +103,59 @@ def _save_jpeg(folder, screenshot_bytes: bytes) -> None:
         (folder / "screenshot.jpg").write_bytes(screenshot_bytes)
 
 
-async def screenshot_reader(sid: str, *, offline: bool = False) -> None:
+OFFLINE_ALLOWED_PREFIXES = ("data:", "about:")
+MAX_SHOT_HEIGHT = 8000
+SHOT_VIEWPORT = {"width": 1280, "height": 900}
+
+
+async def offline_context(browser):
+    """A context for rendering third-party markup: no JavaScript, no service
+    workers, and every request except data:/about: aborted. The route is on the
+    context, so popups and child frames are covered too."""
+    context = await browser.new_context(
+        viewport=SHOT_VIEWPORT, java_script_enabled=False, service_workers="block"
+    )
+
+    async def _abort_network(route):
+        if route.request.url.startswith(OFFLINE_ALLOWED_PREFIXES):
+            await route.continue_()
+        else:
+            await route.abort()
+
+    await context.route("**/*", _abort_network)
+    return context
+
+
+async def render_reader_jpeg(browser, reader_html: str) -> bytes:
+    """Screenshot reader HTML in an offline, script-free context. Tall pages are
+    clipped to MAX_SHOT_HEIGHT so a huge extract cannot exhaust the browser."""
+    context = await offline_context(browser)
+    try:
+        page = await context.new_page()
+        await page.set_content(reader_html, wait_until="domcontentloaded")
+        height = SHOT_VIEWPORT["height"]
+        try:
+            box = await page.locator("html").bounding_box()
+            if box:
+                height = int(box["y"] + box["height"])
+        except Exception:
+            pass
+        height = max(1, min(height, MAX_SHOT_HEIGHT))
+        return await page.screenshot(
+            type="jpeg",
+            quality=82,
+            full_page=True,
+            clip={"x": 0, "y": 0, "width": SHOT_VIEWPORT["width"], "height": height},
+        )
+    finally:
+        await context.close()
+
+
+async def screenshot_reader(sid: str) -> None:
     """Render reader.html to screenshot.jpg. Playwright sync API cannot run under uvicorn.
 
-    offline=True aborts every request except data: URLs, so third-party HTML
-    cannot make this browser fetch anything (remote images are simply absent).
+    reader.html holds third-party markup, so it is always rendered offline and
+    without JavaScript (see offline_context); remote images are blank.
     """
     folder = db.snap_dir(sid)
     path = folder / "reader.html"
@@ -118,18 +166,8 @@ async def screenshot_reader(sid: str, *, offline: bool = False) -> None:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1280, "height": 900})
         try:
-            if offline:
-                async def _abort_network(route):
-                    if route.request.url.startswith(("data:", "about:")):
-                        await route.continue_()
-                    else:
-                        await route.abort()
-
-                await page.route("**/*", _abort_network)
-            await page.set_content(html, wait_until="domcontentloaded")
-            shot = await page.screenshot(full_page=True, type="jpeg", quality=82)
+            shot = await render_reader_jpeg(browser, html)
         finally:
             await browser.close()
     _save_jpeg(folder, shot)
@@ -150,24 +188,32 @@ def ingest_html(
     url: str = "",
     screenshot_bytes: bytes | None = None,
     title_hint: str = "",
+    final_url: str = "",
+    sid: str | None = None,
 ) -> str:
     """Store `html` as a complete snapshot. Reads no network resource: the
-    resource map handed to freeze_html is empty and extraction is DOM-only."""
+    resource map handed to freeze_html is empty and extraction is DOM-only.
+
+    `sid` is a row the caller already inserted (so it can clean up if this
+    runs in a process that gets killed); otherwise one is allocated here.
+    """
     url = (url or original_url_from_html(html)).strip()
     if "://" not in url:
         url = "https://" + url
-    sid = db.allocate_id()
-    db.insert_snapshot(sid, url, normalize_url(url))
+    final = (final_url or url).strip()
+    if sid is None:
+        sid = db.allocate_id()
+        db.insert_snapshot(sid, url, normalize_url(url))
     try:
         folder = db.snap_dir(sid)
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "res").mkdir(exist_ok=True)
 
-        article = extract_article(html, url)
+        article = extract_article(html, url, scrub_secrets=True)
         hint = " ".join((title_hint or "").split())
         if hint and _title_is_missing(article, url):
             article["title"] = hint
-        frozen = freeze_html(html, url, {}, sid)
+        frozen = freeze_html(html, url, {}, sid, scrub_secrets=True)
         reader = build_reader_html(article, url)
 
         (folder / "page.html").write_text(frozen, encoding="utf-8")
@@ -183,7 +229,7 @@ def ingest_html(
             {
                 "id": sid,
                 "url": url,
-                "final_url": url,
+                "final_url": final,
                 "title": article.get("title"),
                 "site_name": article.get("site_name"),
                 "author": article.get("author"),
@@ -198,7 +244,7 @@ def ingest_html(
         )
         db.update_snapshot(
             sid,
-            final_url=url,
+            final_url=final,
             title=article.get("title"),
             site_name=article.get("site_name"),
             author=article.get("author"),

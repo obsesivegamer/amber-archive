@@ -7,7 +7,9 @@ from urllib.parse import urljoin, urldefrag
 
 from bs4 import BeautifulSoup, NavigableString
 
-CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.I)
+# Possessive quantifiers: no backtracking, so a hostile stylesheet of `url(`
+# repeats or long whitespace runs stays linear.
+CSS_URL_RE = re.compile(r"""url\(\s*+(?:"([^"]*+)"|'([^']*+)'|([^'"()\s]*+))\s*+\)""", re.I)
 
 KEEP_LINK_RELS = {
     "stylesheet",
@@ -36,8 +38,13 @@ def local_src(filename: str, snapshot_id: str) -> str:
 
 def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snapshot_id: str) -> str:
     def repl(match: re.Match) -> str:
-        quote, raw = match.group(1), match.group(2)
-        if raw.startswith("data:") or raw.startswith("#"):
+        if match.group(1) is not None:
+            quote, raw = '"', match.group(1)
+        elif match.group(2) is not None:
+            quote, raw = "'", match.group(2)
+        else:
+            quote, raw = "", match.group(3)
+        if not raw.strip() or raw.startswith("data:") or raw.startswith("#"):
             return match.group(0)
         name = lookup_resource(raw, css_url, resource_map)
         if not name:
@@ -77,8 +84,44 @@ def _rewrite_srcset(tag, attr: str, base: str, resource_map: dict[str, str], sna
     tag[attr] = ", ".join(parts)
 
 
-def freeze_html(html: str, base_url: str, resource_map: dict[str, str], snapshot_id: str) -> str:
+_SECRET_META_RE = re.compile(r"csrf|xsrf|token|nonce|authenticity|secret|session", re.I)
+# No '/', '.' or ':' in the charset, so media addresses and URLs never match.
+_OPAQUE_TOKEN_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+=-]{32,}$")
+_JWT_RE = re.compile(r"^eyJ[\w-]+\.[\w-]+\.[\w-]*$")
+_INPUT_TYPES_KEEPING_VALUE = {"submit", "button", "reset", "image", "checkbox", "radio"}
+
+
+def strip_secrets(soup) -> None:
+    """Drop what a signed-in page carries that is not article content: form
+    values, CSRF/token metas and opaque token-looking data-* values."""
+    for meta in soup.find_all("meta"):
+        name = meta.get("name") or meta.get("property") or meta.get("http-equiv") or ""
+        if isinstance(name, str) and _SECRET_META_RE.search(name):
+            meta.decompose()
+    for tag in soup.find_all(True):
+        if tag.name == "input" and tag.has_attr("value"):
+            kind = str(tag.get("type") or "text").lower()
+            if kind not in _INPUT_TYPES_KEEPING_VALUE:
+                del tag.attrs["value"]
+        for attr in list(tag.attrs):
+            value = tag.attrs[attr]
+            if not attr.startswith("data-") or not isinstance(value, str):
+                continue
+            if _OPAQUE_TOKEN_RE.match(value) or _JWT_RE.match(value):
+                del tag.attrs[attr]
+
+
+def freeze_html(
+    html: str,
+    base_url: str,
+    resource_map: dict[str, str],
+    snapshot_id: str,
+    *,
+    scrub_secrets: bool = False,
+) -> str:
     soup = BeautifulSoup(html, "lxml")
+    if scrub_secrets:
+        strip_secrets(soup)
 
     for tag in soup.find_all(["script", "noscript", "template"]):
         tag.decompose()

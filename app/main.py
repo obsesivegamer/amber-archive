@@ -48,9 +48,19 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db
-from .api import effective_status, router as api_router
+from .api import (
+    MAX_IMPORT_BODY_BYTES,
+    _read_body_capped,
+    check_import_budget,
+    claim_import_slot,
+    effective_status,
+    record_import_bytes,
+    release_import_slot,
+    router as api_router,
+)
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
-from .ingest import ingest_html, original_url_from_html, screenshot_reader
+from .import_child import TooComplex, check_complexity, ingest_in_child
+from .ingest import original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
 
 log = logging.getLogger("amber")
@@ -126,9 +136,19 @@ def _read_capture_stats(sid: str) -> dict:
         return {}
 
 
+def _allowed_extension_ids() -> set[str]:
+    raw = os.environ.get("AMBER_EXTENSION_IDS", "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    if not _allowed_extension_ids():
+        log.warning(
+            "AMBER_EXTENSION_IDS is not set: any installed Chrome extension with access to "
+            "this address may POST JSON to Amber. Set it to your extension id(s) to restrict this."
+        )
     capture.job_queue = asyncio.Queue()
     worker = asyncio.create_task(capture.worker())
     yield
@@ -185,6 +205,9 @@ async def reject_cross_site_writes(request: Request, call_next):
     origin = request.headers.get("origin")
     own_origin = origin == f"http://{request.headers.get('host', '')}"
     if origin is not None and origin.startswith("chrome-extension://"):
+        allowed_ids = _allowed_extension_ids()
+        if allowed_ids and origin[len("chrome-extension://"):].split("/")[0].lower() not in allowed_ids:
+            return _forbidden()
         # Only JSON, which forces a CORS preflight unless the extension holds
         # host permission for this address.
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -222,20 +245,53 @@ async def about(request: Request):
     return templates.TemplateResponse(request, "about.html", {})
 
 
+def _import_error(message: str) -> RedirectResponse:
+    return RedirectResponse("/?error=" + quote(message), status_code=303)
+
+
 @app.post("/import")
 async def import_html(request: Request):
-    form = await request.form()
-    upload = form.get("file")
-    url = str(form.get("url") or "").strip()
-    if upload is None or not getattr(upload, "read", None):
-        return RedirectResponse("/?error=" + quote("Choose an HTML file to import."), status_code=303)
-    raw = await upload.read()
-    if not raw:
-        return RedirectResponse("/?error=" + quote("That file was empty."), status_code=303)
-    html = raw.decode("utf-8", errors="replace")
-    if not url:
-        url = original_url_from_html(html)
-    sid = await asyncio.to_thread(ingest_html, html, url)
+    # Same guards as POST /api/import: streaming body cap, in-flight and daily
+    # limits, complexity pre-check and a killable child process.
+    try:
+        claim_import_slot()
+    except HTTPException as exc:
+        return _import_error(exc.detail)
+    try:
+        try:
+            raw_body = await _read_body_capped(request, MAX_IMPORT_BODY_BYTES)
+        except HTTPException:
+            return _import_error("That file is too large to import (12 MB limit).")
+
+        async def _replay():
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+
+        form = await Request(request.scope, _replay).form()
+        upload = form.get("file")
+        url = str(form.get("url") or "").strip()
+        if upload is None or not getattr(upload, "read", None):
+            return _import_error("Choose an HTML file to import.")
+        raw = await upload.read()
+        if not raw:
+            return _import_error("That file was empty.")
+        try:
+            check_import_budget(len(raw))
+        except HTTPException as exc:
+            return _import_error(exc.detail)
+        html = raw.decode("utf-8", errors="replace")
+        try:
+            await asyncio.to_thread(check_complexity, html)
+            if not url:
+                url = await asyncio.to_thread(original_url_from_html, html)
+            sid = await ingest_in_child(html, url, "", "")
+        except TooComplex as exc:
+            return _import_error(f"Page too complex to import: {exc}")
+        except Exception:
+            log.exception("HTML import failed")
+            return _import_error("Could not turn that HTML into a snapshot.")
+        record_import_bytes(len(raw))
+    finally:
+        release_import_slot()
     try:
         await screenshot_reader(sid)
     except Exception:
@@ -435,6 +491,7 @@ async def snapshot_reader(sid: str):
         media_type="text/html; charset=utf-8",
         headers={
             "Content-Security-Policy": (
+                "img-src 'self' data: https:; media-src 'self' data: https:; "
                 "script-src 'none'; object-src 'none'; frame-src 'none'; "
                 "base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
             ),
