@@ -36,7 +36,7 @@ FEED_MAX_BYTES = 5 * 1024 * 1024
 FEED_DEADLINE_S = 15.0
 FEED_MAX_IN_FLIGHT = 8
 FEED_MAX_WAITING = 64
-FEED_SLOT_WAIT_S = 20.0
+FEED_SLOT_WAIT_S = 8.0
 _feed_waiting = 0
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
 _FEED_TYPE_HINTS = ("xml", "rss", "atom", "text/plain", "text/html")
@@ -182,7 +182,7 @@ def _fetch_feed(raw_url: str) -> bytes:
     text = _feed_to_utf8(body, seen.get("charset"))
     if _feed_root(text) not in _FEED_ROOTS:
         raise _FeedError(502, "That address did not return a feed.")
-    return text.encode("utf-8")
+    return text.encode("utf-8", errors="replace")
 
 
 def _refuse_non_app_fetch(request: Request) -> JSONResponse | None:
@@ -225,6 +225,8 @@ async def feedproxy(request: Request, url: str = ""):
                     return _json_error(
                         429, "Too many feeds are being fetched. Try again shortly.", **{"Retry-After": "2"}
                     )
+                if await request.is_disconnected():
+                    return _json_error(499, "Client closed the request.")
                 await asyncio.sleep(0.05)
         finally:
             _feed_waiting -= 1
@@ -263,24 +265,40 @@ async def feedproxy(request: Request, url: str = ""):
 # --- homepage and sources stores ---------------------------------------------
 
 
-def _write_json_atomic(name: str, obj: dict) -> None:
+def _write_json_unlocked(name: str, obj: dict) -> None:
     data_dir = db.DATA_DIR
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    with _store_lock:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=f".{name}.", suffix=".tmp")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, data_dir / name)
+    except BaseException:
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, data_dir / name)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_json_atomic(name: str, obj: dict) -> None:
+    with _store_lock:
+        _write_json_unlocked(name, obj)
+
+
+def _put_sources(sources: list[dict], expected: str | None, updated_at: str) -> dict | None:
+    """Write the list; when `expected` is given and the stored list has a
+    different stamp, write nothing and return the stored document instead."""
+    with _store_lock:
+        if expected is not None:
+            stored = _read_json("sources.json")
+            if stored is not None and stored.get("updated_at") != expected:
+                return stored
+        _write_json_unlocked("sources.json", {"sources": sources, "updated_at": updated_at})
+    return None
 
 
 def _read_json(name: str) -> dict | None:
@@ -415,8 +433,21 @@ async def get_sources():
 async def put_sources(request: Request):
     body = await _json_body(request, MAX_SOURCES_BODY_BYTES)
     sources = _clean_sources(body.get("sources"))
+    expected = body.get("if_updated_at")
+    if expected is not None and not isinstance(expected, str):
+        raise HTTPException(400, '"if_updated_at" must be a string.')
     updated_at = _now_iso()
-    await asyncio.to_thread(_write_json_atomic, "sources.json", {"sources": sources, "updated_at": updated_at})
+    conflict = await asyncio.to_thread(_put_sources, sources, expected, updated_at)
+    if conflict is not None:
+        return JSONResponse(
+            {
+                "detail": "Sources changed on another device.",
+                "updated_at": conflict.get("updated_at"),
+                "sources": conflict.get("sources", []),
+            },
+            status_code=409,
+            headers={"Cache-Control": "no-store"},
+        )
     return JSONResponse({"count": len(sources), "updated_at": updated_at}, headers={"Cache-Control": "no-store"})
 
 
