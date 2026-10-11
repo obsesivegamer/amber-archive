@@ -61,7 +61,7 @@ from .api import (
     run_reserved_thumbnail,
 )
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
-from .import_child import TooComplex, check_complexity, ingest_in_child
+from .import_child import TooComplex, check_complexity, import_failure, ingest_in_child
 from .ingest import original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
 
@@ -146,6 +146,9 @@ def _allowed_extension_ids() -> set[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Captures and imports live in memory: any row still pending or capturing
+    # now belongs to a process that no longer exists.
+    db.fail_interrupted()
     if not _allowed_extension_ids():
         log.warning(
             "AMBER_EXTENSION_IDS is not set: any installed Chrome extension with access to "
@@ -185,21 +188,27 @@ async def reject_cross_site_writes(request: Request, call_next):
     (curl, scripts) is not a browser acting for another site and passes.
 
     GET /save?url=... is the bookmarklet's endpoint, so it stays reachable, but
-    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document):
-    <img>, fetch() and <iframe> GETs from another site are refused.
+    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document),
+    whatever Sec-Fetch-Site says: <img>, fetch(), <iframe> and stylesheet GETs
+    are refused, including ones from a snapshot served on this origin.
     """
     fetch_site = request.headers.get("sec-fetch-site")
     if request.method in {"GET", "HEAD"}:
-        if request.url.path == "/save":
+        if request.url.path in {"/save", "/save/"}:
             # Speculative loads (prefetch/prerender) send navigate+document too.
             purpose = (request.headers.get("sec-purpose", "") + request.headers.get("purpose", "")).lower()
             if "prefetch" in purpose or "prerender" in purpose:
                 return _forbidden()
-        if request.url.path == "/save" and fetch_site in {"cross-site", "same-site"}:
-            if (
-                request.headers.get("sec-fetch-mode") != "navigate"
-                or request.headers.get("sec-fetch-dest") != "document"
-            ):
+            dest = request.headers.get("sec-fetch-dest")
+            mode = request.headers.get("sec-fetch-mode")
+            # Same-origin does not make it safe: the viewer serves captured and
+            # imported markup on this origin, so an <img src="/save?...">, a
+            # stylesheet or a CSS url() there is a same-origin subresource GET.
+            # Only a top-level navigation may start a capture.
+            if any(name.startswith("sec-fetch-") for name in request.headers):
+                if mode != "navigate" or dest != "document":
+                    return _forbidden()
+            if fetch_site in {"same-origin", "same-site", "cross-site"} and dest != "document":
                 return _forbidden()
         return await call_next(request)
     if request.method == "OPTIONS":
@@ -367,7 +376,20 @@ async def job_status(job_id: str):
     if not job:
         snap = db.get_snapshot(job_id)
         if not snap:
-            raise HTTPException(404, "No such job")
+            failed = import_failure(job_id)
+            if failed is None:
+                raise HTTPException(404, "No such job")
+            return {
+                "id": job_id,
+                "snapshot_id": job_id,
+                "status": "failed",
+                "error": failed,
+                "resources": [],
+                "title": None,
+                "url": None,
+                "final_url": None,
+                "capture_stats": {},
+            }
         status = effective_status(snap)
         error = snap.get("error")
         if status == "failed" and not error:

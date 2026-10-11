@@ -2,14 +2,59 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
-from urllib.parse import urljoin, urldefrag
+from urllib.parse import urljoin, urldefrag, urlparse
 
 from bs4 import BeautifulSoup, NavigableString
+
+from .config import HOST
 
 # Possessive quantifiers: no backtracking, so a hostile stylesheet of `url(`
 # repeats or long whitespace runs stays linear.
 CSS_URL_RE = re.compile(r"""url\(\s*+(?:"([^"]*+)"|'([^']*+)'|([^'"()\s]*+))\s*+\)""", re.I)
+
+# `@import "x.css"` (string form) is not a url(...) token.
+CSS_IMPORT_RE = re.compile(r"""@import\s*+(?:"([^"]*+)"|'([^']*+)')""", re.I)
+
+_MEDIA_URL_ATTRS = ("src", "poster", "background", "lowsrc", "dynsrc", "xlink:href")
+_MEDIA_SRCSET_ATTRS = ("srcset", "imagesrcset")
+
+
+def _is_local_host(host: str) -> bool:
+    """Literal check, no DNS: names and addresses that mean this machine or LAN."""
+    host = host.lower().rstrip(".")
+    if host in {"localhost", HOST.lower()} or host.endswith(".localhost"):
+        return True
+    try:
+        return not ipaddress.ip_address(host.strip("[]")).is_global
+    except ValueError:
+        pass
+    # 2130706433, 0x7f.0.0.1, 0177.0.0.1, 127.1 ...
+    return bool(re.fullmatch(r"(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+))*", host))
+
+
+def absolute_or_drop(value: str, base: str) -> str | None:
+    """Resolve a subresource URL against the page it came from.
+
+    A root-relative `/save?...` left as written would resolve against Amber
+    when the snapshot is viewed, so it becomes https://<original host>/...
+    Anything that is not http(s) or that points at this machine is dropped
+    (None). data:, blob: and #fragment references are kept as they are.
+    """
+    v = (value or "").strip()
+    if not v or v.startswith("#") or v.lower().startswith(("data:", "blob:")):
+        return value
+    try:
+        absolute = urljoin(base, v)
+        parsed = urlparse(absolute)
+        host = parsed.hostname
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not host or _is_local_host(host):
+        return None
+    return absolute
+
 
 KEEP_LINK_RELS = {
     "stylesheet",
@@ -36,6 +81,13 @@ def local_src(filename: str, snapshot_id: str) -> str:
     return f"/{snapshot_id}/r/{filename}"
 
 
+def _css_value(raw: str, base: str, resource_map: dict[str, str], snapshot_id: str) -> str | None:
+    name = lookup_resource(raw, base, resource_map)
+    if name:
+        return local_src(name, snapshot_id)
+    return absolute_or_drop(raw, base)
+
+
 def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snapshot_id: str) -> str:
     def repl(match: re.Match) -> str:
         if match.group(1) is not None:
@@ -46,13 +98,27 @@ def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snaps
             quote, raw = "", match.group(3)
         if not raw.strip() or raw.startswith("data:") or raw.startswith("#"):
             return match.group(0)
-        name = lookup_resource(raw, css_url, resource_map)
-        if not name:
+        rewritten = _css_value(raw, css_url, resource_map, snapshot_id)
+        if rewritten is None:
+            return "url()"
+        if rewritten == raw:
             return match.group(0)
-        rewritten = local_src(name, snapshot_id)
+        if not quote and re.search(r"""[\s()'"]""", rewritten):
+            quote = '"'
+        if quote:
+            rewritten = rewritten.replace(quote, "%22" if quote == '"' else "%27")
         return f"url({quote}{rewritten}{quote})"
 
-    return CSS_URL_RE.sub(repl, css_text)
+    def import_repl(match: re.Match) -> str:
+        quote, raw = ('"', match.group(1)) if match.group(1) is not None else ("'", match.group(2))
+        if not raw.strip():
+            return match.group(0)
+        rewritten = _css_value(raw, css_url, resource_map, snapshot_id)
+        if rewritten is None:
+            return "@import url()"
+        return f"@import {quote}{rewritten.replace(quote, '%22')}{quote}"
+
+    return CSS_IMPORT_RE.sub(import_repl, CSS_URL_RE.sub(repl, css_text))
 
 
 def _rewrite_attr(tag, attr: str, base: str, resource_map: dict[str, str], snapshot_id: str) -> None:
@@ -61,9 +127,11 @@ def _rewrite_attr(tag, attr: str, base: str, resource_map: dict[str, str], snaps
         return
     if value.startswith("data:") or value.startswith("blob:"):
         return
-    name = lookup_resource(value, base, resource_map)
-    if name:
-        tag[attr] = local_src(name, snapshot_id)
+    rewritten = _css_value(value, base, resource_map, snapshot_id)
+    if rewritten is None:
+        del tag.attrs[attr]
+    elif rewritten != value:
+        tag[attr] = rewritten
 
 
 def _rewrite_srcset(tag, attr: str, base: str, resource_map: dict[str, str], snapshot_id: str) -> None:
@@ -77,11 +145,28 @@ def _rewrite_srcset(tag, attr: str, base: str, resource_map: dict[str, str], sna
             continue
         bits = item.split()
         url, rest = bits[0], bits[1:]
-        name = lookup_resource(url, base, resource_map)
-        if name:
-            url = local_src(name, snapshot_id)
+        if not url.startswith(("data:", "blob:")):
+            url = _css_value(url, base, resource_map, snapshot_id)
+            if url is None:
+                continue
         parts.append(" ".join([url, *rest]).strip())
-    tag[attr] = ", ".join(parts)
+    if parts:
+        tag[attr] = ", ".join(parts)
+    else:
+        del tag.attrs[attr]
+
+
+def rewrite_media_urls(root, base: str, resource_map: dict[str, str], snapshot_id: str) -> None:
+    """Point every subresource URL at the original site, a captured file, or nothing."""
+    for tag in root.find_all(True):
+        for attr in _MEDIA_URL_ATTRS:
+            _rewrite_attr(tag, attr, base, resource_map, snapshot_id)
+        if tag.name in {"use", "image"}:
+            _rewrite_attr(tag, "href", base, resource_map, snapshot_id)
+        for attr in _MEDIA_SRCSET_ATTRS:
+            _rewrite_srcset(tag, attr, base, resource_map, snapshot_id)
+        if "formaction" in tag.attrs:
+            del tag.attrs["formaction"]
 
 
 _SECRET_META_RE = re.compile(r"csrf|xsrf|token|nonce|authenticity|secret|session", re.I)
@@ -176,12 +261,7 @@ def freeze_html(
             continue
         _rewrite_attr(link, "href", base_url, resource_map, snapshot_id)
 
-    for tag in soup.find_all(["img", "source", "video", "audio", "track", "use"]):
-        _rewrite_attr(tag, "src", base_url, resource_map, snapshot_id)
-        _rewrite_attr(tag, "poster", base_url, resource_map, snapshot_id)
-        _rewrite_attr(tag, "href", base_url, resource_map, snapshot_id)
-        _rewrite_srcset(tag, "srcset", base_url, resource_map, snapshot_id)
-        _rewrite_srcset(tag, "imagesrcset", base_url, resource_map, snapshot_id)
+    rewrite_media_urls(soup, base_url, resource_map, snapshot_id)
 
     for tag in soup.find_all(style=True):
         tag["style"] = rewrite_css(tag["style"], base_url, resource_map, snapshot_id)

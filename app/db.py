@@ -69,6 +69,20 @@ def init_db() -> None:
         db.commit()
 
 
+def fail_interrupted() -> int:
+    """Mark rows left pending/capturing by a previous process as failed."""
+    with connect() as db:
+        cur = db.execute(
+            """
+            UPDATE snapshots
+            SET status = 'failed', error = 'Interrupted before it finished.'
+            WHERE status IN ('pending', 'capturing')
+            """
+        )
+        db.commit()
+        return cur.rowcount
+
+
 def _as_snap(row: sqlite3.Row) -> dict:
     snap = dict(row)
     flag = snap.get("paywalled")

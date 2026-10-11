@@ -396,17 +396,42 @@ _PUBLIC_SUFFIXES = frozenset(
     "co.kr or.kr co.il co.id com.my com.ph com.pk com.eg com.sa com.ng "
     "github.io gitlab.io blogspot.com herokuapp.com vercel.app netlify.app pages.dev "
     "workers.dev web.app firebaseapp.com azurewebsites.net cloudfront.net "
-    "s3.amazonaws.com appspot.com wordpress.com".split()
+    "s3.amazonaws.com appspot.com wordpress.com "
+    "substack.com medium.com wixsite.com myshopify.com tumblr.com squarespace.com "
+    "ghost.io notion.site".split()
 )
+_S3_LABEL_RE = re.compile(r"^s3(?:$|[-.].*)")
+
+
+def _punycode_host(host: str) -> str:
+    """UTS 46-ish fallback when the `idna` package is missing: NFKC and
+    lower-case, then punycode per label. Deliberately not IDNA 2003, so ß stays
+    ß (xn--zca) and does not collapse into ss."""
+    labels = []
+    for label in host.split("."):
+        if label.isascii():
+            labels.append(label)
+        else:
+            try:
+                labels.append("xn--" + label.encode("punycode").decode("ascii"))
+            except UnicodeError:
+                labels.append(label)
+    return ".".join(labels)
 
 
 def _host_key(url: str) -> str:
-    """Lower-cased IDNA (A-label) host, after NFKC so full-width forms compare equal."""
+    """Lower-cased IDNA 2008 (A-label) host, after NFKC so full-width forms compare equal."""
     host = unicodedata.normalize("NFKC", urlparse(url).hostname or "").lower().rstrip(".")
-    try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:
+    if host.isascii():
         return host
+    try:
+        import idna
+
+        return idna.encode(host, uts46=True, transitional=False).decode("ascii")
+    except ImportError:
+        return _punycode_host(host)
+    except Exception:
+        return _punycode_host(host)
 
 
 def _registrable_domain(host: str) -> str:
@@ -416,6 +441,11 @@ def _registrable_domain(host: str) -> str:
     except ValueError:
         pass
     labels = host.split(".")
+    if host.endswith(".amazonaws.com"):
+        # bucket.s3.amazonaws.com, bucket.s3.<region>.amazonaws.com,
+        # bucket.s3-<region>.amazonaws.com: the whole host names one owner.
+        if any(_S3_LABEL_RE.match(label) for label in labels[:-2]):
+            return host
     for i in range(1, len(labels)):
         if ".".join(labels[i:]) in _PUBLIC_SUFFIXES:
             return ".".join(labels[i - 1:])

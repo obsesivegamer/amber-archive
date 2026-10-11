@@ -11,6 +11,8 @@ from bs4 import BeautifulSoup
 from readability import Document
 from readability.readability import REGEXES as _READABILITY_REGEXES
 
+from .freeze import rewrite_media_urls
+
 _WS = re.compile(r"\s+")
 
 # Soft paywalls often leave only a dek / og:description. Same bit is stored on
@@ -830,6 +832,11 @@ def extract_article(html: str, url: str, *, scrub_secrets: bool = False) -> dict
         inner = art.body
         article_html = inner.decode_contents() if inner else str(art)
         article_html = sanitize_article_html(article_html)
+        # After sanitising, which promotes lazy data-src into src: nothing a
+        # page wrote may resolve against Amber's own origin when it is viewed.
+        media = BeautifulSoup(article_html, "lxml")
+        rewrite_media_urls(media, url, {}, "")
+        article_html = media.body.decode_contents() if media.body else article_html
 
     if article_html:
         article_text = BeautifulSoup(article_html, "lxml").get_text("\n", strip=True)

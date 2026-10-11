@@ -58,6 +58,26 @@ _failures: deque[float] = deque()
 _blocked_until = 0.0
 
 
+# sid -> (time, message) for imports that failed, so a client that was handed
+# the reserved id by /api/save can still read why instead of getting a 404.
+_tombstones: dict[str, tuple[float, str]] = {}
+TOMBSTONE_S = 60.0
+
+
+def _tombstone(sid: str, message: str) -> None:
+    now = time.monotonic()
+    for key in [k for k, (t, _) in _tombstones.items() if now - t > TOMBSTONE_S]:
+        del _tombstones[key]
+    _tombstones[sid] = (now, message)
+
+
+def import_failure(sid: str) -> str | None:
+    entry = _tombstones.get(sid)
+    if entry and time.monotonic() - entry[0] <= TOMBSTONE_S:
+        return entry[1]
+    return None
+
+
 def note_failure() -> None:
     """Record a child that failed or was killed; three in a minute pause imports."""
     global _blocked_until
@@ -178,11 +198,16 @@ async def ingest_in_child(
 
     def reserve() -> str:
         sid = db.allocate_id()
-        db.insert_snapshot(sid, url, _normalize(url))
+        # Before the insert, so no reader ever sees the row as an orphan.
+        importing.add(sid)
+        try:
+            db.insert_snapshot(sid, url, _normalize(url))
+        except BaseException:
+            importing.discard(sid)
+            raise
         return sid
 
     sid = await asyncio.to_thread(reserve)
-    importing.add(sid)
     header = json.dumps({"sid": sid, "url": url, "title": title, "final_url": final_url})
     payload = header.encode("utf-8") + b"\n" + html.encode("utf-8")
     env = dict(os.environ, AMBER_DATA_DIR=str(db.DATA_DIR))
@@ -214,6 +239,12 @@ async def ingest_in_child(
     except BaseException as exc:
         if isinstance(exc, (TooComplex, RuntimeError, ValueError, KeyError)):
             note_failure()
+        if isinstance(exc, TooComplex):
+            _tombstone(sid, f"Page too complex to import: {exc}")
+        elif isinstance(exc, asyncio.CancelledError):
+            _tombstone(sid, "The import was cancelled.")
+        else:
+            _tombstone(sid, "Could not turn that HTML into a snapshot.")
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
@@ -242,6 +273,14 @@ def _memory_watchdog() -> None:
 
 
 def _child_main() -> int:
+    try:
+        import signal
+
+        # If the server is killed the child's pipe goes quiet but it would
+        # otherwise run on; SIGALRM ends it a little after the parent's own kill.
+        signal.alarm(int(TIMEOUT_S) + 5)
+    except (AttributeError, ValueError):
+        pass
     try:
         import resource
 

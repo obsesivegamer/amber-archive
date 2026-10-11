@@ -6,6 +6,7 @@ from html import escape
 import re
 
 from .extract import sanitize_article_html
+from .freeze import absolute_or_drop
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z“\"])")
 AMBER_INCOMPLETE_NOTICE_PREFIX = "Incomplete — Amber extracted only a short preview."
@@ -63,7 +64,7 @@ def build_reader_html(article: dict, url: str) -> str:
             body_html = "<p></p>"
 
     initial = escape((article.get("author") or source or "?").strip()[:1].upper() or "?")
-    photo = article.get("author_image") or ""
+    photo = absolute_or_drop(article.get("author_image") or "", url) or ""
     avatar = (
         f'<img class="avatar" src="{escape(photo)}" alt="">'
         if photo
