@@ -282,6 +282,30 @@ def _check_public_peer(sock: socket.socket) -> socket.socket:
     return sock
 
 
+def _connect_before(address, timeout, source_address, deadline: float) -> socket.socket:
+    """socket.create_connection, except each address gets only what is left of
+    the fetch's budget, so a host with several silent addresses cannot hold the
+    thread for N x timeout."""
+    host, port = address
+    err: OSError | None = None
+    for family, socktype, proto, _, sockaddr in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("crawler fetch took too long")
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(min(timeout, remaining) if timeout else remaining)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            sock.settimeout(timeout)
+            return sock
+        except OSError as exc:
+            err = exc
+            sock.close()
+    raise err or OSError("getaddrinfo returned no addresses")
+
+
 class _PeerCheckedMixin:
     """Peer check on every new connection, and a per-fetch wall-clock budget.
 
@@ -293,10 +317,9 @@ class _PeerCheckedMixin:
     def __init__(self, *args, deadline: float, register, **kwargs):
         super().__init__(*args, **kwargs)
         self.timeout = max(0.05, min(self.timeout or 10.0, deadline - time.monotonic()))
-        connect = self._create_connection
 
-        def checked(*a, **kw):
-            sock = _check_public_peer(connect(*a, **kw))
+        def checked(address, timeout=None, source_address=None):
+            sock = _check_public_peer(_connect_before(address, timeout, source_address, deadline))
             register(sock)
             return sock
 
@@ -346,6 +369,7 @@ def _fetch(
     max_bytes: int,
     *,
     strict: bool = False,
+    socket_timeout: float = 10.0,
     on_response=None,
     on_first_chunk=None,
 ) -> bytes:
@@ -356,6 +380,8 @@ def _fetch(
     redirects are re-validated and proxies are ignored. A body past
     `max_bytes` is silently cut, or raises FetchTooLarge when `strict`.
     `on_response(resp)` and `on_first_chunk(bytes)` may raise to stop early.
+    `socket_timeout` is how long one connect or read may stall; `deadline`
+    still bounds the whole fetch.
     """
     req = urllib.request.Request(url, headers=headers)
     expired = threading.Event()
@@ -403,7 +429,7 @@ def _fetch(
     received = 0
     limit = max_bytes + 1 if strict else max_bytes
     try:
-        with opener.open(req, timeout=10) as resp:
+        with opener.open(req, timeout=socket_timeout) as resp:
             if on_response is not None:
                 on_response(resp)
             while received < limit:
