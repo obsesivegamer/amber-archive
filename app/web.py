@@ -8,6 +8,7 @@ proxy refuses anything that is not the app's own fetch().
 from __future__ import annotations
 
 import asyncio
+import gzip
 import http.client
 import json
 import logging
@@ -252,17 +253,20 @@ async def feedproxy(request: Request, url: str = ""):
         return _json_error(504, "The feed took too long to answer (15 s limit).")
     except _FeedError as exc:
         return _json_error(exc.status, exc.detail)
-    return Response(
-        body,
-        media_type="application/xml; charset=utf-8",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            # Feed XML can carry XHTML-namespace <script>; keep it inert if
-            # something ever navigates here.
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-        },
-    )
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        # Feed XML can carry XHTML-namespace <script>; keep it inert if
+        # something ever navigates here.
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Vary": "Accept-Encoding",
+    }
+    # A feed is 5 to 10 times smaller gzipped; a phone on a slow link otherwise
+    # misses the web app's 15 s per-feed budget when 20+ feeds load at once.
+    if "gzip" in request.headers.get("accept-encoding", "").lower():
+        body = await asyncio.to_thread(gzip.compress, body, 6)
+        headers["Content-Encoding"] = "gzip"
+    return Response(body, media_type="application/xml; charset=utf-8", headers=headers)
 
 
 # --- homepage and sources stores ---------------------------------------------
