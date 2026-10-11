@@ -117,14 +117,28 @@ _KEY_DROP_PARAMS = TRACKING_PARAMS | {
     "smid", "unlocked_article_code", "accesstoken", "sharetype", "referringsource",
     "ocid", "guccounter", "gaa_at", "gaa_n", "gaa_sig", "gaa_ts",
 }
+# Prefixes of share/tracking parameters that publishers generate per link
+# (FT appends `syn-<hash>=1`).
+_KEY_DROP_PREFIXES_BY_HOST = {
+    "ft.com": ("syn-",),
+}
 # Names that are generic elsewhere, so they only count as share/tracking
 # tokens on the publishers that use them that way.
 _KEY_DROP_PARAMS_BY_HOST = {
     "wsj.com": {"st", "reflink", "mod"},
     "ft.com": {"token", "segmentid"},
+    "washingtonpost.com": {"pwapi_token", "itid"},
     "nytimes.com": {"partner", "referringsource"},
     "theguardian.com": {"cmp"},
 }
+
+
+def _scoped_prefixes(host: str) -> tuple[str, ...]:
+    found: tuple[str, ...] = ()
+    for domain, prefixes in _KEY_DROP_PREFIXES_BY_HOST.items():
+        if host == domain or host.endswith("." + domain):
+            found += prefixes
+    return found
 
 
 def _scoped_drops(host: str) -> set[str]:
@@ -164,11 +178,13 @@ def article_match_key(url: str | None) -> str:
     path = parsed.path or "/"
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/") or "/"
-    drops = _KEY_DROP_PARAMS | _scoped_drops((parsed.hostname or "").lower().rstrip("."))
+    bare_host = (parsed.hostname or "").lower().rstrip(".")
+    drops = _KEY_DROP_PARAMS | _scoped_drops(bare_host)
+    prefixes = ("utm_",) + _scoped_prefixes(bare_host)
     pairs = sorted(
         (k, v)
         for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-        if k.lower() not in drops and not k.lower().startswith("utm_")
+        if k.lower() not in drops and not k.lower().startswith(prefixes)
     )
     query = urlencode(pairs)
     return f"{host}{path}?{query}" if query else f"{host}{path}"

@@ -168,6 +168,11 @@ async def reject_cross_site_writes(request: Request, call_next):
     """
     fetch_site = request.headers.get("sec-fetch-site")
     if request.method in {"GET", "HEAD"}:
+        if request.url.path == "/save":
+            # Speculative loads (prefetch/prerender) send navigate+document too.
+            purpose = (request.headers.get("sec-purpose", "") + request.headers.get("purpose", "")).lower()
+            if "prefetch" in purpose or "prerender" in purpose:
+                return _forbidden()
         if request.url.path == "/save" and fetch_site in {"cross-site", "same-site"}:
             if (
                 request.headers.get("sec-fetch-mode") != "navigate"

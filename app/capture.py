@@ -400,6 +400,10 @@ def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
                     break
                 chunks.append(chunk)
                 received += len(chunk)
+            # A socket cut by the deadline reads as a quiet end of file; a body
+            # that promised more bytes than arrived is a truncated fetch.
+            if expired.is_set() or (received < MAX_CRAWLER_BYTES and getattr(resp, "length", None)):
+                raise TimeoutError("crawler fetch took too long")
     except Exception as exc:
         if expired.is_set() and not isinstance(exc, TimeoutError):
             raise TimeoutError("crawler fetch took too long") from exc
