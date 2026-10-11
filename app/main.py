@@ -48,9 +48,21 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db
-from .api import effective_status, router as api_router
+from .api import (
+    MAX_IMPORT_BODY_BYTES,
+    _read_body_capped,
+    check_import_budget,
+    claim_import_slot,
+    effective_status,
+    record_import_bytes,
+    release_import_slot,
+    reserve_thumbnail,
+    router as api_router,
+    run_reserved_thumbnail,
+)
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
-from .ingest import ingest_html, original_url_from_html, screenshot_reader
+from .import_child import TooComplex, check_complexity, import_failure, ingest_in_child
+from .ingest import original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
 
 log = logging.getLogger("amber")
@@ -126,9 +138,28 @@ def _read_capture_stats(sid: str) -> dict:
         return {}
 
 
+def _allowed_extension_ids() -> set[str]:
+    raw = os.environ.get("AMBER_EXTENSION_IDS", "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Captures and imports live in memory: any row still pending or capturing
+    # now belongs to a process that no longer exists.
+    if db.hold_instance_lock():
+        db.fail_interrupted()
+    else:
+        log.warning(
+            "Another Amber process holds %s; leaving its in-flight captures alone.",
+            db.DATA_DIR / "amber.lock",
+        )
+    if not _allowed_extension_ids():
+        log.warning(
+            "AMBER_EXTENSION_IDS is not set: any installed Chrome extension with access to "
+            "this address may POST JSON to Amber. Set it to your extension id(s) to restrict this."
+        )
     capture.job_queue = asyncio.Queue()
     worker = asyncio.create_task(capture.worker())
     yield
@@ -163,28 +194,45 @@ async def reject_cross_site_writes(request: Request, call_next):
     (curl, scripts) is not a browser acting for another site and passes.
 
     GET /save?url=... is the bookmarklet's endpoint, so it stays reachable, but
-    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document):
-    <img>, fetch() and <iframe> GETs from another site are refused.
+    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document),
+    whatever Sec-Fetch-Site says: <img>, fetch(), <iframe> and stylesheet GETs
+    are refused, including ones from a snapshot served on this origin.
     """
     fetch_site = request.headers.get("sec-fetch-site")
     if request.method in {"GET", "HEAD"}:
-        if request.url.path == "/save":
+        if request.url.path in {"/save", "/save/"}:
             # Speculative loads (prefetch/prerender) send navigate+document too.
             purpose = (request.headers.get("sec-purpose", "") + request.headers.get("purpose", "")).lower()
             if "prefetch" in purpose or "prerender" in purpose:
                 return _forbidden()
-        if request.url.path == "/save" and fetch_site in {"cross-site", "same-site"}:
-            if (
-                request.headers.get("sec-fetch-mode") != "navigate"
-                or request.headers.get("sec-fetch-dest") != "document"
-            ):
+            dest = request.headers.get("sec-fetch-dest")
+            mode = request.headers.get("sec-fetch-mode")
+            # Same-origin does not make it safe: the viewer serves captured and
+            # imported markup on this origin, so an <img src="/save?...">, a
+            # stylesheet or a CSS url() there is a same-origin subresource GET.
+            # Only a top-level navigation may start a capture.
+            if any(name.startswith("sec-fetch-") for name in request.headers):
+                if mode != "navigate" or dest != "document":
+                    return _forbidden()
+            if fetch_site in {"same-origin", "same-site", "cross-site"} and dest != "document":
                 return _forbidden()
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
+    # <a ping> posts with this type and header. Amber's own pages have no use
+    # for it, and a captured page must not be able to fire a state-changing
+    # POST (such as /saved/{id}/delete) from inside the viewer's iframe.
+    if (
+        request.headers.get("content-type", "").split(";")[0].strip().lower() == "text/ping"
+        or "ping-to" in request.headers
+    ):
+        return _forbidden()
     origin = request.headers.get("origin")
     own_origin = origin == f"http://{request.headers.get('host', '')}"
     if origin is not None and origin.startswith("chrome-extension://"):
+        allowed_ids = _allowed_extension_ids()
+        if allowed_ids and origin[len("chrome-extension://"):].split("/")[0].lower() not in allowed_ids:
+            return _forbidden()
         # Only JSON, which forces a CORS preflight unless the extension holds
         # host permission for this address.
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -222,24 +270,58 @@ async def about(request: Request):
     return templates.TemplateResponse(request, "about.html", {})
 
 
+def _import_error(message: str) -> RedirectResponse:
+    return RedirectResponse("/?error=" + quote(message), status_code=303)
+
+
 @app.post("/import")
 async def import_html(request: Request):
-    form = await request.form()
-    upload = form.get("file")
-    url = str(form.get("url") or "").strip()
-    if upload is None or not getattr(upload, "read", None):
-        return RedirectResponse("/?error=" + quote("Choose an HTML file to import."), status_code=303)
-    raw = await upload.read()
-    if not raw:
-        return RedirectResponse("/?error=" + quote("That file was empty."), status_code=303)
-    html = raw.decode("utf-8", errors="replace")
-    if not url:
-        url = original_url_from_html(html)
-    sid = await asyncio.to_thread(ingest_html, html, url)
+    # Same guards as POST /api/import: streaming body cap, in-flight and daily
+    # limits, complexity pre-check and a killable child process.
     try:
-        await screenshot_reader(sid)
-    except Exception:
-        log.exception("reader screenshot failed for %s", sid)
+        claim_import_slot()
+    except HTTPException as exc:
+        return _import_error(exc.detail)
+    try:
+        try:
+            raw_body = await _read_body_capped(request, MAX_IMPORT_BODY_BYTES)
+        except HTTPException as exc:
+            if exc.status_code == 408:
+                return _import_error("The upload took too long. Try again.")
+            return _import_error("That file is too large to import (12 MB limit).")
+
+        async def _replay():
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+
+        form = await Request(request.scope, _replay).form()
+        upload = form.get("file")
+        url = str(form.get("url") or "").strip()
+        if upload is None or not getattr(upload, "read", None):
+            return _import_error("Choose an HTML file to import.")
+        raw = await upload.read()
+        if not raw:
+            return _import_error("That file was empty.")
+        try:
+            check_import_budget(len(raw))
+        except HTTPException as exc:
+            return _import_error(exc.detail)
+        # Charged before parsing and kept charged if the import fails.
+        record_import_bytes(len(raw))
+        html = raw.decode("utf-8", errors="replace")
+        try:
+            await asyncio.to_thread(check_complexity, html)
+            if not url:
+                url = await asyncio.to_thread(original_url_from_html, html)
+            sid = await ingest_in_child(html, url, "", "")
+        except TooComplex as exc:
+            return _import_error(f"Page too complex to import: {exc}")
+        except Exception:
+            log.exception("HTML import failed")
+            return _import_error("Could not turn that HTML into a snapshot.")
+    finally:
+        release_import_slot()
+    if reserve_thumbnail():
+        await run_reserved_thumbnail(sid, screenshot_reader)
     return RedirectResponse(f"/{sid}", status_code=303)
 
 
@@ -300,7 +382,20 @@ async def job_status(job_id: str):
     if not job:
         snap = db.get_snapshot(job_id)
         if not snap:
-            raise HTTPException(404, "No such job")
+            failed = import_failure(job_id)
+            if failed is None:
+                raise HTTPException(404, "No such job")
+            return {
+                "id": job_id,
+                "snapshot_id": job_id,
+                "status": "failed",
+                "error": failed,
+                "resources": [],
+                "title": None,
+                "url": None,
+                "final_url": None,
+                "capture_stats": {},
+            }
         status = effective_status(snap)
         error = snap.get("error")
         if status == "failed" and not error:
@@ -435,6 +530,9 @@ async def snapshot_reader(sid: str):
         media_type="text/html; charset=utf-8",
         headers={
             "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "img-src 'self' data: https:; media-src 'self' data: https:; "
+                "font-src 'self' data:; connect-src 'none'; "
                 "script-src 'none'; object-src 'none'; frame-src 'none'; "
                 "base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
             ),
