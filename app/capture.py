@@ -974,14 +974,14 @@ async def run_job(job_id: str) -> None:
             css_url = next((u for u, n in resource_map.items() if n == filename), final_url)
             try:
                 text = body.decode("utf-8", errors="replace")
-                text = rewrite_css(text, css_url, resource_map, sid)
+                text = await asyncio.to_thread(rewrite_css, text, css_url, resource_map, sid)
                 saved_bytes += target.write_bytes(text.encode("utf-8"))
                 continue
             except Exception:
                 pass
         saved_bytes += target.write_bytes(body)
 
-    frozen = freeze_html(html, final_url, resource_map, sid)
+    frozen = await asyncio.to_thread(freeze_html, html, final_url, resource_map, sid)
 
     (folder / "page.html").write_text(frozen, encoding="utf-8")
     (folder / "reader.html").write_text(reader, encoding="utf-8")

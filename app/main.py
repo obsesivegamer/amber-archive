@@ -148,7 +148,13 @@ async def lifespan(app: FastAPI):
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
-    db.fail_interrupted()
+    if db.hold_instance_lock():
+        db.fail_interrupted()
+    else:
+        log.warning(
+            "Another Amber process holds %s; leaving its in-flight captures alone.",
+            db.DATA_DIR / "amber.lock",
+        )
     if not _allowed_extension_ids():
         log.warning(
             "AMBER_EXTENSION_IDS is not set: any installed Chrome extension with access to "

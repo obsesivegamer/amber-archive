@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urldefrag, urlparse
 
 from bs4 import BeautifulSoup, NavigableString
 
-from .config import HOST
+from .config import HOST, ID_ALPHABET, ID_LENGTH
 
 # Possessive quantifiers: no backtracking, so a hostile stylesheet of `url(`
 # repeats or long whitespace runs stays linear.
@@ -34,6 +34,12 @@ def _is_local_host(host: str) -> bool:
     return bool(re.fullmatch(r"(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+))*", host))
 
 
+_SAVED_FILE_PATH_RE = re.compile(rf"^/[{re.escape(ID_ALPHABET)}]{{{ID_LENGTH}}}/r/")
+# scheme (optional) followed by slashes that include a backslash: browsers read
+# `\\host`, `/\host` and `https:\\host` as `//host`.
+_BACKSLASH_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?[\\/]*\\")
+
+
 def absolute_or_drop(value: str, base: str) -> str | None:
     """Resolve a subresource URL against the page it came from.
 
@@ -45,13 +51,22 @@ def absolute_or_drop(value: str, base: str) -> str | None:
     v = (value or "").strip()
     if not v or v.startswith("#") or v.lower().startswith(("data:", "blob:")):
         return value
+    if _SAVED_FILE_PATH_RE.match(v):
+        return value  # Amber's own /<id>/r/<file>; a captured file, not a page URL
+    if _BACKSLASH_AUTHORITY_RE.match(v):
+        return None
     try:
         absolute = urljoin(base, v)
         parsed = urlparse(absolute)
         host = parsed.hostname
     except ValueError:
         return None
-    if parsed.scheme not in {"http", "https"} or not host or _is_local_host(host):
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or "\\" in parsed.netloc
+        or _is_local_host(host)
+    ):
         return None
     return absolute
 
@@ -88,7 +103,28 @@ def _css_value(raw: str, base: str, resource_map: dict[str, str], snapshot_id: s
     return absolute_or_drop(raw, base)
 
 
+MAX_CSS_REWRITES = 20_000
+
+
 def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snapshot_id: str) -> str:
+    """Rewrite url(...) and @import "..." targets; work is bounded.
+
+    Repeated values are resolved once, and past MAX_CSS_REWRITES distinct
+    resolutions the remaining targets are dropped without being resolved, so a
+    hostile stylesheet costs a bounded number of urljoin calls.
+    """
+    memo: dict[str, str | None] = {}
+    budget = [MAX_CSS_REWRITES]
+
+    def resolve(raw: str) -> str | None:
+        if raw in memo:
+            return memo[raw]
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        memo[raw] = _css_value(raw, css_url, resource_map, snapshot_id)
+        return memo[raw]
+
     def repl(match: re.Match) -> str:
         if match.group(1) is not None:
             quote, raw = '"', match.group(1)
@@ -98,7 +134,7 @@ def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snaps
             quote, raw = "", match.group(3)
         if not raw.strip() or raw.startswith("data:") or raw.startswith("#"):
             return match.group(0)
-        rewritten = _css_value(raw, css_url, resource_map, snapshot_id)
+        rewritten = resolve(raw)
         if rewritten is None:
             return "url()"
         if rewritten == raw:
@@ -113,7 +149,7 @@ def rewrite_css(css_text: str, css_url: str, resource_map: dict[str, str], snaps
         quote, raw = ('"', match.group(1)) if match.group(1) is not None else ("'", match.group(2))
         if not raw.strip():
             return match.group(0)
-        rewritten = _css_value(raw, css_url, resource_map, snapshot_id)
+        rewritten = resolve(raw)
         if rewritten is None:
             return "@import url()"
         return f"@import {quote}{rewritten.replace(quote, '%22')}{quote}"
@@ -134,22 +170,62 @@ def _rewrite_attr(tag, attr: str, base: str, resource_map: dict[str, str], snaps
         tag[attr] = rewritten
 
 
+_SRCSET_SPACE = " \t\n\r\f"
+
+
+def parse_srcset(value: str) -> list[tuple[str, str]]:
+    """Split a srcset into (url, descriptor) candidates the way browsers do.
+
+    The URL is everything up to the next whitespace, so commas inside it
+    (`w_120,c_limit/a.jpg`, `width=1024,quality=80/...`, `data:image/png;base64,...`)
+    stay put. A URL that ends in commas has no descriptor; otherwise the
+    descriptor runs to the next comma outside parentheses.
+    """
+    candidates: list[tuple[str, str]] = []
+    pos, n = 0, len(value)
+    while True:
+        while pos < n and (value[pos] in _SRCSET_SPACE or value[pos] == ","):
+            pos += 1
+        if pos >= n:
+            return candidates
+        start = pos
+        while pos < n and value[pos] not in _SRCSET_SPACE:
+            pos += 1
+        url = value[start:pos]
+        if url.endswith(","):
+            candidates.append((url.rstrip(","), ""))
+            continue
+        dstart, depth = pos, 0
+        while pos < n:
+            ch = value[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth:
+                depth -= 1
+            elif ch == "," and not depth:
+                break
+            pos += 1
+        candidates.append((url, " ".join(value[dstart:pos].split())))
+
+
 def _rewrite_srcset(tag, attr: str, base: str, resource_map: dict[str, str], snapshot_id: str) -> None:
     value = tag.get(attr)
     if not value or not isinstance(value, str):
         return
     parts = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        bits = item.split()
-        url, rest = bits[0], bits[1:]
+    changed = False
+    for url, descriptor in parse_srcset(value):
         if not url.startswith(("data:", "blob:")):
-            url = _css_value(url, base, resource_map, snapshot_id)
-            if url is None:
+            rewritten = _css_value(url, base, resource_map, snapshot_id)
+            if rewritten is None:
+                changed = True
                 continue
-        parts.append(" ".join([url, *rest]).strip())
+            if rewritten != url:
+                changed = True
+                url = rewritten
+        parts.append(f"{url} {descriptor}".strip())
+    if not changed:
+        return
     if parts:
         tag[attr] = ", ".join(parts)
     else:

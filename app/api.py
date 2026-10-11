@@ -604,7 +604,11 @@ async def import_page(request: Request):
             try:
                 final = await asyncio.to_thread(validate_public_http_url, final_raw)
             except ValueError as exc:
-                raise HTTPException(400, f"final_url: {exc}") from exc
+                message = str(exc)
+                if message.startswith(("Private or local", "Local URLs", "Numeric hosts")):
+                    # Stable strings: the extension maps these distinctly.
+                    raise HTTPException(400, "final_url is a private or local address") from exc
+                raise HTTPException(400, f"final_url: {message}") from exc
             if not _same_site(clean, final):
                 raise HTTPException(400, "final_url is a different site")
 
