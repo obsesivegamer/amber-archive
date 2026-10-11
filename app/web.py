@@ -62,6 +62,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _stamp_iso() -> str:
+    """Version stamp for a stored list: microseconds, so two writes in one second differ."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _json_error(status: int, detail: str, **headers: str) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=status, headers=headers or None)
 
@@ -225,8 +230,6 @@ async def feedproxy(request: Request, url: str = ""):
                     return _json_error(
                         429, "Too many feeds are being fetched. Try again shortly.", **{"Retry-After": "2"}
                     )
-                if await request.is_disconnected():
-                    return _json_error(499, "Client closed the request.")
                 await asyncio.sleep(0.05)
         finally:
             _feed_waiting -= 1
@@ -436,7 +439,7 @@ async def put_sources(request: Request):
     expected = body.get("if_updated_at")
     if expected is not None and not isinstance(expected, str):
         raise HTTPException(400, '"if_updated_at" must be a string.')
-    updated_at = _now_iso()
+    updated_at = _stamp_iso()
     conflict = await asyncio.to_thread(_put_sources, sources, expected, updated_at)
     if conflict is not None:
         return JSONResponse(
