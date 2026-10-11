@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 MIME_BY_EXT = {
@@ -47,7 +48,7 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db
-from .api import router as api_router
+from .api import effective_status, router as api_router
 from .config import HOST, ID_ALPHABET, ID_LENGTH, PORT, ROOT
 from .ingest import ingest_html, original_url_from_html, screenshot_reader
 from .security import normalize_url, validate_public_http_url
@@ -148,6 +149,55 @@ app = FastAPI(
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", HOST}
 if os.environ.get("AMBER_ALLOW_TESTSERVER"):
     ALLOWED_HOSTS.add("testserver")
+
+
+def _forbidden() -> JSONResponse:
+    return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
+
+
+async def reject_cross_site_writes(request: Request, call_next):
+    """Refuse state-changing requests that a web page on another site started.
+
+    Browsers attach Sec-Fetch-Site to every request and Origin to every
+    cross-site POST, and a web page cannot forge either. A request with neither
+    (curl, scripts) is not a browser acting for another site and passes.
+
+    GET /save?url=... is the bookmarklet's endpoint, so it stays reachable, but
+    only as a top-level navigation (Sec-Fetch-Mode: navigate, Dest: document):
+    <img>, fetch() and <iframe> GETs from another site are refused.
+    """
+    fetch_site = request.headers.get("sec-fetch-site")
+    if request.method in {"GET", "HEAD"}:
+        if request.url.path == "/save":
+            # Speculative loads (prefetch/prerender) send navigate+document too.
+            purpose = (request.headers.get("sec-purpose", "") + request.headers.get("purpose", "")).lower()
+            if "prefetch" in purpose or "prerender" in purpose:
+                return _forbidden()
+        if request.url.path == "/save" and fetch_site in {"cross-site", "same-site"}:
+            if (
+                request.headers.get("sec-fetch-mode") != "navigate"
+                or request.headers.get("sec-fetch-dest") != "document"
+            ):
+                return _forbidden()
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    origin = request.headers.get("origin")
+    own_origin = origin == f"http://{request.headers.get('host', '')}"
+    if origin is not None and origin.startswith("chrome-extension://"):
+        # Only JSON, which forces a CORS preflight unless the extension holds
+        # host permission for this address.
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            return _forbidden()
+    elif not (own_origin or fetch_site == "same-origin"):
+        if origin is not None or fetch_site in {"cross-site", "same-site"}:
+            return _forbidden()
+    return await call_next(request)
+
+
+# Added before TrustedHostMiddleware so the Host header is validated first.
+app.add_middleware(BaseHTTPMiddleware, dispatch=reject_cross_site_writes)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
@@ -219,22 +269,13 @@ async def save(request: Request):
             {"url": clean, "existing": existing},
         )
 
-    sid = db.allocate_id()
-    job_id = sid
-    db.insert_snapshot(sid, clean, normalized)
-    capture.jobs[job_id] = {
-        "id": job_id,
-        "snapshot_id": sid,
-        "url": clean,
-        "status": "queued",
-        "resources": [],
-        "error": None,
-        "title": None,
-        "final_url": None,
-        "capture_stats": capture.empty_capture_stats(),
-    }
-    assert capture.job_queue is not None
-    await capture.job_queue.put(job_id)
+    try:
+        job_id = capture.enqueue_capture(clean, normalized)
+    except capture.QueueFull:
+        return RedirectResponse(
+            "/?error=" + quote("Too many saves are already queued. Try again shortly."),
+            status_code=303,
+        )
     return RedirectResponse(f"/saving/{job_id}", status_code=303)
 
 
@@ -260,11 +301,15 @@ async def job_status(job_id: str):
         snap = db.get_snapshot(job_id)
         if not snap:
             raise HTTPException(404, "No such job")
+        status = effective_status(snap)
+        error = snap.get("error")
+        if status == "failed" and not error:
+            error = "Capture was interrupted before it finished."
         return {
             "id": job_id,
             "snapshot_id": job_id,
-            "status": snap["status"],
-            "error": snap.get("error"),
+            "status": status,
+            "error": error,
             "resources": [],
             "title": snap.get("title"),
             "url": snap.get("url"),
@@ -388,7 +433,13 @@ async def snapshot_reader(sid: str):
     return FileResponse(
         path,
         media_type="text/html; charset=utf-8",
-        headers={"X-Content-Type-Options": "nosniff"},
+        headers={
+            "Content-Security-Policy": (
+                "script-src 'none'; object-src 'none'; frame-src 'none'; "
+                "base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -407,7 +458,8 @@ async def snapshot_raw(sid: str):
             "Content-Security-Policy": (
                 "default-src 'none'; img-src 'self' data:; "
                 "style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; "
-                "font-src 'self' data:; media-src 'self' data:; frame-src 'none'; script-src 'none';"
+                "font-src 'self' data:; media-src 'self' data:; frame-src 'none'; script-src 'none'; "
+                "object-src 'none'; base-uri 'none'; form-action 'none'; " + DOCUMENT_SANDBOX
             ),
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "SAMEORIGIN",
@@ -440,6 +492,40 @@ async def snapshot_thumb(sid: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+# Stored resources are third-party bytes served on Amber's origin. Only types a
+# browser renders passively are shown inline; everything else (including any
+# .html/.js/.xml an older capture stored by URL suffix) is a download. The
+# sandbox CSP keeps even an SVG with script from running as a document here.
+_INLINE_RESOURCE_TYPES = {
+    ".css": "text/css",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".tiff": "image/tiff",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".eot": "application/vnd.ms-fontobject",
+}
+RESOURCE_CSP = (
+    "sandbox; default-src 'none'; img-src 'self' data:; "
+    "style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+)
+# Same sandbox the viewer iframes use (no scripts), for captured markup that
+# can also be opened as a top-level page.
+DOCUMENT_SANDBOX = (
+    "sandbox allow-same-origin allow-popups allow-popups-to-escape-sandbox "
+    "allow-top-navigation-by-user-activation"
+)
+
+
 @app.get("/{sid}/r/{filename}")
 async def snapshot_resource(sid: str, filename: str):
     if not ID_RE.fullmatch(sid):
@@ -449,10 +535,16 @@ async def snapshot_resource(sid: str, filename: str):
     path = db.snap_dir(sid) / "res" / filename
     if not path.exists():
         raise HTTPException(404, "Missing resource")
+    inline_type = _INLINE_RESOURCE_TYPES.get(Path(filename).suffix.lower())
     return FileResponse(
         path,
-        media_type=mime_for_filename(filename),
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        media_type=inline_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": "inline" if inline_type else "attachment",
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Security-Policy": RESOURCE_CSP,
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

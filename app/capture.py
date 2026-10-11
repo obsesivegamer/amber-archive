@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import http.client
 import io
 import logging
-import mimetypes
+import os
+import socket
+import threading
 import time
 import traceback
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -39,9 +42,19 @@ from .freeze import freeze_html, rewrite_css
 from .reader import build_reader_html
 from .security import (
     _is_public_ip,
+    article_match_key,
     validate_public_http_request_url,
     validate_public_http_url,
 )
+
+MAX_QUEUED_JOBS = 10
+# Local Network Access checks (a page Chromium treats as public cannot reach
+# loopback or private addresses) are on by default in the Chromium Playwright
+# ships. Passing --enable-features here would replace Playwright's own
+# --enable-features list, so the default is relied on; see the README.
+CHROMIUM_ARGS = ["--disable-blink-features=AutomationControlled"]
+MAX_CRAWLER_BYTES = 8 * 1024 * 1024
+CRAWLER_DEADLINE_S = 30.0
 
 jobs: dict[str, dict] = {}
 job_queue: asyncio.Queue[str] | None = None
@@ -74,6 +87,11 @@ EXT_FOR_TYPE = {
     "font/otf": ".otf",
     "application/font-woff": ".woff",
     "application/font-woff2": ".woff2",
+    "application/x-font-woff": ".woff",
+    "application/x-font-ttf": ".ttf",
+    "application/vnd.ms-fontobject": ".eot",
+    "image/apng": ".png",
+    "image/tiff": ".tiff",
 }
 
 CLEAN_PAGE_JS = """
@@ -215,15 +233,13 @@ def _should_block(url: str) -> bool:
 
 
 def _ext_for(content_type: str, url: str) -> str:
+    """Stored extension comes from the response MIME type only.
+
+    The URL suffix is attacker-controlled: a response typed image/x-evil from
+    /a.html must not become an .html file that a browser would execute.
+    """
     mime = (content_type or "").split(";")[0].strip().lower()
-    if mime in EXT_FOR_TYPE:
-        return EXT_FOR_TYPE[mime]
-    guessed = mimetypes.guess_extension(mime) if mime else None
-    if guessed:
-        return guessed
-    path = urlparse(url).path
-    suffix = Path(path).suffix
-    return suffix if suffix and len(suffix) < 8 else ".bin"
+    return EXT_FOR_TYPE.get(mime, ".bin")
 
 
 def _should_save(content_type: str) -> bool:
@@ -238,12 +254,90 @@ def log_resource(job: dict, **entry) -> None:
 
 
 class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, deadline: float):
+        self._deadline = deadline
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("crawler fetch took too long")
         url = validate_public_http_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, url)
 
 
-def _http_get(url: str, user_agent: str) -> str:
+def _check_public_peer(sock: socket.socket) -> socket.socket:
+    """Refuse a connection whose peer is not a public IP, before any byte is sent.
+
+    The URL was validated against one DNS answer; the connection may have
+    resolved to another (rebinding). The peer address is what really counts.
+    """
+    try:
+        peer_ip = sock.getpeername()[0]
+        ok = _is_public_ip(peer_ip.split("%")[0])
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        sock.close()
+        raise ValueError("Private or local network URLs cannot be archived.")
+    return sock
+
+
+class _PeerCheckedMixin:
+    """Peer check on every new connection, and a per-fetch wall-clock budget.
+
+    `deadline` bounds the connect; `register` receives every raw socket so a
+    timer can shut it down mid-handshake or mid-headers, which a per-recv
+    socket timeout cannot do against a slow drip.
+    """
+
+    def __init__(self, *args, deadline: float, register, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timeout = max(0.05, min(self.timeout or 10.0, deadline - time.monotonic()))
+        connect = self._create_connection
+
+        def checked(*a, **kw):
+            sock = _check_public_peer(connect(*a, **kw))
+            register(sock)
+            return sock
+
+        self._create_connection = checked
+
+
+class _PublicHTTPConnection(_PeerCheckedMixin, http.client.HTTPConnection):
+    pass
+
+
+class _PublicHTTPSConnection(_PeerCheckedMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, **conn_args):
+        super().__init__()
+        self._conn_args = conn_args
+
+    def http_open(self, req):
+        return self.do_open(
+            functools.partial(_PublicHTTPConnection, **self._conn_args), req
+        )
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, **conn_args):
+        super().__init__()
+        self._conn_args = conn_args
+
+    def https_open(self, req):
+        return self.do_open(
+            functools.partial(_PublicHTTPSConnection, **self._conn_args),
+            req,
+            context=self._context,
+        )
+
+
+def _http_get(url: str, user_agent: str, deadline: float | None = None) -> str:
+    """Fetch HTML within one wall-clock budget covering connect, TLS, headers and body."""
+    if deadline is None:
+        deadline = time.monotonic() + CRAWLER_DEADLINE_S
     req = urllib.request.Request(
         validate_public_http_url(url),
         headers={
@@ -253,15 +347,86 @@ def _http_get(url: str, user_agent: str) -> str:
             "Referer": "https://www.google.com/",
         },
     )
-    opener = urllib.request.build_opener(_PublicRedirectHandler())
-    with opener.open(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    expired = threading.Event()
+    lock = threading.Lock()
+    shutdowns: list[socket.socket] = []
+
+    def register(sock: socket.socket) -> None:
+        # A duplicate descriptor survives TLS wrapping (which detaches `sock`)
+        # and shutdown() on it ends the same connection.
+        dup = socket.socket(fileno=os.dup(sock.fileno()))
+        with lock:
+            shutdowns.append(dup)
+            late = expired.is_set()
+        if late:
+            _shutdown(dup)
+
+    def _shutdown(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def expire() -> None:
+        expired.set()
+        with lock:
+            for sock in shutdowns:
+                _shutdown(sock)
+
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+    timer.daemon = True
+    timer.start()
+    # No ProxyHandler: the peer check must see the publisher, not a proxy.
+    opener = urllib.request.OpenerDirector()
+    conn_args = {"deadline": deadline, "register": register}
+    for handler in (
+        urllib.request.UnknownHandler(),
+        _PublicHTTPHandler(**conn_args),
+        _PublicHTTPSHandler(**conn_args),
+        _PublicRedirectHandler(deadline),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    chunks: list[bytes] = []
+    received = 0
+    try:
+        with opener.open(req, timeout=10) as resp:
+            while received < MAX_CRAWLER_BYTES:
+                if expired.is_set() or time.monotonic() > deadline:
+                    raise TimeoutError("crawler fetch took too long")
+                chunk = resp.read1(min(65536, MAX_CRAWLER_BYTES - received))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+            # A socket cut by the deadline reads as a quiet end of file; a body
+            # that promised more bytes than arrived is a truncated fetch.
+            if expired.is_set() or (received < MAX_CRAWLER_BYTES and getattr(resp, "length", None)):
+                raise TimeoutError("crawler fetch took too long")
+    except Exception as exc:
+        if expired.is_set() and not isinstance(exc, TimeoutError):
+            raise TimeoutError("crawler fetch took too long") from exc
+        raise
+    finally:
+        timer.cancel()
+        with lock:
+            for sock in shutdowns:
+                sock.close()
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 async def fetch_crawler_html(url: str) -> str | None:
+    # One budget for both user-agent attempts together.
+    deadline = time.monotonic() + CRAWLER_DEADLINE_S
     for ua in (GOOGLEBOT_UA, USER_AGENT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            html = await asyncio.to_thread(_http_get, url, ua)
+            html = await asyncio.wait_for(
+                asyncio.to_thread(_http_get, url, ua, deadline), remaining + 0.5
+            )
         except Exception:
             continue
         if html and len(html) > 2000 and "Attention Required" not in html:
@@ -547,20 +712,34 @@ async def _capture_visit(
         status = response.status
         ctype = response.headers.get("content-type", "")
         try:
+            declared = int(response.headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        mime = (ctype or "").split(";")[0]
+        if status >= 400 or not _should_save(ctype):
+            # Not stored, so the body is never pulled into this process.
+            log_resource(job, url=req_url, status=status, mime=mime, size=declared)
+            return
+        # Chunked or understated Content-Length: ask the browser for the real
+        # transferred size (after the response finishes) before fetching a body.
+        try:
+            sizes = await asyncio.wait_for(response.request.sizes(), 30)
+            wire_size = int(sizes.get("responseBodySize") or 0)
+        except Exception:
+            blocked_resources += 1
+            log_resource(job, url=req_url, status=status, mime=mime, size=declared)
+            return
+        if max(declared, wire_size) > MAX_RESOURCE_BYTES:
+            blocked_resources += 1
+            log_resource(job, url=req_url, status=status, mime=mime, size=max(declared, wire_size))
+            return
+        try:
             body = await response.body()
         except Exception:
             body = b""
         size = len(body)
-        log_resource(
-            job,
-            url=req_url,
-            status=status,
-            mime=(ctype or "").split(";")[0],
-            size=size,
-        )
-        if status >= 400 or not body:
-            return
-        if not _should_save(ctype):
+        log_resource(job, url=req_url, status=status, mime=mime, size=size)
+        if not body:
             return
         try:
             server_addr = await response.server_addr()
@@ -629,6 +808,52 @@ async def _capture_visit(
     )
 
 
+class QueueFull(Exception):
+    """Too many captures are already waiting; try again shortly."""
+
+
+def in_flight_job(url: str) -> dict | None:
+    key = article_match_key(url)
+    if not key:
+        return None
+    for job in jobs.values():
+        if job["status"] not in {"queued", "capturing"}:
+            continue
+        if key in (article_match_key(job["url"]), article_match_key(job.get("final_url"))):
+            return job
+    return None
+
+
+def enqueue_capture(url: str, url_normalized: str) -> str:
+    """Create a snapshot row and queue its capture; returns the job (= snapshot) id.
+
+    Synchronous on purpose: the in-flight check and the enqueue cannot be split
+    by another request. A URL already queued or capturing returns that job's id
+    instead of a second capture. Raises QueueFull past MAX_QUEUED_JOBS waiting.
+    """
+    assert job_queue is not None
+    existing = in_flight_job(url)
+    if existing:
+        return existing["id"]
+    if job_queue.qsize() >= MAX_QUEUED_JOBS:
+        raise QueueFull
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, url, url_normalized)
+    jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "url": url,
+        "status": "queued",
+        "resources": [],
+        "error": None,
+        "title": None,
+        "final_url": None,
+        "capture_stats": empty_capture_stats(),
+    }
+    job_queue.put_nowait(sid)
+    return sid
+
+
 async def worker() -> None:
     assert job_queue is not None
     while True:
@@ -678,7 +903,7 @@ async def run_job(job_id: str) -> None:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=CHROMIUM_ARGS,
         )
         try:
             visit = await _capture_visit(browser, job, url)
