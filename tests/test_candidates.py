@@ -376,6 +376,73 @@ def test_match_key_index_upgrades_to_unique(tmp_data):
     assert [row["id"] for row in db.list_gift_candidates()] == ["abcdefg3"]
 
 
+def test_unique_index_upgrade_merges_the_older_click(tmp_data):
+    """A pre-fix file can hold two rows for one key. The older one has the history."""
+    with db.connect() as conn:
+        conn.execute("DROP INDEX idx_candidates_match_key")
+        conn.execute("CREATE INDEX idx_candidates_match_key ON candidates(match_key)")
+        conn.execute(
+            """
+            INSERT INTO candidates (
+                id, unlock_url, canonical_url, match_key, publisher, title,
+                source_url, source_author, found_at, expires_at,
+                expires_estimated, dismissed_at, clicked_at, snapshot_id, created_at
+            ) VALUES
+            (
+                'clicked1', 'http://93.184.216.34/dup', 'http://93.184.216.34/canon',
+                '93.184.216.34/dup', 'nyt', 'Cities after the storm',
+                NULL, NULL, '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z',
+                0, '2026-01-04T00:00:00Z', '2026-01-03T00:00:00Z', 'K7mQp',
+                '2026-01-01T00:00:00Z'
+            ),
+            (
+                'bare2222', 'http://93.184.216.34/dup', NULL,
+                '93.184.216.34/dup', 'nyt', NULL,
+                'http://8.8.8.8/post/1', '@ada', '2026-01-01T00:00:00Z',
+                '2026-01-02T00:00:00Z',
+                1, NULL, '2026-01-05T00:00:00Z', NULL,
+                '2026-01-02T00:00:00Z'
+            ),
+            (
+                'otherrow', 'http://93.184.216.34/other', NULL,
+                '93.184.216.34/other', 'wsj', 'Other',
+                NULL, NULL, '2026-01-01T00:00:00Z', '2026-01-03T00:00:00Z',
+                1, NULL, NULL, NULL,
+                '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.commit()
+    db.init_db()
+    rows = {row["match_key"]: row for row in db.list_gift_candidates()}
+    assert set(rows) == {"93.184.216.34/dup", "93.184.216.34/other"}
+    kept = rows["93.184.216.34/dup"]
+    assert kept["clicked_at"] == "2026-01-03T00:00:00Z"
+    assert kept["dismissed_at"] == "2026-01-04T00:00:00Z"
+    assert kept["snapshot_id"] == "K7mQp"
+    assert kept["canonical_url"] == "http://93.184.216.34/canon"
+    assert kept["title"] == "Cities after the storm"
+    assert kept["expires_at"] == "2026-02-01T00:00:00Z"
+    assert kept["expires_estimated"] is False
+    assert kept["source_url"] == "http://8.8.8.8/post/1"
+    assert kept["source_author"] == "@ada"
+    other = rows["93.184.216.34/other"]
+    assert other["id"] == "otherrow"
+    assert other["title"] == "Other"
+    assert other["clicked_at"] is None
+    with db.connect() as conn:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_candidates_match_key'"
+        ).fetchone()["sql"]
+    assert "UNIQUE" in sql.upper()
+    db.init_db()
+    assert {row["id"] for row in db.list_gift_candidates()} == {kept["id"], "otherrow"}
+    again = db.get_gift_candidate(kept["id"])
+    assert again["snapshot_id"] == "K7mQp"
+    assert again["clicked_at"] == "2026-01-03T00:00:00Z"
+    assert again["dismissed_at"] == "2026-01-04T00:00:00Z"
+
+
 def test_referrer_retry_is_off_for_a_gift_job():
     assert _should_referrer_retry({"skip_referrer_bounce": True}, {"paywalled": True}) is False
     assert _should_referrer_retry({}, {"paywalled": True}) is True

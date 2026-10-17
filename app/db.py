@@ -130,12 +130,128 @@ def _index_sql(db: sqlite3.Connection, name: str) -> str:
     return row["sql"]
 
 
+def _blank(value: object) -> bool:
+    return value is None or value == ""
+
+
+def _merge_candidate_group(rows: list[sqlite3.Row]) -> tuple[sqlite3.Row, dict]:
+    """Fold duplicate rows into the newest one's id.
+
+    Blank fields take a non-null value from an older copy. A click and a
+    dismissal keep the earliest timestamp, a snapshot id keeps any non-null
+    value, and the expiry keeps the later deadline (with that row's
+    estimated flag).
+    """
+    survivor = max(rows, key=lambda row: row["rowid"])
+    merged = {key: survivor[key] for key in survivor.keys() if key != "rowid"}
+
+    def prefer_non_null(field: str) -> None:
+        if not _blank(merged.get(field)):
+            return
+        for row in rows:
+            if not _blank(row[field]):
+                merged[field] = row[field]
+                return
+
+    for field in (
+        "unlock_url",
+        "canonical_url",
+        "publisher",
+        "title",
+        "source_url",
+        "source_author",
+        "found_at",
+        "created_at",
+    ):
+        prefer_non_null(field)
+
+    for field in ("clicked_at", "dismissed_at"):
+        stamps = [row[field] for row in rows if not _blank(row[field])]
+        if stamps:
+            merged[field] = min(stamps)
+
+    if _blank(merged.get("snapshot_id")):
+        for row in rows:
+            if not _blank(row["snapshot_id"]):
+                merged["snapshot_id"] = row["snapshot_id"]
+                break
+
+    best_expires = None
+    best_estimated = None
+    for row in rows:
+        expires = row["expires_at"]
+        if _blank(expires):
+            continue
+        estimated = row["expires_estimated"]
+        if best_expires is None or expires > best_expires:
+            best_expires = expires
+            best_estimated = estimated
+        elif expires == best_expires and not estimated and best_estimated:
+            best_estimated = estimated
+    if best_expires is not None:
+        merged["expires_at"] = best_expires
+        if best_estimated is not None:
+            merged["expires_estimated"] = 1 if best_estimated else 0
+    return survivor, merged
+
+
+_MERGED_CANDIDATE_COLUMNS = (
+    "unlock_url",
+    "canonical_url",
+    "publisher",
+    "title",
+    "source_url",
+    "source_author",
+    "found_at",
+    "expires_at",
+    "expires_estimated",
+    "dismissed_at",
+    "clicked_at",
+    "snapshot_id",
+    "created_at",
+)
+
+
+def _merge_duplicate_candidates(db: sqlite3.Connection) -> None:
+    """One row per match key, keeping every non-null fact from the copies."""
+    keys = db.execute(
+        """
+        SELECT match_key FROM candidates
+        WHERE match_key IS NOT NULL
+        GROUP BY match_key
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for (match_key,) in keys:
+        rows = db.execute(
+            "SELECT rowid, * FROM candidates WHERE match_key = ? ORDER BY rowid",
+            (match_key,),
+        ).fetchall()
+        if len(rows) < 2:
+            continue
+        survivor, merged = _merge_candidate_group(rows)
+        assignments = ", ".join(f"{name} = ?" for name in _MERGED_CANDIDATE_COLUMNS)
+        values = [merged[name] for name in _MERGED_CANDIDATE_COLUMNS]
+        values.append(survivor["id"])
+        db.execute(
+            f"UPDATE candidates SET {assignments} WHERE id = ?",
+            values,
+        )
+        drop_ids = [row["id"] for row in rows if row["id"] != survivor["id"]]
+        placeholders = ", ".join("?" for _ in drop_ids)
+        db.execute(
+            f"DELETE FROM candidates WHERE id IN ({placeholders})",
+            drop_ids,
+        )
+
+
 def _ensure_candidates_match_index(db: sqlite3.Connection) -> None:
     """One row per match key, including expired and dismissed rows.
 
     A repeat find refreshes that row instead of inserting another live one.
     The first version of this table used a non-unique index. Upgrade it once,
-    under a write lock, and do not drop it again once it is unique.
+    under a write lock, and do not drop it again once it is unique. Duplicate
+    rows are merged before the unique index is built.
     """
     if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
         return
@@ -148,19 +264,8 @@ def _ensure_candidates_match_index(db: sqlite3.Connection) -> None:
         if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
             db.commit()
             return
+        _merge_duplicate_candidates(db)
         if _index_sql(db, "idx_candidates_match_key"):
-            # Keep the newest row when an older file already has duplicates.
-            db.execute(
-                """
-                DELETE FROM candidates
-                WHERE match_key IS NOT NULL
-                  AND rowid NOT IN (
-                      SELECT MAX(rowid) FROM candidates
-                      WHERE match_key IS NOT NULL
-                      GROUP BY match_key
-                  )
-                """
-            )
             db.execute("DROP INDEX idx_candidates_match_key")
         db.execute(
             "CREATE UNIQUE INDEX idx_candidates_match_key ON candidates(match_key)"
