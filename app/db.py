@@ -43,6 +43,28 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# 8 characters, not the 5-character snapshot id, so a candidate route cannot
+# collide with a snapshot route. Same alphabet as snapshot ids.
+GIFT_CANDIDATE_ID_LENGTH = 8
+
+_CANDIDATE_ADD_COLUMNS = (
+    ("unlock_url", "TEXT"),
+    ("canonical_url", "TEXT"),
+    ("match_key", "TEXT"),
+    ("publisher", "TEXT"),
+    ("title", "TEXT"),
+    ("source_url", "TEXT"),
+    ("source_author", "TEXT"),
+    ("found_at", "TEXT"),
+    ("expires_at", "TEXT"),
+    ("expires_estimated", "INTEGER"),
+    ("dismissed_at", "TEXT"),
+    ("clicked_at", "TEXT"),
+    ("snapshot_id", "TEXT"),
+    ("created_at", "TEXT"),
+)
+
+
 def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
     cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
     if "paywalled" not in cols:
@@ -60,12 +82,53 @@ def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_candidates_table(db: sqlite3.Connection) -> None:
+    """Add the gift-candidate queue. Safe to run on every startup and from the CLI.
+
+    Same approach as ``_ensure_paywalled_column``: create the table when it is
+    missing, then add any column an older file does not have yet. There is no
+    ``status`` column. Live, saved, expired and dismissed are derived on read.
+    """
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidates (
+            id TEXT PRIMARY KEY,
+            unlock_url TEXT NOT NULL,
+            canonical_url TEXT,
+            match_key TEXT NOT NULL,
+            publisher TEXT NOT NULL,
+            title TEXT,
+            source_url TEXT,
+            source_author TEXT,
+            found_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            expires_estimated INTEGER NOT NULL DEFAULT 1,
+            dismissed_at TEXT,
+            clicked_at TEXT,
+            snapshot_id TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cols = {row[1] for row in db.execute("PRAGMA table_info(candidates)")}
+    for name, decl in _CANDIDATE_ADD_COLUMNS:
+        if name not in cols:
+            db.execute(f"ALTER TABLE candidates ADD COLUMN {name} {decl}")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidates_match_key ON candidates(match_key)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidates_expires ON candidates(expires_at)"
+    )
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SNAPS_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript(SCHEMA)
         _ensure_paywalled_column(db)
+        _ensure_candidates_table(db)
         db.commit()
 
 
@@ -287,6 +350,118 @@ def delete_snapshot(sid: str) -> bool:
 
 def snap_dir(sid: str) -> Path:
     return SNAPS_DIR / sid
+
+
+def _as_candidate(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["expires_estimated"] = bool(item.get("expires_estimated"))
+    return item
+
+
+_CANDIDATE_UPDATABLE = {
+    "unlock_url",
+    "canonical_url",
+    "match_key",
+    "publisher",
+    "title",
+    "source_url",
+    "source_author",
+    "found_at",
+    "expires_at",
+    "expires_estimated",
+    "dismissed_at",
+    "clicked_at",
+    "snapshot_id",
+}
+
+
+def insert_gift_candidate(
+    *,
+    unlock_url: str,
+    canonical_url: str | None,
+    match_key: str,
+    publisher: str,
+    title: str | None,
+    source_url: str | None,
+    source_author: str | None,
+    found_at: str,
+    expires_at: str,
+    expires_estimated: bool,
+) -> dict:
+    created_at = now_iso()
+    estimated = 1 if expires_estimated else 0
+    with connect() as conn:
+        for _ in range(32):
+            cid = "".join(secrets.choice(ID_ALPHABET) for _ in range(GIFT_CANDIDATE_ID_LENGTH))
+            if conn.execute("SELECT 1 FROM candidates WHERE id = ?", (cid,)).fetchone():
+                continue
+            conn.execute(
+                """
+                INSERT INTO candidates (
+                    id, unlock_url, canonical_url, match_key, publisher, title,
+                    source_url, source_author, found_at, expires_at,
+                    expires_estimated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cid,
+                    unlock_url,
+                    canonical_url,
+                    match_key,
+                    publisher,
+                    title,
+                    source_url,
+                    source_author,
+                    found_at,
+                    expires_at,
+                    estimated,
+                    created_at,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+            return _as_candidate(row)
+    raise RuntimeError("Could not allocate a candidate id.")
+
+
+def update_gift_candidate(cid: str, **fields: Any) -> None:
+    unknown = set(fields) - _CANDIDATE_UPDATABLE
+    if unknown:
+        raise ValueError(f"Unknown candidate fields: {sorted(unknown)}")
+    if not fields:
+        return
+    if "expires_estimated" in fields:
+        fields["expires_estimated"] = 1 if fields["expires_estimated"] else 0
+    cols = ", ".join(f"{name} = ?" for name in fields)
+    values = list(fields.values()) + [cid]
+    with connect() as conn:
+        conn.execute(f"UPDATE candidates SET {cols} WHERE id = ?", values)
+        conn.commit()
+
+
+def get_gift_candidate(cid: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+    return _as_candidate(row) if row else None
+
+
+def list_gift_candidates() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
+        ).fetchall()
+    return [_as_candidate(r) for r in rows]
+
+
+def purge_gift_candidates(expired_before: str) -> int:
+    """Delete candidates whose expires_at is strictly older than ``expired_before``."""
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM candidates WHERE expires_at < ?",
+            (expired_before,),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def write_json(path: Path, data: Any) -> None:

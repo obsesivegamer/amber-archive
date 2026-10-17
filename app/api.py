@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import capture, db
+from .candidates import dismiss_candidate, get_candidates_payload, save_candidate
 from .config import ID_ALPHABET, ID_LENGTH
 from .import_child import TooComplex, blocked_for, importing, ingest_in_child
 from .ingest import screenshot_reader
@@ -30,6 +31,7 @@ MIN_USABLE_WORDS = 120
 MAX_SINCE_DAYS = 365
 MAX_LIMIT = 200
 MAX_SAVE_BODY_BYTES = 16 * 1024
+MAX_CANDIDATE_BODY_BYTES = 4 * 1024
 MAX_URL_LENGTH = 2048
 MAX_IMPORT_BODY_BYTES = 12 * 1024 * 1024
 MIN_IMPORT_HTML_CHARS = 200
@@ -376,6 +378,44 @@ async def save(request: Request):
     return JSONResponse(
         {"id": job_id, "status": capture.jobs[job_id]["status"]}, status_code=202
     )
+
+
+async def _json_object(request: Request, limit: int) -> dict:
+    """JSON object body, same rules as /api/save: 415, capped size, 400 otherwise.
+
+    The parsed object is intentionally discarded by the candidate routes. A
+    client cannot supply the URL those routes capture.
+    """
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(415, "Send the request as application/json.")
+    raw = await _read_body_capped(request, limit)
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise HTTPException(400, "Body must be valid JSON.") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object.")
+    return body
+
+
+@router.get("/candidates")
+def api_list_candidates(response: Response, include: str = "live"):
+    """Live gift queue. Status is derived here and is not a stored column."""
+    response.headers["Cache-Control"] = "no-store"
+    return get_candidates_payload(include)
+
+
+@router.post("/candidates/{cid}/save")
+async def api_save_candidate(cid: str, request: Request):
+    await _json_object(request, MAX_CANDIDATE_BODY_BYTES)
+    return await save_candidate(cid)
+
+
+@router.post("/candidates/{cid}/dismiss")
+async def api_dismiss_candidate(cid: str, request: Request):
+    await _json_object(request, MAX_CANDIDATE_BODY_BYTES)
+    return dismiss_candidate(cid)
 
 
 _imports_in_flight = 0

@@ -886,12 +886,30 @@ def in_flight_job(url: str) -> dict | None:
     return None
 
 
-def enqueue_capture(url: str, url_normalized: str) -> str:
+def _should_referrer_retry(job: dict, article: dict) -> bool:
+    """Whether a short capture should be retried from an allowlisted referrer.
+
+    A gift save sets ``skip_referrer_bounce``. Those retries are extra anonymous
+    visits and can spend a gift link's redemptions. The signed-in browser
+    fallback is the better second try.
+    """
+    return bool(article.get("paywalled")) and not job.get("skip_referrer_bounce")
+
+
+def enqueue_capture(
+    url: str,
+    url_normalized: str,
+    *,
+    skip_referrer_bounce: bool = False,
+) -> str:
     """Create a snapshot row and queue its capture; returns the job (= snapshot) id.
 
     Synchronous on purpose: the in-flight check and the enqueue cannot be split
     by another request. A URL already queued or capturing returns that job's id
     instead of a second capture. Raises QueueFull past MAX_QUEUED_JOBS waiting.
+
+    ``skip_referrer_bounce`` is set only by a gift-candidate save. It is not read
+    from the request body.
     """
     assert job_queue is not None
     existing = in_flight_job(url)
@@ -901,7 +919,7 @@ def enqueue_capture(url: str, url_normalized: str) -> str:
         raise QueueFull
     sid = db.allocate_id()
     db.insert_snapshot(sid, url, url_normalized)
-    jobs[sid] = {
+    job = {
         "id": sid,
         "snapshot_id": sid,
         "url": url,
@@ -912,6 +930,9 @@ def enqueue_capture(url: str, url_normalized: str) -> str:
         "final_url": None,
         "capture_stats": empty_capture_stats(),
     }
+    if skip_referrer_bounce:
+        job["skip_referrer_bounce"] = True
+    jobs[sid] = job
     job_queue.put_nowait(sid)
     return sid
 
@@ -978,7 +999,7 @@ async def run_job(job_id: str) -> None:
                 article = _merge_crawler_article(article, crawler_article)
                 visit.article = article
 
-            if article.get("paywalled"):
+            if _should_referrer_retry(job, article):
                 for origin in bounce_origins_for(url, visit.final_url):
                     retried = True
                     try:
