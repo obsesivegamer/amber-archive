@@ -114,12 +114,61 @@ def _ensure_candidates_table(db: sqlite3.Connection) -> None:
     for name, decl in _CANDIDATE_ADD_COLUMNS:
         if name not in cols:
             db.execute(f"ALTER TABLE candidates ADD COLUMN {name} {decl}")
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_candidates_match_key ON candidates(match_key)"
-    )
+    _ensure_candidates_match_index(db)
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_candidates_expires ON candidates(expires_at)"
     )
+
+
+def _index_sql(db: sqlite3.Connection, name: str) -> str:
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (name,),
+    ).fetchone()
+    if row is None or not row["sql"]:
+        return ""
+    return row["sql"]
+
+
+def _ensure_candidates_match_index(db: sqlite3.Connection) -> None:
+    """One row per match key, including expired and dismissed rows.
+
+    A repeat find refreshes that row instead of inserting another live one.
+    The first version of this table used a non-unique index. Upgrade it once,
+    under a write lock, and do not drop it again once it is unique.
+    """
+    if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
+        return
+    # The caller (init_db) may already be inside the implicit transaction
+    # Python opens before DDL. Commit that, then take the write lock so two
+    # startups cannot both rebuild this index.
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
+            db.commit()
+            return
+        if _index_sql(db, "idx_candidates_match_key"):
+            # Keep the newest row when an older file already has duplicates.
+            db.execute(
+                """
+                DELETE FROM candidates
+                WHERE match_key IS NOT NULL
+                  AND rowid NOT IN (
+                      SELECT MAX(rowid) FROM candidates
+                      WHERE match_key IS NOT NULL
+                      GROUP BY match_key
+                  )
+                """
+            )
+            db.execute("DROP INDEX idx_candidates_match_key")
+        db.execute(
+            "CREATE UNIQUE INDEX idx_candidates_match_key ON candidates(match_key)"
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def init_db() -> None:
@@ -375,6 +424,59 @@ _CANDIDATE_UPDATABLE = {
 }
 
 
+def insert_gift_candidate_in(
+    conn: sqlite3.Connection,
+    *,
+    unlock_url: str,
+    canonical_url: str | None,
+    match_key: str,
+    publisher: str,
+    title: str | None,
+    source_url: str | None,
+    source_author: str | None,
+    found_at: str,
+    expires_at: str,
+    expires_estimated: bool,
+) -> dict:
+    """Insert one candidate on ``conn`` without committing.
+
+    The caller holds the write transaction so a concurrent add cannot insert
+    the same match key between the existence check and this insert.
+    """
+    created_at = now_iso()
+    estimated = 1 if expires_estimated else 0
+    for _ in range(32):
+        cid = "".join(secrets.choice(ID_ALPHABET) for _ in range(GIFT_CANDIDATE_ID_LENGTH))
+        if conn.execute("SELECT 1 FROM candidates WHERE id = ?", (cid,)).fetchone():
+            continue
+        conn.execute(
+            """
+            INSERT INTO candidates (
+                id, unlock_url, canonical_url, match_key, publisher, title,
+                source_url, source_author, found_at, expires_at,
+                expires_estimated, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cid,
+                unlock_url,
+                canonical_url,
+                match_key,
+                publisher,
+                title,
+                source_url,
+                source_author,
+                found_at,
+                expires_at,
+                estimated,
+                created_at,
+            ),
+        )
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        return _as_candidate(row)
+    raise RuntimeError("Could not allocate a candidate id.")
+
+
 def insert_gift_candidate(
     *,
     unlock_url: str,
@@ -388,54 +490,48 @@ def insert_gift_candidate(
     expires_at: str,
     expires_estimated: bool,
 ) -> dict:
-    created_at = now_iso()
-    estimated = 1 if expires_estimated else 0
     with connect() as conn:
-        for _ in range(32):
-            cid = "".join(secrets.choice(ID_ALPHABET) for _ in range(GIFT_CANDIDATE_ID_LENGTH))
-            if conn.execute("SELECT 1 FROM candidates WHERE id = ?", (cid,)).fetchone():
-                continue
-            conn.execute(
-                """
-                INSERT INTO candidates (
-                    id, unlock_url, canonical_url, match_key, publisher, title,
-                    source_url, source_author, found_at, expires_at,
-                    expires_estimated, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    cid,
-                    unlock_url,
-                    canonical_url,
-                    match_key,
-                    publisher,
-                    title,
-                    source_url,
-                    source_author,
-                    found_at,
-                    expires_at,
-                    estimated,
-                    created_at,
-                ),
-            )
-            conn.commit()
-            row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
-            return _as_candidate(row)
-    raise RuntimeError("Could not allocate a candidate id.")
+        stored = insert_gift_candidate_in(
+            conn,
+            unlock_url=unlock_url,
+            canonical_url=canonical_url,
+            match_key=match_key,
+            publisher=publisher,
+            title=title,
+            source_url=source_url,
+            source_author=source_author,
+            found_at=found_at,
+            expires_at=expires_at,
+            expires_estimated=expires_estimated,
+        )
+        conn.commit()
+        return stored
 
 
-def update_gift_candidate(cid: str, **fields: Any) -> None:
+def update_gift_candidate_in(conn: sqlite3.Connection, cid: str, **fields: Any) -> None:
+    """Update allowlisted columns on ``conn`` without committing."""
     unknown = set(fields) - _CANDIDATE_UPDATABLE
     if unknown:
         raise ValueError(f"Unknown candidate fields: {sorted(unknown)}")
     if not fields:
         return
-    if "expires_estimated" in fields:
-        fields["expires_estimated"] = 1 if fields["expires_estimated"] else 0
-    cols = ", ".join(f"{name} = ?" for name in fields)
-    values = list(fields.values()) + [cid]
+    assignments: list[str] = []
+    values: list[Any] = []
+    for name, value in fields.items():
+        if name == "expires_estimated":
+            value = 1 if value else 0
+        assignments.append(f"{name} = ?")
+        values.append(value)
+    values.append(cid)
+    conn.execute(
+        f"UPDATE candidates SET {', '.join(assignments)} WHERE id = ?",
+        values,
+    )
+
+
+def update_gift_candidate(cid: str, **fields: Any) -> None:
     with connect() as conn:
-        conn.execute(f"UPDATE candidates SET {cols} WHERE id = ?", values)
+        update_gift_candidate_in(conn, cid, **fields)
         conn.commit()
 
 
@@ -445,12 +541,16 @@ def get_gift_candidate(cid: str) -> dict | None:
     return _as_candidate(row) if row else None
 
 
+def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
+    ).fetchall()
+    return [_as_candidate(r) for r in rows]
+
+
 def list_gift_candidates() -> list[dict]:
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
-        ).fetchall()
-    return [_as_candidate(r) for r in rows]
+        return load_gift_candidates(conn)
 
 
 def purge_gift_candidates(expired_before: str) -> int:

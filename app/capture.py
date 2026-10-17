@@ -896,6 +896,16 @@ def _should_referrer_retry(job: dict, article: dict) -> bool:
     return bool(article.get("paywalled")) and not job.get("skip_referrer_bounce")
 
 
+def note_skip_referrer_bounce(job_id: str) -> None:
+    """A gift save joined this job. Leave referrer-bounce retries off.
+
+    A later ordinary save does not clear the flag.
+    """
+    job = jobs.get(job_id)
+    if job is not None:
+        job["skip_referrer_bounce"] = True
+
+
 def enqueue_capture(
     url: str,
     url_normalized: str,
@@ -909,11 +919,14 @@ def enqueue_capture(
     instead of a second capture. Raises QueueFull past MAX_QUEUED_JOBS waiting.
 
     ``skip_referrer_bounce`` is set only by a gift-candidate save. It is not read
-    from the request body.
+    from the request body. Joining an in-flight job sets the flag on that job
+    and never clears a flag a gift save already set.
     """
     assert job_queue is not None
     existing = in_flight_job(url)
     if existing:
+        if skip_referrer_bounce:
+            existing["skip_referrer_bounce"] = True
         return existing["id"]
     if job_queue.qsize() >= MAX_QUEUED_JOBS:
         raise QueueFull

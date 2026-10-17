@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import socket
 import subprocess
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -102,6 +104,32 @@ def test_cli_add_and_refresh_is_idempotent(tmp_data, monkeypatch, capsys):
     assert code == 0, err
     assert rows[0]["id"] in out
     assert "  new  " in out
+
+
+def test_overlapping_adds_insert_one_row(tmp_data):
+    find = _live_find("http://93.184.216.34/dup")
+    barrier = threading.Barrier(2)
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def _add() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(add_finds([find]))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_add) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert errors == []
+    assert sorted(line for batch in results for line in batch) == ["added", "refreshed"]
+    rows = db.list_gift_candidates()
+    assert len(rows) == 1
+    assert rows[0]["match_key"] == article_match_key("http://93.184.216.34/dup")
 
 
 def test_cli_rejects_bad_finds_and_keeps_the_good_one(tmp_data, monkeypatch, capsys):
@@ -310,12 +338,73 @@ def test_candidates_table_is_idempotent_and_has_no_status(tmp_data):
         names = {row[1] for row in conn.execute("PRAGMA table_info(candidates)")}
     assert {"source_url", "source_author", "clicked_at", "dismissed_at", "expires_at", "match_key"} <= names
     assert "status" not in names
+    with db.connect() as conn:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_candidates_match_key'"
+        ).fetchone()["sql"]
+    assert "UNIQUE" in sql.upper()
+
+
+def test_match_key_index_upgrades_to_unique(tmp_data):
+    with db.connect() as conn:
+        conn.execute("DROP INDEX idx_candidates_match_key")
+        conn.execute("CREATE INDEX idx_candidates_match_key ON candidates(match_key)")
+        conn.execute(
+            """
+            INSERT INTO candidates (
+                id, unlock_url, canonical_url, match_key, publisher, title,
+                source_url, source_author, found_at, expires_at,
+                expires_estimated, created_at
+            ) VALUES
+            ('abcdefg2', 'http://93.184.216.34/dup', NULL, '93.184.216.34/dup', 'nyt', NULL,
+             NULL, NULL, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 1, '2026-01-01T00:00:00Z'),
+            ('abcdefg3', 'http://93.184.216.34/dup', NULL, '93.184.216.34/dup', 'nyt', NULL,
+             NULL, NULL, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 1, '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.commit()
+    db.init_db()
+    rows = db.list_gift_candidates()
+    assert len(rows) == 1
+    assert rows[0]["id"] == "abcdefg3"
+    with db.connect() as conn:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_candidates_match_key'"
+        ).fetchone()["sql"]
+    assert "UNIQUE" in sql.upper()
+    db.init_db()
+    assert [row["id"] for row in db.list_gift_candidates()] == ["abcdefg3"]
 
 
 def test_referrer_retry_is_off_for_a_gift_job():
     assert _should_referrer_retry({"skip_referrer_bounce": True}, {"paywalled": True}) is False
     assert _should_referrer_retry({}, {"paywalled": True}) is True
     assert _should_referrer_retry({}, {"paywalled": False}) is False
+
+
+def test_gift_join_sets_skip_referrer_bounce(tmp_data):
+    previous = capture.job_queue
+    capture.jobs.clear()
+    capture.job_queue = asyncio.Queue()
+    try:
+        url = "http://93.184.216.34/join"
+        first = capture.enqueue_capture(url, url)
+        assert "skip_referrer_bounce" not in capture.jobs[first]
+        second = capture.enqueue_capture(
+            url + "?unlocked_article_code=abc",
+            url + "?unlocked_article_code=abc",
+            skip_referrer_bounce=True,
+        )
+        assert second == first
+        job = capture.jobs[first]
+        assert job["skip_referrer_bounce"] is True
+        assert _should_referrer_retry(job, {"paywalled": True}) is False
+        third = capture.enqueue_capture(url, url)
+        assert third == first
+        assert capture.jobs[first]["skip_referrer_bounce"] is True
+    finally:
+        capture.jobs.clear()
+        capture.job_queue = previous
 
 
 def test_save_links_the_snapshot_and_skips_the_bounce(api):
@@ -384,6 +473,44 @@ def test_expired_save_returns_410_and_does_not_capture(api):
     assert db.get_gift_candidate(row["id"])["snapshot_id"] is None
     assert db.get_gift_candidate(row["id"])["clicked_at"] is None
     assert api.get("/api/candidates?include=bogus").status_code == 400
+
+
+def test_gift_save_joining_an_inflight_job_skips_the_bounce(api):
+    url = "http://93.184.216.34/join"
+    plain = api.post("/api/save", json={"url": url})
+    assert plain.status_code == 202
+    job_id = plain.json()["id"]
+    assert "skip_referrer_bounce" not in capture.jobs[job_id]
+    row = _queue(url)
+    saved = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert saved.status_code == 202
+    assert saved.json()["id"] == job_id
+    job = capture.jobs[job_id]
+    assert job["skip_referrer_bounce"] is True
+    assert _should_referrer_retry(job, {"paywalled": True}) is False
+    again = capture.enqueue_capture(url, url)
+    assert again == job_id
+    assert capture.jobs[job_id]["skip_referrer_bounce"] is True
+
+
+def test_dismissed_and_expired_stays_dismissed(api):
+    canonical = "http://93.184.216.34/old-canonical"
+    row = _queue(
+        "http://93.184.216.34/old-dismissed",
+        found_at=_iso(_now() - timedelta(days=40)),
+        canonical_url=canonical,
+    )
+    dismissed = api.post(f"/api/candidates/{row['id']}/dismiss", json={})
+    assert dismissed.status_code == 200
+    saved = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert saved.status_code == 409
+    assert saved.json()["detail"] == "dismissed"
+    stored = db.get_gift_candidate(row["id"])
+    assert stored["snapshot_id"] is None
+    assert stored["clicked_at"] is None
+    listed = api.get("/api/candidates?include=all").json()["candidates"]
+    match = next(item for item in listed if item["id"] == row["id"])
+    assert match["status"] == "dismissed"
 
 
 def test_cross_site_post_is_forbidden(api):

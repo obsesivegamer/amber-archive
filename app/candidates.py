@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -159,10 +160,10 @@ def _queue_match(rows: list[dict], keys: set[str]) -> dict | None:
     return None
 
 
-def _remember(row: dict, updates: dict) -> None:
+def _apply(conn: sqlite3.Connection, row: dict, updates: dict) -> None:
     if not updates:
         return
-    db.update_gift_candidate(row["id"], **updates)
+    db.update_gift_candidate_in(conn, row["id"], **updates)
     for key, value in updates.items():
         row[key] = bool(value) if key == "expires_estimated" else value
 
@@ -248,12 +249,66 @@ def _parse_find(find: dict) -> dict:
     }
 
 
+def _claim(incoming: dict) -> str:
+    """Insert or refresh one find while holding the database write lock.
+
+    The read and the write share one ``BEGIN IMMEDIATE`` transaction, and
+    ``match_key`` is unique. A second add that loses the race refreshes the
+    row the first add stored.
+    """
+    keys = _keys(incoming["canonical_url"], incoming["unlock_url"])
+    conn = db.connect()
+    try:
+        for attempt in (1, 2):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = db.load_gift_candidates(conn)
+                existing = _queue_match(rows, keys)
+                if existing is None:
+                    existing = next(
+                        (
+                            row
+                            for row in rows
+                            if row.get("match_key") == incoming["match_key"]
+                        ),
+                        None,
+                    )
+                if existing is not None:
+                    _apply(conn, existing, _refresh_updates(existing, incoming))
+                    conn.commit()
+                    return "refreshed"
+                db.insert_gift_candidate_in(
+                    conn,
+                    unlock_url=incoming["unlock_url"],
+                    canonical_url=incoming["canonical_url"],
+                    match_key=incoming["match_key"],
+                    publisher=incoming["publisher"],
+                    title=incoming["title"],
+                    source_url=incoming["source_url"],
+                    source_author=incoming["source_author"],
+                    found_at=incoming["found_at"],
+                    expires_at=incoming["expires_at"],
+                    expires_estimated=incoming["expires_estimated"],
+                )
+                conn.commit()
+                return "added"
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                if attempt == 2:
+                    raise
+            except Exception:
+                conn.rollback()
+                raise
+    finally:
+        conn.close()
+    raise RuntimeError("Could not store the candidate.")
+
+
 def add_finds(finds: list) -> list[str]:
     """Validate, dedupe and store finds. One result line per find."""
     db.init_db()
     from .api import _best_match, _find_matches
 
-    rows = db.list_gift_candidates()
     lines: list[str] = []
     for find in finds:
         if not isinstance(find, dict):
@@ -264,31 +319,12 @@ def add_finds(finds: list) -> list[str]:
         except ValueError as exc:
             lines.append(f"rejected: {exc}")
             continue
-        keys = _keys(incoming["canonical_url"], incoming["unlock_url"])
         if _usable_archive(
             [incoming["canonical_url"], incoming["unlock_url"]], _best_match, _find_matches
         ):
             lines.append("archived")
             continue
-        existing = _queue_match(rows, keys)
-        if existing is not None:
-            _remember(existing, _refresh_updates(existing, incoming))
-            lines.append("refreshed")
-            continue
-        stored = db.insert_gift_candidate(
-            unlock_url=incoming["unlock_url"],
-            canonical_url=incoming["canonical_url"],
-            match_key=incoming["match_key"],
-            publisher=incoming["publisher"],
-            title=incoming["title"],
-            source_url=incoming["source_url"],
-            source_author=incoming["source_author"],
-            found_at=incoming["found_at"],
-            expires_at=incoming["expires_at"],
-            expires_estimated=incoming["expires_estimated"],
-        )
-        rows.append(stored)
-        lines.append("added")
+        lines.append(_claim(incoming))
     return lines
 
 
@@ -445,19 +481,24 @@ async def save_candidate(cid: str) -> JSONResponse:
     row = db.get_gift_candidate(cid)
     if row is None:
         raise HTTPException(404, "No such candidate")
+    # Dismissal wins over expiry, same order as derived_status. A dismissed
+    # gift stays dismissed after it expires, so the client does not fall
+    # back to saving its canonical URL.
+    if row.get("dismissed_at"):
+        raise HTTPException(409, "dismissed")
     if _parse_stored(row["expires_at"]) <= datetime.now(timezone.utc):
         return JSONResponse(
             {"detail": "gift link expired", "canonical_url": row.get("canonical_url")},
             status_code=410,
         )
-    if row.get("dismissed_at"):
-        raise HTTPException(409, "dismissed")
     try:
         clean = await asyncio.to_thread(validate_public_http_url, row["unlock_url"])
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
     kind, snapshot_id, extra = await asyncio.to_thread(_lookup_capture, row, clean)
+    from . import capture
+
     if kind == "exists":
         _record_click(row, snapshot_id or "")
         return JSONResponse(
@@ -465,13 +506,13 @@ async def save_candidate(cid: str) -> JSONResponse:
             status_code=200,
         )
     if kind == "inflight":
+        # Set before the next await. The worker reads the flag on this loop.
+        capture.note_skip_referrer_bounce(snapshot_id or "")
         _record_click(row, snapshot_id or "")
         return JSONResponse(
             {"id": snapshot_id, "status": extra, "candidate": cid},
             status_code=202,
         )
-
-    from . import capture
 
     try:
         job_id = capture.enqueue_capture(

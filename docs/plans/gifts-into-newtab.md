@@ -70,8 +70,9 @@ New pieces:
 1. **Candidates store**: a table in the same SQLite file. Each candidate holds its unlock URL, canonical
    URL, match key, publisher, title, `source_url`, `source_author`, `found_at`, `expires_at`, an
    `expires_estimated` flag, `clicked_at`, `dismissed_at`, and the `snapshot_id` once someone clicks it.
-   Status is **derived on read** from `expires_at`, `dismissed_at` and the linked snapshot's
-   `effective_status` and grade. Amber never stores a second copy of job state that could drift.
+   Status is **derived on read**, in this order: dismissal, then expiry, then the linked snapshot's
+   `effective_status` and grade. A dismissed gift stays dismissed after it expires. Amber never stores
+   a second copy of job state that could drift.
 2. **Candidate CLI**: `python -m app.candidates add`. It reads finds as JSON on stdin, validates them,
    dedupes (against the archive and within the queue), then writes through `app.db`. It prints one result
    line per find: `added`, `refreshed`, `archived` or `rejected: <reason>`. It is idempotent, works
@@ -135,8 +136,9 @@ New pieces:
    same rail.
 2. **Gift save flow**: `saveCandidate`, then poll, then read. On `paywall-stub`, `thin` or `junk`,
    `captureWithBrowser(unlockUrl)` runs inside the same attempt, then `importPage` with
-   `url = canonical || unlock` and `final_url = where the page landed`. An expired candidate (`410`)
-   falls back to a normal save of the canonical URL, then to Capture with my browser.
+   `url = canonical || unlock` and `final_url = where the page landed`. An expired candidate that was
+   not dismissed (`410`) falls back to a normal save of the canonical URL, then to Capture with my
+   browser. A dismissed gift answers `409` even after it expires, and does not take that fallback.
 3. **Later** button on gift rows and in the Reader: saves (gift) or bookmarks (archived) and adds the
    article to Read later without opening it. Opening an item in the Reader marks it read, and the Reader
    has a "Mark unread" toggle.
@@ -204,8 +206,12 @@ as archived. `Cache-Control: no-store`.
 |---|---|
 | `202 {"id": "<snapshot id>", "status": "queued"\|"capturing", "candidate": "<id>"}` | Capture queued from the unlock URL. Poll `/api/jobs/{id}` as today. |
 | `200 {"id", "status": "exists", "usable", "quality"}` | Already archived. Same meaning as `/api/save`. |
-| `410 {"detail": "gift link expired", "canonical_url"}` | Too old to use. The client falls back to the canonical URL. |
-| `404` / `409 {"detail": "dismissed"}` / `429` | Unknown id / dismissed / the capture queue is full. |
+| `410 {"detail": "gift link expired", "canonical_url"}` | Not dismissed, and too old to use. The client falls back to the canonical URL. |
+| `404` / `409 {"detail": "dismissed"}` / `429` | Unknown id / dismissed, including when the gift has also expired / the capture queue is full. |
+
+Dismissal wins over expiry. That is the same order as derived status (`dismissed`, then `expired`).
+`410` is only for a gift nobody dismissed, so a dismissed gift is not archived through the canonical-URL
+fallback.
 
 ### `POST /api/candidates/{id}/dismiss` (body `{}`)
 
@@ -333,6 +339,7 @@ Each slice can be demoed on its own and builds on the ones before it.
    The thin threshold gets tuned against fixtures in slice 4.
 5. **What does a click on an expired or unknown-expiry gift do?**
    **Default:** use conservative per-publisher TTLs when Gift Links reports no expiry, and show the age
-   on each row. An expired gift answers `410`, and the client falls back to a normal save of the canonical
-   URL, then Capture with my browser. With no canonical URL, the row shows "Link expired" and an Open
-   original button.
+   on each row. An expired gift that was not dismissed answers `410`, and the client falls back to a
+   normal save of the canonical URL, then Capture with my browser. A gift that was dismissed stays
+   dismissed after it expires (`409`) and does not take that fallback. With no canonical URL, the row
+   shows "Link expired" and an Open original button.
