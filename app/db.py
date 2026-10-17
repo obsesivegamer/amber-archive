@@ -43,6 +43,28 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# 8 characters, not the 5-character snapshot id, so a candidate route cannot
+# collide with a snapshot route. Same alphabet as snapshot ids.
+GIFT_CANDIDATE_ID_LENGTH = 8
+
+_CANDIDATE_ADD_COLUMNS = (
+    ("unlock_url", "TEXT"),
+    ("canonical_url", "TEXT"),
+    ("match_key", "TEXT"),
+    ("publisher", "TEXT"),
+    ("title", "TEXT"),
+    ("source_url", "TEXT"),
+    ("source_author", "TEXT"),
+    ("found_at", "TEXT"),
+    ("expires_at", "TEXT"),
+    ("expires_estimated", "INTEGER"),
+    ("dismissed_at", "TEXT"),
+    ("clicked_at", "TEXT"),
+    ("snapshot_id", "TEXT"),
+    ("created_at", "TEXT"),
+)
+
+
 def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
     cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
     if "paywalled" not in cols:
@@ -60,12 +82,207 @@ def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_candidates_table(db: sqlite3.Connection) -> None:
+    """Add the gift-candidate queue. Safe to run on every startup and from the CLI.
+
+    Same approach as ``_ensure_paywalled_column``: create the table when it is
+    missing, then add any column an older file does not have yet. There is no
+    ``status`` column. Live, saved, expired and dismissed are derived on read.
+    """
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidates (
+            id TEXT PRIMARY KEY,
+            unlock_url TEXT NOT NULL,
+            canonical_url TEXT,
+            match_key TEXT NOT NULL,
+            publisher TEXT NOT NULL,
+            title TEXT,
+            source_url TEXT,
+            source_author TEXT,
+            found_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            expires_estimated INTEGER NOT NULL DEFAULT 1,
+            dismissed_at TEXT,
+            clicked_at TEXT,
+            snapshot_id TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cols = {row[1] for row in db.execute("PRAGMA table_info(candidates)")}
+    for name, decl in _CANDIDATE_ADD_COLUMNS:
+        if name not in cols:
+            db.execute(f"ALTER TABLE candidates ADD COLUMN {name} {decl}")
+    _ensure_candidates_match_index(db)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidates_expires ON candidates(expires_at)"
+    )
+
+
+def _index_sql(db: sqlite3.Connection, name: str) -> str:
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (name,),
+    ).fetchone()
+    if row is None or not row["sql"]:
+        return ""
+    return row["sql"]
+
+
+def _blank(value: object) -> bool:
+    return value is None or value == ""
+
+
+def _merge_candidate_group(rows: list[sqlite3.Row]) -> tuple[sqlite3.Row, dict]:
+    """Fold duplicate rows into the newest one's id.
+
+    Blank fields take a non-null value from an older copy. A click and a
+    dismissal keep the earliest timestamp, a snapshot id keeps any non-null
+    value, and the expiry keeps the later deadline (with that row's
+    estimated flag).
+    """
+    survivor = max(rows, key=lambda row: row["rowid"])
+    merged = {key: survivor[key] for key in survivor.keys() if key != "rowid"}
+
+    def prefer_non_null(field: str) -> None:
+        if not _blank(merged.get(field)):
+            return
+        for row in rows:
+            if not _blank(row[field]):
+                merged[field] = row[field]
+                return
+
+    for field in (
+        "unlock_url",
+        "canonical_url",
+        "publisher",
+        "title",
+        "source_url",
+        "source_author",
+        "found_at",
+        "created_at",
+    ):
+        prefer_non_null(field)
+
+    for field in ("clicked_at", "dismissed_at"):
+        stamps = [row[field] for row in rows if not _blank(row[field])]
+        if stamps:
+            merged[field] = min(stamps)
+
+    if _blank(merged.get("snapshot_id")):
+        for row in rows:
+            if not _blank(row["snapshot_id"]):
+                merged["snapshot_id"] = row["snapshot_id"]
+                break
+
+    best_expires = None
+    best_estimated = None
+    for row in rows:
+        expires = row["expires_at"]
+        if _blank(expires):
+            continue
+        estimated = row["expires_estimated"]
+        if best_expires is None or expires > best_expires:
+            best_expires = expires
+            best_estimated = estimated
+        elif expires == best_expires and not estimated and best_estimated:
+            best_estimated = estimated
+    if best_expires is not None:
+        merged["expires_at"] = best_expires
+        if best_estimated is not None:
+            merged["expires_estimated"] = 1 if best_estimated else 0
+    return survivor, merged
+
+
+_MERGED_CANDIDATE_COLUMNS = (
+    "unlock_url",
+    "canonical_url",
+    "publisher",
+    "title",
+    "source_url",
+    "source_author",
+    "found_at",
+    "expires_at",
+    "expires_estimated",
+    "dismissed_at",
+    "clicked_at",
+    "snapshot_id",
+    "created_at",
+)
+
+
+def _merge_duplicate_candidates(db: sqlite3.Connection) -> None:
+    """One row per match key, keeping every non-null fact from the copies."""
+    keys = db.execute(
+        """
+        SELECT match_key FROM candidates
+        WHERE match_key IS NOT NULL
+        GROUP BY match_key
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for (match_key,) in keys:
+        rows = db.execute(
+            "SELECT rowid, * FROM candidates WHERE match_key = ? ORDER BY rowid",
+            (match_key,),
+        ).fetchall()
+        if len(rows) < 2:
+            continue
+        survivor, merged = _merge_candidate_group(rows)
+        assignments = ", ".join(f"{name} = ?" for name in _MERGED_CANDIDATE_COLUMNS)
+        values = [merged[name] for name in _MERGED_CANDIDATE_COLUMNS]
+        values.append(survivor["id"])
+        db.execute(
+            f"UPDATE candidates SET {assignments} WHERE id = ?",
+            values,
+        )
+        drop_ids = [row["id"] for row in rows if row["id"] != survivor["id"]]
+        placeholders = ", ".join("?" for _ in drop_ids)
+        db.execute(
+            f"DELETE FROM candidates WHERE id IN ({placeholders})",
+            drop_ids,
+        )
+
+
+def _ensure_candidates_match_index(db: sqlite3.Connection) -> None:
+    """One row per match key, including expired and dismissed rows.
+
+    A repeat find refreshes that row instead of inserting another live one.
+    The first version of this table used a non-unique index. Upgrade it once,
+    under a write lock, and do not drop it again once it is unique. Duplicate
+    rows are merged before the unique index is built.
+    """
+    if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
+        return
+    # The caller (init_db) may already be inside the implicit transaction
+    # Python opens before DDL. Commit that, then take the write lock so two
+    # startups cannot both rebuild this index.
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if "UNIQUE" in _index_sql(db, "idx_candidates_match_key").upper():
+            db.commit()
+            return
+        _merge_duplicate_candidates(db)
+        if _index_sql(db, "idx_candidates_match_key"):
+            db.execute("DROP INDEX idx_candidates_match_key")
+        db.execute(
+            "CREATE UNIQUE INDEX idx_candidates_match_key ON candidates(match_key)"
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SNAPS_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript(SCHEMA)
         _ensure_paywalled_column(db)
+        _ensure_candidates_table(db)
         db.commit()
 
 
@@ -287,6 +504,169 @@ def delete_snapshot(sid: str) -> bool:
 
 def snap_dir(sid: str) -> Path:
     return SNAPS_DIR / sid
+
+
+def _as_candidate(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["expires_estimated"] = bool(item.get("expires_estimated"))
+    return item
+
+
+_CANDIDATE_UPDATABLE = {
+    "unlock_url",
+    "canonical_url",
+    "match_key",
+    "publisher",
+    "title",
+    "source_url",
+    "source_author",
+    "found_at",
+    "expires_at",
+    "expires_estimated",
+    "dismissed_at",
+    "clicked_at",
+    "snapshot_id",
+}
+
+
+def insert_gift_candidate_in(
+    conn: sqlite3.Connection,
+    *,
+    unlock_url: str,
+    canonical_url: str | None,
+    match_key: str,
+    publisher: str,
+    title: str | None,
+    source_url: str | None,
+    source_author: str | None,
+    found_at: str,
+    expires_at: str,
+    expires_estimated: bool,
+) -> dict:
+    """Insert one candidate on ``conn`` without committing.
+
+    The caller holds the write transaction so a concurrent add cannot insert
+    the same match key between the existence check and this insert.
+    """
+    created_at = now_iso()
+    estimated = 1 if expires_estimated else 0
+    for _ in range(32):
+        cid = "".join(secrets.choice(ID_ALPHABET) for _ in range(GIFT_CANDIDATE_ID_LENGTH))
+        if conn.execute("SELECT 1 FROM candidates WHERE id = ?", (cid,)).fetchone():
+            continue
+        conn.execute(
+            """
+            INSERT INTO candidates (
+                id, unlock_url, canonical_url, match_key, publisher, title,
+                source_url, source_author, found_at, expires_at,
+                expires_estimated, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cid,
+                unlock_url,
+                canonical_url,
+                match_key,
+                publisher,
+                title,
+                source_url,
+                source_author,
+                found_at,
+                expires_at,
+                estimated,
+                created_at,
+            ),
+        )
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        return _as_candidate(row)
+    raise RuntimeError("Could not allocate a candidate id.")
+
+
+def insert_gift_candidate(
+    *,
+    unlock_url: str,
+    canonical_url: str | None,
+    match_key: str,
+    publisher: str,
+    title: str | None,
+    source_url: str | None,
+    source_author: str | None,
+    found_at: str,
+    expires_at: str,
+    expires_estimated: bool,
+) -> dict:
+    with connect() as conn:
+        stored = insert_gift_candidate_in(
+            conn,
+            unlock_url=unlock_url,
+            canonical_url=canonical_url,
+            match_key=match_key,
+            publisher=publisher,
+            title=title,
+            source_url=source_url,
+            source_author=source_author,
+            found_at=found_at,
+            expires_at=expires_at,
+            expires_estimated=expires_estimated,
+        )
+        conn.commit()
+        return stored
+
+
+def update_gift_candidate_in(conn: sqlite3.Connection, cid: str, **fields: Any) -> None:
+    """Update allowlisted columns on ``conn`` without committing."""
+    unknown = set(fields) - _CANDIDATE_UPDATABLE
+    if unknown:
+        raise ValueError(f"Unknown candidate fields: {sorted(unknown)}")
+    if not fields:
+        return
+    assignments: list[str] = []
+    values: list[Any] = []
+    for name, value in fields.items():
+        if name == "expires_estimated":
+            value = 1 if value else 0
+        assignments.append(f"{name} = ?")
+        values.append(value)
+    values.append(cid)
+    conn.execute(
+        f"UPDATE candidates SET {', '.join(assignments)} WHERE id = ?",
+        values,
+    )
+
+
+def update_gift_candidate(cid: str, **fields: Any) -> None:
+    with connect() as conn:
+        update_gift_candidate_in(conn, cid, **fields)
+        conn.commit()
+
+
+def get_gift_candidate(cid: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+    return _as_candidate(row) if row else None
+
+
+def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
+    ).fetchall()
+    return [_as_candidate(r) for r in rows]
+
+
+def list_gift_candidates() -> list[dict]:
+    with connect() as conn:
+        return load_gift_candidates(conn)
+
+
+def purge_gift_candidates(expired_before: str) -> int:
+    """Delete candidates whose expires_at is strictly older than ``expired_before``."""
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM candidates WHERE expires_at < ?",
+            (expired_before,),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def write_json(path: Path, data: Any) -> None:
