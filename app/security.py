@@ -130,6 +130,7 @@ _KEY_DROP_PARAMS_BY_HOST = {
     "washingtonpost.com": {"pwapi_token", "itid"},
     "nytimes.com": {"partner", "referringsource"},
     "theguardian.com": {"cmp"},
+    "theatlantic.com": {"gift"},
 }
 
 
