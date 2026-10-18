@@ -44,6 +44,7 @@ from .reader import build_reader_html
 from .security import (
     _is_public_ip,
     article_match_key,
+    normalize_url,
     validate_public_http_request_url,
     validate_public_http_url,
 )
@@ -874,7 +875,21 @@ class QueueFull(Exception):
     """Too many captures are already waiting; try again shortly."""
 
 
-def in_flight_job(url: str) -> dict | None:
+def in_flight_job(url: str, *, same_url_only: bool = False) -> dict | None:
+    """A queued or capturing job for this article.
+
+    ``same_url_only`` matches the capture URL, not the article match key.
+    Gift saves need that. The match key drops the gift token, so a paywall
+    capture of the canonical article would otherwise count as this job.
+    """
+    if same_url_only:
+        want = normalize_url(url)
+        for job in jobs.values():
+            if job["status"] not in {"queued", "capturing"}:
+                continue
+            if normalize_url(job["url"]) == want:
+                return job
+        return None
     key = article_match_key(url)
     if not key:
         return None
@@ -920,10 +935,13 @@ def enqueue_capture(
 
     ``skip_referrer_bounce`` is set only by a gift-candidate save. It is not read
     from the request body. Joining an in-flight job sets the flag on that job
-    and never clears a flag a gift save already set.
+    and never clears a flag a gift save already set. A gift save joins only a
+    job that is already capturing that same unlock URL. Joining by article
+    match key would reuse a canonical paywall capture, never fetch the gift,
+    and turn off that capture's referrer retries.
     """
     assert job_queue is not None
-    existing = in_flight_job(url)
+    existing = in_flight_job(url, same_url_only=skip_referrer_bounce)
     if existing:
         if skip_referrer_bounce:
             existing["skip_referrer_bounce"] = True

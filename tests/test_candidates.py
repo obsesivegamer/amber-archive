@@ -449,26 +449,45 @@ def test_referrer_retry_is_off_for_a_gift_job():
     assert _should_referrer_retry({}, {"paywalled": False}) is False
 
 
-def test_gift_join_sets_skip_referrer_bounce(tmp_data):
+def _make_stub(sid: str, url: str) -> None:
+    db.update_snapshot(
+        sid,
+        status="complete",
+        title="Subscribe to continue",
+        site_name="Example",
+        word_count=4,
+        final_url=url,
+        paywalled=1,
+    )
+    folder = db.snap_dir(sid)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "article.txt").write_text("Subscribe to continue reading.", encoding="utf-8")
+
+
+def test_gift_enqueue_does_not_join_a_canonical_capture(tmp_data):
     previous = capture.job_queue
     capture.jobs.clear()
     capture.job_queue = asyncio.Queue()
     try:
-        url = "http://93.184.216.34/join"
-        first = capture.enqueue_capture(url, url)
+        canonical = "http://93.184.216.34/join"
+        unlock = canonical + "?unlocked_article_code=abc"
+        first = capture.enqueue_capture(canonical, canonical)
         assert "skip_referrer_bounce" not in capture.jobs[first]
-        second = capture.enqueue_capture(
-            url + "?unlocked_article_code=abc",
-            url + "?unlocked_article_code=abc",
-            skip_referrer_bounce=True,
-        )
-        assert second == first
-        job = capture.jobs[first]
-        assert job["skip_referrer_bounce"] is True
-        assert _should_referrer_retry(job, {"paywalled": True}) is False
-        third = capture.enqueue_capture(url, url)
-        assert third == first
-        assert capture.jobs[first]["skip_referrer_bounce"] is True
+        second = capture.enqueue_capture(unlock, unlock, skip_referrer_bounce=True)
+        assert second != first
+        assert "skip_referrer_bounce" not in capture.jobs[first]
+        gift = capture.jobs[second]
+        assert gift["url"] == unlock
+        assert gift["skip_referrer_bounce"] is True
+        assert _should_referrer_retry(gift, {"paywalled": True}) is False
+        third = capture.enqueue_capture(unlock, unlock, skip_referrer_bounce=True)
+        assert third == second
+        assert capture.jobs[second]["skip_referrer_bounce"] is True
+        # A later ordinary save of the canonical article still joins that job,
+        # and does not clear the flag on the gift job or set one on itself.
+        fourth = capture.enqueue_capture(canonical, canonical)
+        assert fourth == first
+        assert "skip_referrer_bounce" not in capture.jobs[first]
     finally:
         capture.jobs.clear()
         capture.job_queue = previous
@@ -519,6 +538,76 @@ def test_save_links_the_snapshot_and_skips_the_bounce(api):
     with db.connect() as conn:
         cols = {col[1] for col in conn.execute("PRAGMA table_info(candidates)")}
     assert "status" not in cols
+
+
+def test_gift_save_captures_the_unlock_url_past_a_canonical_stub(api):
+    """A paywall stub of the article must not swallow the gift click.
+
+    The match key drops ``unlocked_article_code``, so the stub looks like the
+    same article. The click still has to capture the unlock URL.
+    """
+    canonical = "http://93.184.216.34/story"
+    unlock = canonical + "?unlocked_article_code=abc"
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, canonical, canonical)
+    _make_stub(sid, canonical)
+    row = _queue(unlock, canonical_url=canonical)
+    saved = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert saved.status_code == 202
+    body = saved.json()
+    assert body["id"] != sid
+    assert body["status"] == "queued"
+    job = capture.jobs[body["id"]]
+    assert job["url"] == unlock
+    assert job["skip_referrer_bounce"] is True
+    assert db.get_snapshot(sid)["status"] == "complete"
+    assert db.get_gift_candidate(row["id"])["snapshot_id"] == body["id"]
+
+
+def test_gift_save_does_not_join_an_inflight_canonical_capture(api):
+    canonical = "http://93.184.216.34/join"
+    unlock = canonical + "?unlocked_article_code=abc"
+    plain = api.post("/api/save", json={"url": canonical})
+    assert plain.status_code == 202
+    canonical_id = plain.json()["id"]
+    row = _queue(unlock, canonical_url=canonical)
+    saved = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert saved.status_code == 202
+    gift_id = saved.json()["id"]
+    assert gift_id != canonical_id
+    assert capture.jobs[gift_id]["url"] == unlock
+    assert capture.jobs[gift_id]["skip_referrer_bounce"] is True
+    assert "skip_referrer_bounce" not in capture.jobs[canonical_id]
+    assert _should_referrer_retry(capture.jobs[canonical_id], {"paywalled": True}) is True
+
+
+def test_gift_save_reuses_a_usable_canonical_snapshot(api):
+    canonical = "http://93.184.216.34/already"
+    unlock = canonical + "?unlocked_article_code=abc"
+    row = _queue(unlock, canonical_url=canonical)
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, canonical, canonical)
+    _make_usable(sid, canonical)
+    saved = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert saved.status_code == 200
+    assert saved.json()["id"] == sid
+    assert saved.json()["status"] == "exists"
+    assert saved.json()["usable"] is True
+    assert capture.jobs == {}
+
+
+def test_second_gift_click_does_not_redeem_a_finished_unlock_capture(api):
+    unlock = "http://93.184.216.34/story?unlocked_article_code=abc"
+    row = _queue(unlock)
+    first = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert first.status_code == 202
+    gift_id = first.json()["id"]
+    _make_stub(gift_id, unlock)
+    capture.jobs[gift_id]["status"] = "complete"
+    again = api.post(f"/api/candidates/{row['id']}/save", json={})
+    assert again.status_code == 200
+    assert again.json() == {"id": gift_id, "status": "exists", "usable": False}
+    assert list(capture.jobs) == [gift_id]
 
 
 def test_expired_save_returns_410_and_does_not_capture(api):
