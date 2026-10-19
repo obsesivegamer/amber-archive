@@ -15,6 +15,7 @@ import posixpath
 import re
 import sqlite3
 import sys
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse
 
@@ -26,14 +27,19 @@ from .config import ID_ALPHABET
 from .security import article_match_key, normalize_url, validate_public_http_url
 
 PUBLISHERS = frozenset({"nyt", "wsj", "ft", "wapo", "atlantic", "newyorker", "other"})
-# Display names that do not compact to the key above. Compared after
-# lowercasing, stripping a leading "the", and dropping spaces and punctuation.
+# Folded display names. Whitespace, hyphens and apostrophes are one space.
+# Anything else must already be an allowlist key.
 _PUBLISHER_ALIASES = {
-    "newyorktimes": "nyt",
-    "wallstreetjournal": "wsj",
-    "financialtimes": "ft",
-    "washingtonpost": "wapo",
+    "new yorker": "newyorker",
+    "new york times": "nyt",
+    "ny times": "nyt",
+    "nytimes": "nyt",
+    "wall street journal": "wsj",
+    "financial times": "ft",
+    "washington post": "wapo",
 }
+# A run of whitespace, ASCII hyphens, or apostrophes. Other punctuation stays.
+_PUBLISHER_SEPARATOR = re.compile(r"[\s\-']+")
 
 # Shorter than the usual public gift window. A reported expires_at still wins
 # when it is earlier. Tune later.
@@ -125,13 +131,43 @@ def _present(find: dict, *names: str):
     return None
 
 
-def _normalize_publisher(value: str) -> str:
-    """Lowercase, drop a leading "the", then drop spaces, hyphens and punctuation."""
-    text = value.strip().lower()
-    if text.startswith("the"):
-        text = text[3:]
-    compact = re.sub(r"[^a-z0-9]", "", text)
-    return _PUBLISHER_ALIASES.get(compact, compact)
+def _forbidden_publisher_char(text: str) -> bool:
+    """Zero-width characters, combining marks, and soft hyphens."""
+    for char in text:
+        if unicodedata.combining(char) or unicodedata.category(char) == "Cf":
+            return True
+    return False
+
+
+def _fold_publisher(text: str) -> str | None:
+    """Collapse separators. None when the result is not a key or an alias.
+
+    A leading "the" is removed only as its own word, and that cannot produce
+    the sentinel ``other``.
+    """
+    if len(text) > 3 and text.startswith("the") and text[3].isspace():
+        text = text[4:].lstrip()
+        if _PUBLISHER_SEPARATOR.sub(" ", text).strip() == "other":
+            return None
+    folded = _PUBLISHER_SEPARATOR.sub(" ", text).strip()
+    key = _PUBLISHER_ALIASES.get(folded)
+    if key is None and folded in PUBLISHERS:
+        key = folded
+    return key
+
+
+def _normalize_publisher(value: str) -> str | None:
+    """Allowlist key for a publisher name, or None when it is not one.
+
+    NFKC must be plain ASCII. Only whitespace, hyphens and apostrophes fold
+    into a single space. The folded text must equal a key or an alias.
+    """
+    if _forbidden_publisher_char(value):
+        return None
+    text = unicodedata.normalize("NFKC", value)
+    if _forbidden_publisher_char(text) or not text.isascii():
+        return None
+    return _fold_publisher(text.strip().lower())
 
 
 def _publisher(find: dict) -> str:
@@ -141,7 +177,7 @@ def _publisher(find: dict) -> str:
     if not isinstance(value, str):
         raise ValueError("unknown publisher")
     key = _normalize_publisher(value)
-    if key not in PUBLISHERS:
+    if key is None:
         raise ValueError("unknown publisher")
     return key
 
