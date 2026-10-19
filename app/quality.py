@@ -10,8 +10,9 @@ that replace files must refuse a new capture that does not beat the stored one.
 
 Burned FT wall markers and a pricing-feature list are checked even when the
 raw page is long. Offer lines, and blocks of offer lines that sit together,
-are set aside. Prose between separate offer lines still counts. The page is
-a wall when fewer than 80 words remain. One mention inside a real article stays.
+are set aside. When those markers are present the score is the longest
+contiguous run of prose that remains, so short blurbs between pricing rows
+do not add up. A real article between two banners still counts.
 """
 
 from __future__ import annotations
@@ -133,19 +134,15 @@ def _is_benefit(piece: str) -> bool:
     return bool(_BENEFIT_RE.search(piece))
 
 
-def _prose_without_offer(text: str, *, aggressive: bool) -> str:
-    """Drop offer lines. A burned wall also drops the pitch block around them.
+def _offer_drop(pieces: list[str], *, aggressive: bool) -> set[int]:
+    """Indexes of offer lines and of benefit lines sitting against them.
 
-    A block is a contiguous run of offer or pricing lines, including benefit
-    lines that sit against those lines. Prose between two separate blocks
-    stays. The span from the first offer line to the last one is not removed.
+    Benefit lines count only on a burned wall, and only while they form one
+    block with a marker or a pricing line. A gap of ordinary prose stops the block.
     """
-    pieces = _pieces(text)
-    if not pieces:
-        return ""
     core = [_is_core_offer(piece) for piece in pieces]
     benefit = [_is_benefit(piece) for piece in pieces]
-    drop = set(index for index, flag in enumerate(core) if flag)
+    drop = {index for index, flag in enumerate(core) if flag}
     if aggressive:
         for index in list(drop):
             cursor = index - 1
@@ -156,6 +153,35 @@ def _prose_without_offer(text: str, *, aggressive: bool) -> str:
             while cursor < len(pieces) and (core[cursor] or benefit[cursor]):
                 drop.add(cursor)
                 cursor += 1
+    return drop
+
+
+def _word_runs(pieces: list[str], drop: set[int]) -> list[int]:
+    runs: list[int] = []
+    current = 0
+    for index, piece in enumerate(pieces):
+        if index in drop:
+            if current:
+                runs.append(current)
+                current = 0
+            continue
+        current += len(piece.split())
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _prose_without_offer(text: str, *, aggressive: bool) -> str:
+    """Drop offer lines. A burned wall also drops the pitch block around them.
+
+    A block is a contiguous run of offer or pricing lines, including benefit
+    lines that sit against those lines. Prose between two separate blocks
+    stays. The span from the first offer line to the last one is not removed.
+    """
+    pieces = _pieces(text)
+    if not pieces:
+        return ""
+    drop = _offer_drop(pieces, aggressive=aggressive)
     return " ".join(piece for index, piece in enumerate(pieces) if index not in drop)
 
 
@@ -190,16 +216,21 @@ def grade_parts(*, article_text: str, title: str = "", page_text: str = "") -> G
     """Grade extracted article text. `page_text` catches block pages the extractor drops.
 
     FT wall markers are applied even when the raw word count is past the
-    article minimum. What matters is the prose left after offer lines and
-    contiguous offer blocks are removed.
+    article minimum. With markers or a pricing list, the score is the longest
+    contiguous run of non-offer prose, not the sum of the short blurbs between rows.
     """
     source = article_text or page_text or ""
     word_count = len(source.split())
     blob = _norm("\n".join((title or "", page_text or "", article_text or "")))
     markers = _marker_count(blob)
     pricing_list = _pricing_hits(blob) >= _PRICING_LIST_MIN
-    prose = _prose_without_offer(source, aggressive=markers >= 2 or pricing_list)
-    score = len(prose.split())
+    pieces = _pieces(source)
+    drop = _offer_drop(pieces, aggressive=markers >= 2 or pricing_list)
+    runs = _word_runs(pieces, drop)
+    if markers or pricing_list:
+        score = max(runs) if runs else 0
+    else:
+        score = sum(runs)
     if score < MIN_ARTICLE_WORDS and _is_block(title, page_text or article_text):
         return Grade("bad", "block_page", 0, word_count)
     if (markers or pricing_list) and score < MIN_ARTICLE_WORDS:
