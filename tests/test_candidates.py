@@ -132,6 +132,91 @@ def test_overlapping_adds_insert_one_row(tmp_data):
     assert rows[0]["match_key"] == article_match_key("http://93.184.216.34/dup")
 
 
+@pytest.mark.parametrize(
+    ("label", "publisher"),
+    [
+        ("New Yorker", "newyorker"),
+        ("The New Yorker", "newyorker"),
+        ("new-yorker", "newyorker"),
+        ("newyorker", "newyorker"),
+        ("The Atlantic", "atlantic"),
+        ("Washington Post", "wapo"),
+        ("Wall Street Journal", "wsj"),
+        ("Financial Times", "ft"),
+        ("New York Times", "nyt"),
+        ("NY Times", "nyt"),
+        ("NYTimes", "nyt"),
+        ("nytimes", "nyt"),
+        ("NYT", "nyt"),
+        ("WSJ", "wsj"),
+        ("FT", "ft"),
+        ("WaPo", "wapo"),
+        ("New\u00a0Yorker", "newyorker"),
+    ],
+)
+def test_publisher_names_normalize_to_the_allowlist_key(tmp_data, label, publisher):
+    assert add_finds([_live_find(publisher=label)]) == ["added"]
+    assert db.list_gift_candidates()[0]["publisher"] == publisher
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "n.y.t",
+        "n y t",
+        "n-y-t",
+        "f t",
+        "o.t.h.e.r",
+        "thenyt",
+        "The Other",
+        "ny\u200bt",
+        "n\u0301yt",
+        "ny\u00adt",
+        "\uff4e\uff59\uff54",
+        "w\u017fj",
+        "\ufb01nancial times",
+    ],
+    ids=[
+        "dotted-nyt",
+        "spaced-nyt",
+        "hyphenated-nyt",
+        "spaced-ft",
+        "dotted-other",
+        "thenyt",
+        "the-other",
+        "zero-width",
+        "combining-mark",
+        "soft-hyphen",
+        "fullwidth-nyt",
+        "long-s",
+        "ligature-ft",
+    ],
+)
+def test_junk_publisher_names_are_rejected(tmp_data, label):
+    assert add_finds([_live_find(publisher=label)]) == ["rejected: unknown publisher"]
+    assert db.list_gift_candidates() == []
+
+
+def test_empty_or_missing_publisher_defaults_to_other(tmp_data):
+    missing = _live_find("http://93.184.216.34/missing-pub")
+    del missing["publisher"]
+    blank = _live_find("http://93.184.216.34/blank-pub", publisher="")
+    assert add_finds([missing, blank]) == ["added", "added"]
+    rows = {row["unlock_url"]: row["publisher"] for row in db.list_gift_candidates()}
+    assert rows == {
+        "http://93.184.216.34/missing-pub": "other",
+        "http://93.184.216.34/blank-pub": "other",
+    }
+
+
+def test_unknown_publisher_is_rejected(tmp_data):
+    assert add_finds([_live_find(publisher="The Economist")]) == ["rejected: unknown publisher"]
+    assert add_finds([_live_find("http://93.184.216.34/other-name", publisher="nope")]) == [
+        "rejected: unknown publisher"
+    ]
+    assert db.list_gift_candidates() == []
+
+
 def test_cli_rejects_bad_finds_and_keeps_the_good_one(tmp_data, monkeypatch, capsys):
     found = _iso(_now())
     payload = json.dumps(
