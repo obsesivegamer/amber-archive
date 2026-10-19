@@ -11,11 +11,12 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import posixpath
 import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
@@ -37,8 +38,8 @@ PUBLISHER_TTL = {
     "newyorker": timedelta(days=7),
     "other": timedelta(days=2),
 }
-# Article hosts. A bare host and www are the same publication. Keys match
-# PUBLISHERS. The homepage and /newsletters are not articles on any of them.
+# Article hosts. Keys match PUBLISHERS. Only the apex, or that apex with one
+# www label, is the publication. Other subdomains are not.
 PUBLICATION_DOMAINS = {
     "nyt": "nytimes.com",
     "wsj": "wsj.com",
@@ -47,6 +48,11 @@ PUBLICATION_DOMAINS = {
     "atlantic": "theatlantic.com",
     "newyorker": "newyorker.com",
 }
+_APEX_HOSTS = frozenset(PUBLICATION_DOMAINS.values())
+# FT gift links are redeemed on this host, not on ft.com.
+_EXTRA_ALLOWED_HOSTS = frozenset({"giftarticle.ft.com"})
+# The homepage and /newsletters are not articles. Compared after the path is
+# percent-decoded and normalized.
 _NON_ARTICLE_PATHS = frozenset({"/", "/newsletters"})
 # Expired rows stay this long so a repeat find refreshes the same candidate
 # instead of queueing a dead link again.
@@ -222,6 +228,23 @@ def _usable_archive(urls: list[str], best_match, find_matches) -> bool:
     return False
 
 
+def _normalized_path(path: str) -> str:
+    """Percent-decode, collapse slashes, and resolve . and .. segments.
+
+    posixpath.normpath keeps a leading double slash, so repeated slashes are
+    collapsed first. The membership test then sees /newsletters for
+    //newsletters, foo/../newsletters, and %6eewsletters.
+    """
+    decoded = unquote(path or "/")
+    collapsed = re.sub(r"/{2,}", "/", decoded)
+    if not collapsed.startswith("/"):
+        collapsed = "/" + collapsed
+    normalized = posixpath.normpath(collapsed)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized.lower()
+
+
 def _host_and_path(url: str) -> tuple[str, str] | None:
     raw = (url or "").strip()
     if not raw:
@@ -235,10 +258,7 @@ def _host_and_path(url: str) -> tuple[str, str] | None:
         return None
     if not host:
         return None
-    path = parsed.path or "/"
-    if path != "/" and path.endswith("/"):
-        path = path.rstrip("/") or "/"
-    return host, path.lower()
+    return host, _normalized_path(parsed.path or "/")
 
 
 def _address_literal(host: str) -> bool:
@@ -249,12 +269,14 @@ def _address_literal(host: str) -> bool:
     return True
 
 
-def _publication_domain(host: str) -> str | None:
-    bare = host[4:] if host.startswith("www.") else host
-    for domain in PUBLICATION_DOMAINS.values():
-        if bare == domain or bare.endswith("." + domain):
-            return domain
-    return None
+def _allowed_publication_host(host: str) -> bool:
+    """Apex, a single www label on that apex, or an explicit extra host."""
+    host = host.lower().rstrip(".")
+    if host in _EXTRA_ALLOWED_HOSTS or host in _APEX_HOSTS:
+        return True
+    if host.startswith("www."):
+        return host[4:] in _APEX_HOSTS
+    return False
 
 
 def _allowed_article_url(url: str) -> bool:
@@ -270,7 +292,7 @@ def _allowed_article_url(url: str) -> bool:
     host, path = found
     if _address_literal(host):
         return True
-    if _publication_domain(host) is None:
+    if not _allowed_publication_host(host):
         return False
     return path not in _NON_ARTICLE_PATHS
 

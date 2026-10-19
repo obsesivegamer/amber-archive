@@ -341,6 +341,43 @@ def test_newyorker_non_article_paths_match_other_publications(tmp_data, allow_pr
     assert db.list_gift_candidates() == []
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.newyorker.com/magazine/2026/10/19/city-bridge",
+        "https://www.evil.newyorker.com/magazine/2026/10/19/city-bridge",
+        "https://attacker.ft.com/content/abc123",
+        "https://myaccount.nytimes.com/2026/10/16/us/cities.html",
+        "https://on.wsj.com/articles/story",
+    ],
+)
+def test_publication_subdomains_are_rejected(tmp_data, allow_private, url):
+    assert add_finds([_live_find(url, publisher="other")]) == [_NOT_AN_ARTICLE]
+    assert db.list_gift_candidates() == []
+
+
+def test_ft_gift_host_is_still_accepted(tmp_data, allow_private):
+    url = "https://giftarticle.ft.com/giftarticle/actions/redeem/TOKEN"
+    canonical = "https://www.ft.com/content/abc123"
+    assert add_finds([_live_find(url, publisher="ft", canonical_url=canonical)]) == ["added"]
+    row = db.list_gift_candidates()[0]
+    assert row["unlock_url"] == url
+    assert row["canonical_url"] == canonical
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.newyorker.com/foo/../newsletters",
+        "https://newyorker.com/%6eewsletters",
+        "https://www.newyorker.com//newsletters",
+    ],
+)
+def test_equivalent_newsletter_paths_are_rejected(tmp_data, allow_private, url):
+    assert add_finds([_live_find(url, publisher="newyorker")]) == [_NOT_AN_ARTICLE]
+    assert db.list_gift_candidates() == []
+
+
 def test_unrelated_domain_is_rejected(tmp_data, allow_private):
     lines = add_finds(
         [
