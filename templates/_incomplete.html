@@ -1,3 +1,12 @@
 {% if s.paywalled %}
 <span class="flag-incomplete">incomplete · short extract</span>
 {% endif %}
+{% if s.recapture_state == 'pending' or s.recapture_state == 'running' %}
+<span class="flag-recapture">recapture pending</span>
+{% elif s.recapture_state == 'gave_up' %}
+<span class="flag-recapture">recapture gave up</span>
+{% elif s.recapture_state == 'needs_browser_capture' %}
+<span class="flag-recapture">needs browser capture</span>
+{% elif s.recapture_state == 'needs_fresh_gift' %}
+<span class="flag-recapture">needs fresh gift</span>
+{% endif %}

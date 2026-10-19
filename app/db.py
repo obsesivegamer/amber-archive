@@ -65,6 +65,29 @@ _CANDIDATE_ADD_COLUMNS = (
 )
 
 
+_RECAPTURE_ADD_COLUMNS = (
+    ("unlock_url", "TEXT"),
+    ("recapture_state", "TEXT"),
+    ("recapture_reason", "TEXT"),
+    ("recapture_attempts", "INTEGER"),
+    ("recapture_next_at", "TEXT"),
+)
+
+
+def _ensure_recapture_columns(db: sqlite3.Connection) -> None:
+    """Optional recapture fields. Existing rows stay NULL and keep their files."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
+    for name, decl in _RECAPTURE_ADD_COLUMNS:
+        if name not in cols:
+            db.execute(f"ALTER TABLE snapshots ADD COLUMN {name} {decl}")
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_snaps_recapture
+        ON snapshots(recapture_state, recapture_next_at)
+        """
+    )
+
+
 def _ensure_paywalled_column(db: sqlite3.Connection) -> None:
     cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
     if "paywalled" not in cols:
@@ -282,6 +305,7 @@ def init_db() -> None:
     with connect() as db:
         db.executescript(SCHEMA)
         _ensure_paywalled_column(db)
+        _ensure_recapture_columns(db)
         _ensure_candidates_table(db)
         db.commit()
 
@@ -461,6 +485,35 @@ def recent_snapshots(limit: int = 12) -> list[dict]:
             (limit,),
         ).fetchall()
     return [_as_snap(r) for r in rows]
+
+
+def complete_snapshots() -> list[dict]:
+    """Every complete snapshot, oldest first."""
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE status = 'complete'
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    return [_as_snap(row) for row in rows]
+
+
+def recapture_snapshots() -> list[dict]:
+    """Snaps waiting on a recapture, paused, or stopped."""
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE recapture_state IN (
+                'pending', 'running', 'gave_up',
+                'needs_browser_capture', 'needs_fresh_gift'
+            )
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    return [_as_snap(row) for row in rows]
 
 
 def complete_since(created_after: str) -> list[dict]:

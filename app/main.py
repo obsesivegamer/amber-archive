@@ -47,7 +47,7 @@ def mime_for_filename(filename: str) -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or "application/octet-stream"
 
-from . import capture, db
+from . import capture, db, recapture
 from .api import (
     MAX_IMPORT_BODY_BYTES,
     _read_body_capped,
@@ -95,6 +95,7 @@ RESERVED = {
     "delete",
     "favicon.ico",
     "robots.txt",
+    "recapture",
 }
 
 
@@ -471,6 +472,19 @@ async def delete_saved(sid: str):
     if not db.delete_snapshot(sid):
         raise HTTPException(404, "Not found")
     return RedirectResponse("/saved", status_code=303)
+
+
+@app.post("/recapture/run")
+async def recapture_run():
+    """Retry due bad snapshots once. Safe to call from a timer or twice at once."""
+    report = await asyncio.to_thread(recapture.run)
+    return JSONResponse(report)
+
+
+@app.get("/recapture")
+async def recapture_status():
+    report = await asyncio.to_thread(recapture.status)
+    return JSONResponse(report)
 
 
 @app.get("/search", response_class=HTMLResponse)
