@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
+import posixpath
 import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlparse
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
@@ -35,6 +38,22 @@ PUBLISHER_TTL = {
     "newyorker": timedelta(days=7),
     "other": timedelta(days=2),
 }
+# Article hosts. Keys match PUBLISHERS. Only the apex, or that apex with one
+# www label, is the publication. Other subdomains are not.
+PUBLICATION_DOMAINS = {
+    "nyt": "nytimes.com",
+    "wsj": "wsj.com",
+    "ft": "ft.com",
+    "wapo": "washingtonpost.com",
+    "atlantic": "theatlantic.com",
+    "newyorker": "newyorker.com",
+}
+_APEX_HOSTS = frozenset(PUBLICATION_DOMAINS.values())
+# FT gift links are redeemed on this host, not on ft.com.
+_EXTRA_ALLOWED_HOSTS = frozenset({"giftarticle.ft.com"})
+# The homepage and /newsletters are not articles. Compared after the path is
+# percent-decoded and normalized.
+_NON_ARTICLE_PATHS = frozenset({"/", "/newsletters"})
 # Expired rows stay this long so a repeat find refreshes the same candidate
 # instead of queueing a dead link again.
 PURGE_AFTER = timedelta(days=30)
@@ -209,13 +228,90 @@ def _usable_archive(urls: list[str], best_match, find_matches) -> bool:
     return False
 
 
+def _normalized_path(path: str) -> str:
+    """Percent-decode, collapse slashes, and resolve . and .. segments.
+
+    posixpath.normpath keeps a leading double slash, so repeated slashes are
+    collapsed first. The membership test then sees /newsletters for
+    //newsletters, foo/../newsletters, and %6eewsletters.
+    """
+    decoded = unquote(path or "/")
+    collapsed = re.sub(r"/{2,}", "/", decoded)
+    if not collapsed.startswith("/"):
+        collapsed = "/" + collapsed
+    normalized = posixpath.normpath(collapsed)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized.lower()
+
+
+def _host_and_path(url: str) -> tuple[str, str] | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return host, _normalized_path(parsed.path or "/")
+
+
+def _address_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        return False
+    return True
+
+
+def _allowed_publication_host(host: str) -> bool:
+    """Apex, a single www label on that apex, or an explicit extra host."""
+    host = host.lower().rstrip(".")
+    if host in _EXTRA_ALLOWED_HOSTS or host in _APEX_HOSTS:
+        return True
+    if host.startswith("www."):
+        return host[4:] in _APEX_HOSTS
+    return False
+
+
+def _allowed_article_url(url: str) -> bool:
+    """True for an article on an allowed publication.
+
+    Address literals are not publication domains. They stay on the public-URL
+    check, which does not need a DNS lookup. On an allowed publication, the
+    homepage and /newsletters are not articles. Any other hostname is rejected.
+    """
+    found = _host_and_path(url)
+    if found is None:
+        return False
+    host, path = found
+    if _address_literal(host):
+        return True
+    if not _allowed_publication_host(host):
+        return False
+    return path not in _NON_ARTICLE_PATHS
+
+
+def _require_allowed_article(url: str, field: str) -> None:
+    if not _allowed_article_url(url):
+        raise ValueError(f"{field} is not an allowed article URL")
+
+
 def _parse_find(find: dict) -> dict:
     publisher = _publisher(find)
     raw_unlock = _present(find, "unlock_url")
     if raw_unlock is None:
         raise ValueError("unlock_url is required")
     unlock = _clean_url(raw_unlock, "unlock_url")
+    _require_allowed_article(unlock, "unlock_url")
     canonical = _optional_url(find, "canonical_url")
+    if canonical:
+        _require_allowed_article(canonical, "canonical_url")
     source_url = _optional_url(find, "source_url", "x_post_url")
     title = _short_text(_present(find, "title"), "title", MAX_TITLE_CHARS)
     author = _short_text(
