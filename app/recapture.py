@@ -14,6 +14,8 @@ files stay untouched):
 - ``recapture_attempts`` — how many /save fetches have run.
 - ``recapture_next_at`` — when a pending snap is due, or the claim lease while
   ``running``.
+- ``recapture_owner`` — token of the process that holds a running row. File
+  swaps and status writes compare-and-set on this token. NULL otherwise.
 
 ``meta.json`` gains ``unlock_url`` when one is known, and ``recapture`` with
 ``state``, ``reason``, ``attempts``, ``next_at`` and ``history``. History
@@ -33,19 +35,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
+import re
+import secrets
+import shutil
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from PIL import Image
+
 from . import db
 from .extract import extract_article
-from .freeze import freeze_html
-from .ingest import _save_jpeg
+from .freeze import freeze_html, rewrite_css
 from .quality import PAYWALL_REASONS, Grade, grade_html, grade_parts, is_better
 from .reader import build_reader_html
 from .security import article_match_key
@@ -57,11 +64,28 @@ log = logging.getLogger("amber.recapture")
 BACKOFF_SECONDS = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
 MAX_ATTEMPTS = 4
 CLAIM_LEASE_SECONDS = 15 * 60
+# One pass leases a few due rows, refreshes each lease before that fetch,
+# then comes back for the next few. A long queue is not stamped at once.
+CLAIM_BATCH = 4
 
 # Plain article URLs on these hosts come back paywalled. Retry the unlock URL
 # or stop. FT is not in this list: a plain FT URL can still be tried once.
 _GIFT_HOSTS = ("nytimes.com", "wsj.com", "washingtonpost.com")
 _UNLOCK_QUERY = ("unlocked_article_code", "accesstoken", "pwapi_token", "gift")
+# History stores a fixed detail, and this strips a gift token if one lands in
+# a string anyway. The key name goes too, so the log cannot be replayed.
+_GIFT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:unlocked_article_code|accesstoken|pwapi_token|gift|st)"
+    r"=[^&\s\"']+",
+    re.I,
+)
+_TERMINAL_VALUE_ERRORS = (
+    "private or local",
+    "local urls",
+    "numeric hosts",
+    "credentials",
+    "only http and https",
+)
 
 _RUN_LOCK = threading.Lock()
 
@@ -119,13 +143,36 @@ def looks_like_unlock(url: str | None) -> bool:
 
 
 def failure_kind(exc: BaseException) -> str:
-    """Classify a /save fetch error. Anything else can be retried later."""
+    """Classify a /save fetch error.
+
+    Private-host, credential, and non-http rejections stop. A DNS miss and a
+    timeout stay on the backoff schedule. Other errors do too.
+    """
     message = str(exc).lower()
     if "redirected to a blocked address" in message:
         return "private_redirect"
+    if "timed out" in message or "timeout" in message:
+        return "timeout"
     if isinstance(exc, ValueError):
-        return "ssrf"
+        if "could not resolve host" in message:
+            return "dns"
+        if any(snippet in message for snippet in _TERMINAL_VALUE_ERRORS):
+            return "ssrf"
+        return "transient"
     return "transient"
+
+
+def _failure_detail(kind: str) -> str:
+    return {
+        "private_redirect": "private redirect",
+        "ssrf": "ssrf",
+        "dns": "dns",
+        "timeout": "timeout",
+    }.get(kind, "error")
+
+
+def _redact(value: str) -> str:
+    return _GIFT_TOKEN_RE.sub("[redacted]", value)
 
 
 def _delay_for(attempts: int) -> int | None:
@@ -151,7 +198,7 @@ def _write_meta(sid: str, meta: dict) -> None:
     if not folder.is_dir():
         return
     path = folder / "meta.json"
-    tmp = path.with_name(path.name + ".recapture-new")
+    tmp = path.with_name(path.name + f".{secrets.token_hex(8)}.recapture-new")
     try:
         tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
@@ -285,6 +332,61 @@ def status() -> dict:
     return grouped
 
 
+def _scrub_history(entry: dict) -> dict:
+    cleaned = {}
+    for key, value in entry.items():
+        cleaned[key] = _redact(value) if isinstance(value, str) else value
+    return cleaned
+
+
+def _still_owner(sid: str, token: str, now: datetime) -> bool:
+    """Refresh this row's lease only if `token` still holds it."""
+    lease = _iso(now + timedelta(seconds=CLAIM_LEASE_SECONDS))
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT id FROM snapshots
+            WHERE id = ? AND recapture_state = 'running' AND recapture_owner = ?
+            """,
+            (sid, token),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return False
+        conn.execute(
+            """
+            UPDATE snapshots
+            SET recapture_next_at = ?
+            WHERE id = ? AND recapture_state = 'running' AND recapture_owner = ?
+            """,
+            (lease, sid, token),
+        )
+        conn.commit()
+    return True
+
+
+def _release(sid: str, token: str, fields: dict[str, Any]) -> bool:
+    """Write status only while `token` still owns the row, then drop the lease."""
+    fields = dict(fields)
+    fields["recapture_owner"] = None
+    cols = ", ".join(f"{name} = ?" for name in fields)
+    values = list(fields.values())
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            f"""
+            UPDATE snapshots
+            SET {cols}
+            WHERE id = ? AND recapture_state = 'running' AND recapture_owner = ?
+            """,
+            (*values, sid, token),
+        )
+        owned = cur.rowcount == 1
+        conn.commit()
+    return owned
+
+
 def _remember(
     sid: str,
     snap: dict,
@@ -298,7 +400,13 @@ def _remember(
     history: dict | None,
     unlock: _Unlock | None,
     write_meta: bool,
-) -> None:
+    owner: str | None = None,
+    now: datetime | None = None,
+    content: dict | None = None,
+) -> bool:
+    """Persist queue status. With `owner`, skip the write if the lease was lost."""
+    if owner is not None and not _still_owner(sid, owner, _clock(now)):
+        return False
     if write_meta:
         stored = dict(meta)
         stored["id"] = sid
@@ -315,14 +423,17 @@ def _remember(
             past = rec.get("history")
             if not isinstance(past, list):
                 past = []
-            past.append(history)
-            rec["history"] = past[-12:]
+            past.append(_scrub_history(history))
+            rec["history"] = [
+                _scrub_history(item) if isinstance(item, dict) else item for item in past[-12:]
+            ]
         stored["recapture"] = rec
         if unlock is not None:
             stored["unlock_url"] = unlock.url
             if unlock.expires_at:
                 stored["unlock_expires_at"] = unlock.expires_at
-        _write_meta(sid, stored)
+    else:
+        stored = meta
     fields: dict[str, Any] = {
         "recapture_state": state,
         "recapture_reason": reason,
@@ -332,7 +443,18 @@ def _remember(
         fields["recapture_attempts"] = attempts
     if unlock is not None and unlock.url and not snap.get("unlock_url"):
         fields["unlock_url"] = unlock.url
+    if content:
+        fields.update(content)
+    if owner is not None:
+        if not _release(sid, owner, fields):
+            return False
+        if write_meta:
+            _write_meta(sid, stored)
+        return True
+    if write_meta:
+        _write_meta(sid, stored)
     db.update_snapshot(sid, **fields)
+    return True
 
 
 def _history(
@@ -345,15 +467,17 @@ def _history(
     new_score: int | None = None,
     url_kind: str | None = None,
 ) -> dict:
-    return {
-        "at": _iso(now),
-        "outcome": outcome,
-        "reason": reason,
-        "detail": detail,
-        "score": score,
-        "new_score": new_score,
-        "url_kind": url_kind,
-    }
+    return _scrub_history(
+        {
+            "at": _iso(now),
+            "outcome": outcome,
+            "reason": reason,
+            "detail": detail,
+            "score": score,
+            "new_score": new_score,
+            "url_kind": url_kind,
+        }
+    )
 
 
 def _stop_for_gift(snap: dict, unlock: _Unlock | None) -> str | None:
@@ -436,10 +560,10 @@ def _classify(now: datetime) -> None:
         _classify_one(snap, now)
 
 
-def _claim_due(now: datetime) -> list[str]:
+def _claim_due(now: datetime) -> list[tuple[str, str]]:
+    """Lease up to CLAIM_BATCH due rows, each with its own owner token and lease."""
     now_s = _iso(now)
-    lease = _iso(now + timedelta(seconds=CLAIM_LEASE_SECONDS))
-    claimed: list[str] = []
+    claimed: list[tuple[str, str]] = []
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         stale = conn.execute(
@@ -456,10 +580,10 @@ def _claim_due(now: datetime) -> list[str]:
             conn.execute(
                 """
                 UPDATE snapshots
-                SET recapture_state = 'pending'
-                WHERE id = ? AND recapture_state = 'running'
+                SET recapture_state = 'pending', recapture_owner = NULL
+                WHERE id = ? AND recapture_state = 'running' AND recapture_next_at <= ?
                 """,
-                (row["id"],),
+                (row["id"], now_s),
             )
         due = conn.execute(
             """
@@ -468,20 +592,25 @@ def _claim_due(now: datetime) -> list[str]:
               AND recapture_state = 'pending'
               AND (recapture_next_at IS NULL OR recapture_next_at <= ?)
             ORDER BY created_at ASC, rowid ASC
+            LIMIT ?
             """,
-            (now_s,),
+            (now_s, CLAIM_BATCH),
         ).fetchall()
         for row in due:
+            token = secrets.token_hex(16)
+            lease = _iso(now + timedelta(seconds=CLAIM_LEASE_SECONDS))
             cur = conn.execute(
                 """
                 UPDATE snapshots
-                SET recapture_state = 'running', recapture_next_at = ?
+                SET recapture_state = 'running',
+                    recapture_next_at = ?,
+                    recapture_owner = ?
                 WHERE id = ? AND recapture_state = 'pending'
                 """,
-                (lease, row["id"]),
+                (lease, token, row["id"]),
             )
             if cur.rowcount:
-                claimed.append(row["id"])
+                claimed.append((row["id"], token))
         conn.commit()
     return claimed
 
@@ -495,47 +624,122 @@ def _coerce(url: str, fetched: Any) -> dict:
     raise RuntimeError("recapture fetch returned no html")
 
 
-def _atomic_file(path, content: str | bytes) -> None:
-    tmp = path.with_name(path.name + ".recapture-new")
+def _prefer(new: Any, old: Any) -> Any:
+    """Keep the stored value when the new extract has nothing for this field."""
+    if isinstance(new, str):
+        new = new.strip() or None
+    if new:
+        return new
+    return old
+
+
+def _jpeg_pair(raw: bytes) -> tuple[bytes, bytes | None]:
+    """Encode a screenshot in memory. The snap file is replaced afterwards."""
     try:
-        if isinstance(content, str):
-            tmp.write_text(content, encoding="utf-8")
-        else:
-            tmp.write_bytes(content)
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+        image = Image.open(io.BytesIO(raw))
+        rgb = image.convert("RGB")
+        shot = io.BytesIO()
+        rgb.save(shot, "JPEG", quality=82)
+        rgb.thumbnail((480, 360))
+        thumb = io.BytesIO()
+        rgb.save(thumb, "JPEG", quality=70)
+        return shot.getvalue(), thumb.getvalue()
+    except Exception:
+        return raw, None
 
 
-def _swap_files(sid: str, snap: dict, meta: dict, fetched: dict, grade: Grade) -> dict:
-    """Write a better capture into the existing snap directory."""
-    folder = db.snap_dir(sid)
-    folder.mkdir(parents=True, exist_ok=True)
-    html = fetched["html"]
+def _safe_resource_name(filename: str) -> bool:
+    return (
+        bool(filename)
+        and filename not in {".", ".."}
+        and "/" not in filename
+        and "\\" not in filename
+    )
+
+
+def _resource_body(
+    filename: str,
+    packed: Any,
+    resource_map: dict,
+    final_url: str,
+    sid: str,
+) -> bytes | None:
+    if isinstance(packed, tuple):
+        body = packed[0]
+    else:
+        body = packed
+    if not isinstance(body, (bytes, bytearray)):
+        return None
+    data = bytes(body)
+    if filename.endswith(".css"):
+        css_url = next((url for url, name in resource_map.items() if name == filename), final_url)
+        try:
+            text = data.decode("utf-8", errors="replace")
+            text = rewrite_css(text, css_url, resource_map, sid)
+            return text.encode("utf-8")
+        except Exception:
+            return data
+    return data
+
+
+def _stage_capture(sid: str, snap: dict, meta: dict, fetched: dict, token: str) -> tuple[Any, Grade, dict, dict]:
+    """Write the replacement set under DATA_DIR and grade that set.
+
+    Nothing in the snap directory is touched here. The stage lives on the
+    same filesystem as the snaps so a later replace does not copy across devices.
+    """
     final_url = fetched.get("final_url") or snap.get("final_url") or snap.get("url") or ""
-    article = extract_article(html, final_url)
-    frozen = freeze_html(html, final_url, {}, sid)
+    resource_map = fetched.get("resource_map") if isinstance(fetched.get("resource_map"), dict) else {}
+    bodies = fetched.get("resource_bodies") if isinstance(fetched.get("resource_bodies"), dict) else {}
+    frozen = freeze_html(fetched["html"], final_url, resource_map, sid)
+    article = extract_article(frozen, final_url)
     reader = build_reader_html(article, snap.get("url") or final_url)
-    _atomic_file(folder / "page.html", frozen)
-    _atomic_file(folder / "article.html", article.get("article_html") or "")
-    _atomic_file(folder / "article.txt", article.get("article_text") or "")
-    _atomic_file(folder / "reader.html", reader)
+    stage = db.DATA_DIR / "recapture-staging" / token
+    try:
+        if stage.exists():
+            shutil.rmtree(stage)
+        (stage / "res").mkdir(parents=True)
+    except Exception:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+    (stage / "page.html").write_text(frozen, encoding="utf-8")
+    (stage / "article.html").write_text(article.get("article_html") or "", encoding="utf-8")
+    (stage / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
+    (stage / "reader.html").write_text(reader, encoding="utf-8")
+    for filename, packed in bodies.items():
+        if not isinstance(filename, str) or not _safe_resource_name(filename):
+            continue
+        data = _resource_body(filename, packed, resource_map, final_url, sid)
+        if data is None:
+            continue
+        (stage / "res" / filename).write_bytes(data)
     shot = fetched.get("screenshot")
     if isinstance(shot, (bytes, bytearray)) and shot:
-        _save_jpeg(folder, bytes(shot))
+        image, thumb = _jpeg_pair(bytes(shot))
+        (stage / "screenshot.jpg").write_bytes(image)
+        if thumb is not None:
+            (stage / "thumb.jpg").write_bytes(thumb)
+    grade = grade_html(frozen, final_url)
+    text_grade = grade_parts(
+        article_text=article.get("article_text") or "",
+        title=str(article.get("title") or ""),
+        page_text=article.get("article_text") or "",
+    )
+    if grade.label == "good" and text_grade.label != "good":
+        grade = text_grade
     stored = dict(meta)
     stored.update(
         {
             "id": sid,
             "url": snap.get("url") or stored.get("url"),
             "final_url": final_url,
-            "title": article.get("title") or stored.get("title"),
-            "site_name": article.get("site_name") or stored.get("site_name"),
-            "author": article.get("author"),
-            "published_at": article.get("published_at"),
-            "description": article.get("description"),
-            "dek": article.get("dek"),
+            "title": _prefer(article.get("title"), stored.get("title")),
+            "site_name": _prefer(article.get("site_name"), stored.get("site_name")),
+            "author": _prefer(article.get("author"), stored.get("author")),
+            "published_at": _prefer(article.get("published_at"), stored.get("published_at")),
+            "description": _prefer(article.get("description"), stored.get("description")),
+            "dek": _prefer(article.get("dek"), stored.get("dek")),
             "word_count": article.get("word_count"),
             "paywalled": article.get("paywalled"),
             "quality": grade.as_dict(),
@@ -543,7 +747,7 @@ def _swap_files(sid: str, snap: dict, meta: dict, fetched: dict, grade: Grade) -
     )
     if fetched.get("http_status") is not None:
         stored["http_status"] = fetched.get("http_status")
-    fields: dict[str, Any] = {
+    content: dict[str, Any] = {
         "final_url": final_url,
         "title": stored.get("title"),
         "site_name": stored.get("site_name"),
@@ -556,9 +760,33 @@ def _swap_files(sid: str, snap: dict, meta: dict, fetched: dict, grade: Grade) -
         "error": None,
     }
     if stored.get("http_status") is not None:
-        fields["http_status"] = stored["http_status"]
-    db.update_snapshot(sid, **fields)
-    return stored
+        content["http_status"] = stored["http_status"]
+    return stage, grade, stored, content
+
+
+def _publish_staged(stage, folder) -> None:
+    """Move a finished stage into the snap. page.html lands last.
+
+    A crash before that replace leaves the previous page.html, which is what
+    a later grade trusts. article.txt from this attempt is already beside it
+    only after both replaces have run; callers record ok only then.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "res").mkdir(exist_ok=True)
+    files = [path for path in stage.rglob("*") if path.is_file()]
+
+    def order(path) -> tuple[int, str]:
+        rel = str(path.relative_to(stage))
+        if rel == "page.html":
+            return (2, rel)
+        if rel == "article.txt":
+            return (1, rel)
+        return (0, rel)
+
+    for path in sorted(files, key=order):
+        dest = folder / path.relative_to(stage)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(path, dest)
 
 
 def _schedule(
@@ -571,10 +799,12 @@ def _schedule(
     grade: Grade,
     history: dict,
     unlock: _Unlock | None,
+    owner: str | None = None,
+    content: dict | None = None,
 ) -> str:
     delay = _delay_for(attempts)
     if delay is None:
-        _remember(
+        if not _remember(
             sid,
             snap,
             meta,
@@ -586,9 +816,13 @@ def _schedule(
             history=history,
             unlock=unlock,
             write_meta=True,
-        )
+            owner=owner,
+            now=now,
+            content=content,
+        ):
+            return "lost"
         return "gave_up"
-    _remember(
+    if not _remember(
         sid,
         snap,
         meta,
@@ -600,11 +834,15 @@ def _schedule(
         history=history,
         unlock=unlock,
         write_meta=True,
-    )
+        owner=owner,
+        now=now,
+        content=content,
+    ):
+        return "lost"
     return "pending"
 
 
-def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
+def _attempt(sid: str, now: datetime, fetch: Fetch, owner: str) -> str:
     """Retry one claimed snap. Returns ``replaced`` or another outcome name."""
     snap = db.get_snapshot(sid)
     if snap is None:
@@ -625,6 +863,8 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
             history=None,
             unlock=None,
             write_meta=False,
+            owner=owner,
+            now=now,
         )
         return "kept"
     if meta.get("imported"):
@@ -646,6 +886,8 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
             ),
             unlock=unlock,
             write_meta=True,
+            owner=owner,
+            now=now,
         )
         return "needs_browser_capture"
     gift_block = _stop_for_gift(snap, unlock)
@@ -668,20 +910,22 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
             ),
             unlock=unlock,
             write_meta=True,
+            owner=owner,
+            now=now,
         )
         return "needs_fresh_gift"
 
     url, url_kind = (snap.get("url") or ""), "article"
     if unlock is not None and not unlock.expired:
         url, url_kind = unlock.url, "unlock"
+    if not _still_owner(sid, owner, now):
+        return "lost"
     attempts = int(snap.get("recapture_attempts") or 0) + 1
     try:
         fetched = _coerce(url, fetch(url))
     except Exception as exc:
         kind = failure_kind(exc)
-        detail = "private redirect" if kind == "private_redirect" else (
-            "ssrf" if kind == "ssrf" else str(exc)[:200]
-        )
+        detail = _failure_detail(kind)
         if kind in {"ssrf", "private_redirect"}:
             _remember(
                 sid,
@@ -702,6 +946,8 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
                 ),
                 unlock=unlock,
                 write_meta=True,
+                owner=owner,
+                now=now,
             )
             return "needs_browser_capture"
         return _schedule(
@@ -720,44 +966,122 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
                 url_kind=url_kind,
             ),
             unlock=unlock,
+            owner=owner,
         )
 
-    new_grade = grade_html(fetched["html"], fetched.get("final_url") or url)
-    if new_grade.reason in PAYWALL_REASONS:
-        state = "needs_fresh_gift" if url_kind == "unlock" or requires_gift(
-            snap.get("url"), snap.get("final_url")
-        ) else "needs_browser_capture"
-        detail = "gift link burned" if state == "needs_fresh_gift" else "paywall"
-        _remember(
-            sid,
-            snap,
-            meta,
-            state=state,
-            reason=new_grade.reason,
-            attempts=attempts,
-            next_at=None,
-            grade=grade,
-            history=_history(
-                now,
-                outcome=state,
-                reason=new_grade.reason,
-                detail=detail,
-                score=grade.score,
-                new_score=new_grade.score,
-                url_kind=url_kind,
-            ),
-            unlock=unlock,
-            write_meta=True,
-        )
-        return state
-
-    if is_better(new_grade, grade):
-        meta = _swap_files(sid, snap, meta, fetched, new_grade)
-        if new_grade.label == "good":
+    stage = None
+    try:
+        stage, new_grade, staged_meta, content = _stage_capture(sid, snap, meta, fetched, owner)
+        if new_grade.reason in PAYWALL_REASONS:
+            state = "needs_fresh_gift" if url_kind == "unlock" or requires_gift(
+                snap.get("url"), snap.get("final_url")
+            ) else "needs_browser_capture"
+            detail = "gift link burned" if state == "needs_fresh_gift" else "paywall"
             _remember(
                 sid,
                 snap,
                 meta,
+                state=state,
+                reason=new_grade.reason,
+                attempts=attempts,
+                next_at=None,
+                grade=grade,
+                history=_history(
+                    now,
+                    outcome=state,
+                    reason=new_grade.reason,
+                    detail=detail,
+                    score=grade.score,
+                    new_score=new_grade.score,
+                    url_kind=url_kind,
+                ),
+                unlock=unlock,
+                write_meta=True,
+                owner=owner,
+                now=now,
+            )
+            return state
+
+        # Grade the files on disk again. Another worker may already have
+        # published a better capture while this fetch was in flight.
+        disk = grade_snap(sid)
+        if not is_better(new_grade, disk):
+            return _schedule(
+                sid,
+                snap,
+                meta,
+                now=now,
+                attempts=attempts,
+                grade=disk,
+                history=_history(
+                    now,
+                    outcome="kept",
+                    reason=new_grade.reason,
+                    detail="not better",
+                    score=disk.score,
+                    new_score=new_grade.score,
+                    url_kind=url_kind,
+                ),
+                unlock=unlock,
+                owner=owner,
+            )
+        # Compare-and-set immediately before any snap write.
+        if not _still_owner(sid, owner, now):
+            return "lost"
+        disk = grade_snap(sid)
+        if not is_better(new_grade, disk):
+            return _schedule(
+                sid,
+                snap,
+                meta,
+                now=now,
+                attempts=attempts,
+                grade=disk,
+                history=_history(
+                    now,
+                    outcome="kept",
+                    reason=new_grade.reason,
+                    detail="not better",
+                    score=disk.score,
+                    new_score=new_grade.score,
+                    url_kind=url_kind,
+                ),
+                unlock=unlock,
+                owner=owner,
+            )
+        page_bytes = (stage / "page.html").read_bytes()
+        text_bytes = (stage / "article.txt").read_bytes()
+        _publish_staged(stage, db.snap_dir(sid))
+        folder = db.snap_dir(sid)
+        same_attempt = (
+            (folder / "page.html").read_bytes() == page_bytes
+            and (folder / "article.txt").read_bytes() == text_bytes
+        )
+        if not same_attempt:
+            return _schedule(
+                sid,
+                snap,
+                meta,
+                now=now,
+                attempts=attempts,
+                grade=grade,
+                history=_history(
+                    now,
+                    outcome="error",
+                    reason=new_grade.reason,
+                    detail="error",
+                    score=grade.score,
+                    new_score=new_grade.score,
+                    url_kind=url_kind,
+                ),
+                unlock=unlock,
+                owner=owner,
+            )
+        if new_grade.label == "good":
+            wrote = _remember(
+                sid,
+                snap,
+                staged_meta,
                 state=None,
                 reason="ok",
                 attempts=attempts,
@@ -773,12 +1097,15 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
                 ),
                 unlock=unlock,
                 write_meta=True,
+                owner=owner,
+                now=now,
+                content=content,
             )
-            return "replaced"
-        _schedule(
+            return "replaced" if wrote else "lost"
+        outcome = _schedule(
             sid,
             snap,
-            meta,
+            staged_meta,
             now=now,
             attempts=attempts,
             grade=new_grade,
@@ -791,27 +1118,13 @@ def _attempt(sid: str, now: datetime, fetch: Fetch) -> str:
                 url_kind=url_kind,
             ),
             unlock=unlock,
+            owner=owner,
+            content=content,
         )
-        return "replaced"
-
-    return _schedule(
-        sid,
-        snap,
-        meta,
-        now=now,
-        attempts=attempts,
-        grade=grade,
-        history=_history(
-            now,
-            outcome="kept",
-            reason=new_grade.reason,
-            detail="not better",
-            score=grade.score,
-            new_score=new_grade.score,
-            url_kind=url_kind,
-        ),
-        unlock=unlock,
-    )
+        return "lost" if outcome == "lost" else "replaced"
+    finally:
+        if stage is not None and stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def fetch_via_save(url: str) -> dict:
@@ -837,43 +1150,50 @@ def run(*, now: datetime | None = None, fetch: Fetch | None = None) -> dict:
         db.init_db()
         moment = _clock(now)
         _classify(moment)
-        claimed = _claim_due(moment)
         fetcher = fetch or fetch_via_save
         replaced: list[str] = []
         attempted = 0
+        seen: set[str] = set()
 
         def counting(url: str) -> Any:
             nonlocal attempted
             attempted += 1
             return fetcher(url)
 
-        for sid in claimed:
-            try:
-                outcome = _attempt(sid, moment, counting)
-            except Exception:
-                log.exception("recapture failed for %s", sid)
-                snap = db.get_snapshot(sid) or {"id": sid, "unlock_url": None}
-                _remember(
-                    sid,
-                    snap,
-                    _load_meta(sid),
-                    state="pending",
-                    reason=(snap.get("recapture_reason") if snap else None),
-                    attempts=None,
-                    next_at=_iso(moment + timedelta(seconds=BACKOFF_SECONDS[0])),
-                    grade=None,
-                    history=_history(
-                        moment,
-                        outcome="error",
-                        reason=None,
-                        detail="internal error",
-                    ),
-                    unlock=None,
-                    write_meta=True,
-                )
-                outcome = "error"
-            if outcome == "replaced":
-                replaced.append(sid)
+        while True:
+            claimed = [(sid, token) for sid, token in _claim_due(moment) if sid not in seen]
+            if not claimed:
+                break
+            for sid, token in claimed:
+                seen.add(sid)
+                try:
+                    outcome = _attempt(sid, moment, counting, token)
+                except Exception:
+                    log.exception("recapture failed for %s", sid)
+                    snap = db.get_snapshot(sid) or {"id": sid, "unlock_url": None}
+                    _remember(
+                        sid,
+                        snap,
+                        _load_meta(sid),
+                        state="pending",
+                        reason=(snap.get("recapture_reason") if snap else None),
+                        attempts=None,
+                        next_at=_iso(moment + timedelta(seconds=BACKOFF_SECONDS[0])),
+                        grade=None,
+                        history=_history(
+                            moment,
+                            outcome="error",
+                            reason=None,
+                            detail="internal error",
+                        ),
+                        unlock=None,
+                        write_meta=True,
+                        owner=token,
+                        now=moment,
+                    )
+                    outcome = "error"
+                if outcome == "replaced":
+                    replaced.append(sid)
         report = status()
         report["attempted"] = attempted
         report["replaced"] = replaced

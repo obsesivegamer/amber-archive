@@ -71,6 +71,7 @@ _RECAPTURE_ADD_COLUMNS = (
     ("recapture_reason", "TEXT"),
     ("recapture_attempts", "INTEGER"),
     ("recapture_next_at", "TEXT"),
+    ("recapture_owner", "TEXT"),
 )
 
 

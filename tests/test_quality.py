@@ -111,6 +111,51 @@ def test_hard_paywall_and_block_page():
     assert blocked.score == 0
 
 
+def test_long_ft_offer_with_benefit_copy_grades_bad():
+    """Markers are checked even when benefit sentences push the raw count past 80."""
+    from app.extract import extract_article
+    from app.quality import narrative_text
+
+    html, grade = _grade("ft_offer_long.html")
+    lowered = html.lower()
+    assert "subscribe to unlock" in lowered
+    assert "$75 per month" in lowered
+    assert "explore our full range of subscriptions" in lowered
+    article = extract_article(html, "https://www.ft.com/content/offer")
+    words = article.get("article_text") or ""
+    # The offer is long enough that ignoring the markers would call it an article.
+    assert 150 <= len(words.split()) <= 330
+    assert len(narrative_text(words).split()) >= 80
+    assert grade.label == "bad"
+    assert grade.reason == "ft_subscribe_wall"
+    assert grade.score < 80
+
+
+def _upsell_inside_article(html: str) -> str:
+    moved = html.replace('<aside class="subscribe">', "<div>").replace("<aside>", "<div>")
+    moved = moved.replace("</article>", "", 1).replace("</div>", "</article>", 1)
+    return moved
+
+
+def test_soft_newsletter_myft_and_wapo_upsell_inside_the_article_stay_good():
+    soft = _upsell_inside_article((FIXTURES / "ft_soft_cta.html").read_text(encoding="utf-8"))
+    assert "<aside" not in soft
+    assert "myft" in soft.lower()
+    assert "newsletter" in soft.lower()
+    soft_grade = grade_html(soft)
+    assert soft_grade.label == "good"
+    assert soft_grade.reason == "ok"
+    assert soft_grade.score >= 80
+
+    wapo = _upsell_inside_article((FIXTURES / "wapo_upsell.html").read_text(encoding="utf-8"))
+    assert "<aside" not in wapo
+    assert "unlimited access" in wapo.lower()
+    wapo_grade = grade_html(wapo)
+    assert wapo_grade.label == "good"
+    assert wapo_grade.reason == "ok"
+    assert "TOKEN_WAPO_BODY" in wapo
+
+
 def test_better_never_prefers_a_worse_capture():
     good, _ = _grade("good_article.html")
     thin, _ = _grade("thin_body.html")

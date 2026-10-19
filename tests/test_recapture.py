@@ -1,9 +1,13 @@
 """Recapture queue: same snap id, no downgrade, gift and import stops."""
 
+import io
+import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app import db, recapture
 from app.extract import extract_article
@@ -441,6 +445,278 @@ def test_cli_run_prints_the_queue(tmp_data, capsys):
     out = capsys.readouterr().out
     assert "needs_browser_capture" in out
     assert "abcde" in out
+
+
+def _jpeg() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (12, 40, 90)).save(buf, "JPEG", quality=82)
+    return buf.getvalue()
+
+
+def test_long_ft_offer_does_not_replace_the_snap(tmp_data):
+    folder = _seed("abcde", GUARDIAN, _html("thin_body.html"))
+
+    def offer(url: str) -> str:
+        return _html("ft_offer_long.html")
+
+    report = recapture.run(now=START, fetch=offer)
+    assert report["replaced"] == []
+    assert "TOKEN_THIN_BODY" in (folder / "article.txt").read_text(encoding="utf-8")
+    assert "Subscribe to unlock" not in (folder / "article.txt").read_text(encoding="utf-8")
+    assert (folder / "screenshot.jpg").read_bytes() == b"old-screenshot"
+    assert db.get_snapshot("abcde")["recapture_state"] == "needs_browser_capture"
+
+
+def test_claims_are_small_and_a_lost_owner_cannot_overwrite(tmp_data, monkeypatch):
+    monkeypatch.setattr(recapture, "CLAIM_BATCH", 2)
+    ids = ("abcde", "fghij", "kmnpq", "rstuv", "wxyza")
+    for index, sid in enumerate(ids):
+        _seed(sid, f"https://www.theguardian.com/world/2026/oct/0{index}/story", _html("thin_body.html"))
+    running_counts: list[int] = []
+    owners: list[str] = []
+
+    def still_thin(url: str) -> str:
+        rows = db.complete_snapshots()
+        running = [row for row in rows if row["recapture_state"] == "running"]
+        running_counts.append(len(running))
+        owners.extend(row["recapture_owner"] for row in running)
+        return _html("thin_body.html")
+
+    recapture.run(now=START, fetch=still_thin)
+    assert len(running_counts) == 5
+    assert max(running_counts) == 2
+    assert all(owners)
+    assert len(set(owners)) == 5
+
+    # A second process publishes a better-but-still-bad body and takes the lease.
+    # The in-flight fetch then returns a full article. That article must not land.
+    for sid in ids:
+        db.update_snapshot(
+            sid,
+            recapture_state="gave_up",
+            recapture_next_at=None,
+            recapture_owner=None,
+        )
+    folder = db.snap_dir("abcde")
+    medium = (
+        "<html><head><title>Halfway there</title></head><body><article>"
+        "<h1>Halfway there</h1>"
+        "<p>TOKEN_FIRST_BODY The council published a short note, then a second note, "
+        "then a third note about the bridge, the river, and the vote.</p>"
+        "</article></body></html>"
+    )
+    db.update_snapshot(
+        "abcde",
+        recapture_state="pending",
+        recapture_reason="thin_body",
+        recapture_next_at="2000-01-01T00:00:00Z",
+        recapture_owner=None,
+        recapture_attempts=0,
+    )
+
+    def late(url: str) -> str:
+        article = extract_article(medium, url)
+        (folder / "page.html").write_text(medium, encoding="utf-8")
+        (folder / "article.txt").write_text(article.get("article_text") or "", encoding="utf-8")
+        (folder / "screenshot.jpg").write_bytes(b"first-writer")
+        db.update_snapshot(
+            "abcde",
+            recapture_state="running",
+            recapture_owner="other-worker",
+            recapture_next_at="2099-01-01T00:00:00Z",
+        )
+        return _html("good_article.html")
+
+    report = recapture.run(now=START + timedelta(days=2), fetch=late)
+    text = (folder / "article.txt").read_text(encoding="utf-8")
+    assert "TOKEN_FIRST_BODY" in text
+    assert "TOKEN_GOOD_ARTICLE" not in text
+    assert "TOKEN_GOOD_ARTICLE" not in (folder / "page.html").read_text(encoding="utf-8")
+    assert (folder / "screenshot.jpg").read_bytes() == b"first-writer"
+    assert report["replaced"] == []
+    assert db.get_snapshot("abcde")["recapture_owner"] == "other-worker"
+
+    # An expired per-row lease can be claimed again. The old token cannot write.
+    db.update_snapshot(
+        "fghij",
+        recapture_state="running",
+        recapture_owner="expired-token",
+        recapture_next_at="2000-01-01T00:00:00Z",
+    )
+    claimed = recapture._claim_due(START + timedelta(days=3))
+    again = dict(claimed)
+    assert "fghij" in again
+    assert again["fghij"] != "expired-token"
+    assert recapture._still_owner("fghij", "expired-token", START + timedelta(days=3)) is False
+    assert recapture._release(
+        "fghij",
+        "expired-token",
+        {"recapture_state": None, "recapture_reason": "ok", "recapture_next_at": None},
+    ) is False
+    assert db.get_snapshot("fghij")["recapture_owner"] == again["fghij"]
+
+
+def test_replacement_is_staged_and_screenshot_is_replaced(tmp_data, monkeypatch):
+    folder = _seed("abcde", GUARDIAN, _html("thin_body.html"))
+    shot = _jpeg()
+    seen: dict[str, bool] = {}
+    real_replace = os.replace
+
+    def spy(src, dst):
+        dest = Path(dst)
+        src_path = Path(src)
+        if (
+            dest.parent == folder
+            and "recapture-staging" in src_path.parts
+            and not seen
+        ):
+            stage = src_path.parent
+            assert "TOKEN_GOOD_ARTICLE" in (stage / "page.html").read_text(encoding="utf-8")
+            assert "TOKEN_GOOD_ARTICLE" in (stage / "article.txt").read_text(encoding="utf-8")
+            assert (stage / "screenshot.jpg").is_file()
+            assert "TOKEN_THIN_BODY" in (folder / "article.txt").read_text(encoding="utf-8")
+            seen["staged"] = True
+        return real_replace(src, dst)
+
+    real_write = Path.write_bytes
+
+    def guard_write(self, data):
+        if self.name in {"screenshot.jpg", "thumb.jpg"} and self.parent == folder:
+            raise AssertionError(f"in-place screenshot write: {self}")
+        return real_write(self, data)
+
+    monkeypatch.setattr(recapture.os, "replace", spy)
+    monkeypatch.setattr(Path, "write_bytes", guard_write)
+
+    def better(url: str) -> dict:
+        return {"html": _html("good_article.html"), "final_url": url, "screenshot": shot}
+
+    report = recapture.run(now=START, fetch=better)
+    assert seen.get("staged") is True
+    assert report["replaced"] == ["abcde"]
+    assert "TOKEN_GOOD_ARTICLE" in (folder / "article.txt").read_text(encoding="utf-8")
+    assert (folder / "screenshot.jpg").read_bytes() != b"old-screenshot"
+    assert (folder / "screenshot.jpg").read_bytes().startswith(b"\xff\xd8")
+    assert (folder / "thumb.jpg").read_bytes().startswith(b"\xff\xd8")
+
+
+def test_recapture_keeps_the_resource_map(tmp_data):
+    folder = _seed("abcde", GUARDIAN, _html("thin_body.html"))
+    html = _html("good_article.html").replace(
+        "</head>",
+        '<link rel="stylesheet" href="https://cdn.example/style.css"></head>',
+    ).replace(
+        "</article>",
+        '<img src="https://cdn.example/photo.jpg" alt="bridge"></article>',
+    )
+    photo = "https://cdn.example/photo.jpg"
+    css = "https://cdn.example/style.css"
+
+    def richer(url: str) -> dict:
+        return {
+            "html": html,
+            "final_url": url,
+            "resource_map": {photo: "photo.jpg", css: "style.css"},
+            "resource_bodies": {
+                "photo.jpg": (b"image-bytes", "image/jpeg"),
+                "style.css": (
+                    b"body{background:url(https://cdn.example/photo.jpg)}",
+                    "text/css",
+                ),
+            },
+        }
+
+    report = recapture.run(now=START, fetch=richer)
+    assert report["replaced"] == ["abcde"]
+    page = (folder / "page.html").read_text(encoding="utf-8")
+    assert "/abcde/r/photo.jpg" in page
+    assert "/abcde/r/style.css" in page
+    assert (folder / "res" / "photo.jpg").read_bytes() == b"image-bytes"
+    css_text = (folder / "res" / "style.css").read_text(encoding="utf-8")
+    assert "/abcde/r/photo.jpg" in css_text
+    assert (folder / "res" / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_keeps_the_stored_author_when_the_new_extract_has_none(tmp_data):
+    folder = _seed("abcde", GUARDIAN, _html("thin_body.html"))
+    meta = db.read_json(folder / "meta.json")
+    meta.update(
+        {
+            "author": "Ada Lovelace",
+            "published_at": "1843-01-01",
+            "description": "Notes on the engine",
+            "dek": "A sketch",
+        }
+    )
+    db.write_json(folder / "meta.json", meta)
+    db.update_snapshot(
+        "abcde",
+        author="Ada Lovelace",
+        published_at="1843-01-01",
+        description="Notes on the engine",
+    )
+
+    def better(url: str) -> str:
+        # A one-word lede keeps the extractor from inventing a dek, so the
+        # stored dek has to be kept on its own.
+        return _html("good_article.html").replace(
+            "</h1>",
+            "</h1><p>Hi.</p>",
+            1,
+        )
+
+    report = recapture.run(now=START, fetch=better)
+    assert report["replaced"] == ["abcde"]
+    snap = db.get_snapshot("abcde")
+    stored = db.read_json(folder / "meta.json")
+    assert snap["author"] == "Ada Lovelace"
+    assert stored["author"] == "Ada Lovelace"
+    assert snap["published_at"] == "1843-01-01"
+    assert stored["published_at"] == "1843-01-01"
+    assert snap["description"] == "Notes on the engine"
+    assert stored["description"] == "Notes on the engine"
+    assert stored["dek"] == "A sketch"
+    assert "TOKEN_GOOD_ARTICLE" in (folder / "article.txt").read_text(encoding="utf-8")
+
+
+def test_dns_and_timeout_retry_and_history_omits_the_gift(tmp_data):
+    folder = _seed("abcde", NYT, _html("thin_body.html"), unlock_url=UNLOCK)
+
+    def timed_out(url: str) -> str:
+        raise RuntimeError(f"Timed out loading {url}")
+
+    recapture.run(now=START, fetch=timed_out)
+    snap = db.get_snapshot("abcde")
+    assert snap["recapture_state"] == "pending"
+    assert snap["recapture_next_at"] == "2026-10-19T04:00:00Z"
+    history = db.read_json(folder / "meta.json")["recapture"]["history"]
+    dumped = json.dumps(history)
+    assert history[-1]["detail"] == "timeout"
+    assert history[-1]["url_kind"] == "unlock"
+    assert "unlocked_article_code" not in dumped
+    assert UNLOCK not in dumped
+    scrubbed = recapture._scrub_history({"detail": f"Timed out loading {UNLOCK}"})
+    assert "unlocked_article_code" not in json.dumps(scrubbed)
+    assert "abc" not in json.dumps(scrubbed)
+
+    _seed("fghij", GUARDIAN, _html("thin_body.html"))
+
+    def dns(url: str) -> str:
+        raise ValueError("Could not resolve host: www.theguardian.com")
+
+    recapture.run(now=START, fetch=dns)
+    assert db.get_snapshot("fghij")["recapture_state"] == "pending"
+    dns_history = db.read_json(db.snap_dir("fghij") / "meta.json")["recapture"]["history"]
+    assert dns_history[-1]["detail"] == "dns"
+    assert db.get_snapshot("fghij")["recapture_state"] != "needs_browser_capture"
+
+    assert recapture.failure_kind(ValueError("Private or local network URLs cannot be archived.")) == "ssrf"
+    assert recapture.failure_kind(ValueError("URLs with credentials are not allowed.")) == "ssrf"
+    assert recapture.failure_kind(ValueError("Only http and https URLs can be archived.")) == "ssrf"
+    assert recapture.failure_kind(ValueError("Local URLs cannot be archived.")) == "ssrf"
+    assert recapture.failure_kind(ValueError("Numeric hosts must be written as a plain IP address.")) == "ssrf"
+    assert recapture.failure_kind(RuntimeError("Redirected to a blocked address: no")) == "private_redirect"
+    assert recapture.failure_kind(ValueError("Could not resolve host: www.nytimes.com")) == "dns"
 
 
 def test_save_fetch_skips_bounce_for_an_unlock_url(monkeypatch):

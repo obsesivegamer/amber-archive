@@ -1206,6 +1206,8 @@ async def fetch_document(url: str, *, skip_referrer_bounce: bool = False) -> dic
                 "http_status": visit.http_status,
                 "screenshot": screenshot,
                 "duration_ms": _elapsed_ms(started),
+                "resource_map": dict(visit.resource_map),
+                "resource_bodies": dict(visit.resource_bodies),
             }
         finally:
             if visit is not None:
