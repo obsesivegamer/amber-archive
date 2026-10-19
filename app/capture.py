@@ -1134,3 +1134,82 @@ async def run_job(job_id: str) -> None:
     job["status"] = "complete"
     job["title"] = meta["title"]
     job.pop("_capture_started", None)
+
+
+async def fetch_document(url: str, *, skip_referrer_bounce: bool = False) -> dict:
+    """Capture one public page the way /save does, without writing a snapshot.
+
+    Validates the URL, loads it in Chromium, and applies the same crawler merge
+    and referrer bounce as a save. Raises ValueError when the URL is rejected
+    as local or private, and RuntimeError when a redirect lands on one.
+    `skip_referrer_bounce` is for a gift or unlock URL, matching a gift save.
+    """
+    url = await asyncio.to_thread(validate_public_http_url, url)
+    job = {
+        "id": "recapture",
+        "snapshot_id": "recapture",
+        "url": url,
+        "status": "capturing",
+        "resources": [],
+        "error": None,
+        "title": None,
+        "final_url": None,
+        "capture_stats": empty_capture_stats(),
+        "skip_referrer_bounce": skip_referrer_bounce,
+    }
+    started = time.perf_counter()
+    visit: _Visit | None = None
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+        try:
+            visit = await _capture_visit(browser, job, url)
+            job["final_url"] = visit.final_url
+            article = visit.article
+            crawler_html = await fetch_crawler_html(visit.final_url or url)
+            if crawler_html:
+                crawler_article = extract_article(crawler_html, visit.final_url or url)
+                article = _merge_crawler_article(article, crawler_article)
+                visit.article = article
+            if _should_referrer_retry(job, article):
+                for origin in bounce_origins_for(url, visit.final_url):
+                    try:
+                        attempt = await _capture_visit(
+                            browser, job, url, bounce_origin=origin
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Referrer retry failed recapture origin=%s (%s)",
+                            origin,
+                            type(exc).__name__,
+                        )
+                        continue
+                    if _richer_article(attempt.article, visit.article):
+                        await visit.close()
+                        visit = attempt
+                    else:
+                        await attempt.close()
+                    if not visit.article.get("paywalled"):
+                        break
+            article = visit.article
+            screenshot = None
+            try:
+                screenshot = await visit.page.screenshot(
+                    full_page=True, type="jpeg", quality=82
+                )
+            except Exception:
+                screenshot = None
+            return {
+                "html": visit.html,
+                "article": article,
+                "final_url": visit.final_url,
+                "title": article.get("title") or visit.title,
+                "http_status": visit.http_status,
+                "screenshot": screenshot,
+                "duration_ms": _elapsed_ms(started),
+                "resource_map": dict(visit.resource_map),
+                "resource_bodies": dict(visit.resource_bodies),
+            }
+        finally:
+            if visit is not None:
+                await visit.close()
+            await browser.close()

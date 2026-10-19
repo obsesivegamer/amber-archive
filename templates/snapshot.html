@@ -42,6 +42,15 @@
   </div>
 </header>
 
+{% if snap.recapture_state == 'pending' or snap.recapture_state == 'running' %}
+<p class="viewer-note" role="status">Recapture pending. Amber will try this page again later.</p>
+{% elif snap.recapture_state == 'gave_up' %}
+<p class="viewer-note" role="status">Recapture gave up after several tries.</p>
+{% elif snap.recapture_state == 'needs_browser_capture' %}
+<p class="viewer-note" role="status">Needs browser capture. Saving the URL again will not replace this copy.</p>
+{% elif snap.recapture_state == 'needs_fresh_gift' %}
+<p class="viewer-note" role="status">Needs a fresh gift link. The saved unlock URL is missing, expired, or still walled.</p>
+{% endif %}
 {% if snap.paywalled %}
 <p class="viewer-note" role="status">
   Incomplete — Amber extracted only a short preview. The page may have limited access, or extraction may have missed the full article.

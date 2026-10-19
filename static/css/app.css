@@ -196,9 +196,13 @@ button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber
 
 .recent li span.flag-incomplete,
 .results li span.flag-incomplete,
-.flag-incomplete {
+.flag-incomplete,
+.recent li span.flag-recapture,
+.results li span.flag-recapture,
+.flag-recapture {
   display: inline-block;
   margin-top: 0.28rem;
+  margin-right: 0.35rem;
   padding: 0.08rem 0.4rem;
   border: 1px solid #e0c48a;
   background: #f6ead0;
@@ -208,6 +212,13 @@ button:hover, .btn:hover { background: var(--amber-d); border-color: var(--amber
   font-weight: 500;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+.recent li span.flag-recapture,
+.results li span.flag-recapture,
+.flag-recapture {
+  border-color: #b7c4c2;
+  background: #e7eeed;
+  color: var(--ink);
 }
 
 .results .url {
