@@ -339,9 +339,13 @@ def _scrub_history(entry: dict) -> dict:
     return cleaned
 
 
-def _still_owner(sid: str, token: str, now: datetime) -> bool:
-    """Refresh this row's lease only if `token` still holds it."""
-    lease = _iso(now + timedelta(seconds=CLAIM_LEASE_SECONDS))
+def _still_owner(sid: str, token: str) -> bool:
+    """Refresh this row's lease from the current time if `token` still holds it.
+
+    The deadline is ``now()`` at this refresh, not the clock the run started with.
+    A long queue must not leave a row expiring from the moment it was first claimed.
+    """
+    lease = _iso(_clock(None) + timedelta(seconds=CLAIM_LEASE_SECONDS))
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -405,7 +409,7 @@ def _remember(
     content: dict | None = None,
 ) -> bool:
     """Persist queue status. With `owner`, skip the write if the lease was lost."""
-    if owner is not None and not _still_owner(sid, owner, _clock(now)):
+    if owner is not None and not _still_owner(sid, owner):
         return False
     if write_meta:
         stored = dict(meta)
@@ -918,7 +922,7 @@ def _attempt(sid: str, now: datetime, fetch: Fetch, owner: str) -> str:
     url, url_kind = (snap.get("url") or ""), "article"
     if unlock is not None and not unlock.expired:
         url, url_kind = unlock.url, "unlock"
-    if not _still_owner(sid, owner, now):
+    if not _still_owner(sid, owner):
         return "lost"
     attempts = int(snap.get("recapture_attempts") or 0) + 1
     try:
@@ -1026,7 +1030,7 @@ def _attempt(sid: str, now: datetime, fetch: Fetch, owner: str) -> str:
                 owner=owner,
             )
         # Compare-and-set immediately before any snap write.
-        if not _still_owner(sid, owner, now):
+        if not _still_owner(sid, owner):
             return "lost"
         disk = grade_snap(sid)
         if not is_better(new_grade, disk):

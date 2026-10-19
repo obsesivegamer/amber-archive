@@ -111,6 +111,61 @@ def test_hard_paywall_and_block_page():
     assert blocked.score == 0
 
 
+def _bridge_words(count: int) -> str:
+    seed = (
+        "The city council voted last night to fund a new bridge over the river "
+        "after years of argument about the long detour"
+    ).split()
+    words = []
+    for index in range(count):
+        word = seed[index % len(seed)]
+        if index % 21 == 0:
+            word = word.capitalize()
+        words.append(word)
+    for index in range(21, count, 21):
+        words[index - 1] = words[index - 1] + "."
+    text = " ".join(words)
+    if not text.endswith("."):
+        text += "."
+    return text
+
+
+def test_article_between_ft_markers_stays_good():
+    middle = _bridge_words(167)
+    html = f"""
+    <html><head><title>City council funds a bridge</title></head>
+    <body><article>
+      <h1>City council funds a bridge</h1>
+      <p>Subscribe to unlock this article.</p>
+      <p>{middle}</p>
+      <p>The figure printed on the board is $75 per month.</p>
+    </article></body></html>
+    """
+    assert len(middle.split()) == 167
+    grade = grade_html(html, "https://www.ft.com/content/bridge")
+    assert grade.label == "good"
+    assert grade.reason == "ok"
+    assert grade.score >= 167
+
+
+def test_article_between_a_pricing_list_stays_good():
+    middle = _bridge_words(167)
+    html = f"""
+    <html><head><title>City council funds a bridge</title></head>
+    <body><article>
+      <h1>City council funds a bridge</h1>
+      <p>Standard Digital and Premium Digital are the first two rows.</p>
+      <p>{middle}</p>
+      <p>Cancel anytime. Digital + print is the last row.</p>
+    </article></body></html>
+    """
+    assert len(middle.split()) == 167
+    grade = grade_html(html, "https://www.ft.com/content/bridge")
+    assert grade.label == "good"
+    assert grade.reason == "ok"
+    assert grade.score >= 167
+
+
 def test_long_ft_offer_with_benefit_copy_grades_bad():
     """Markers are checked even when benefit sentences push the raw count past 80."""
     from app.extract import extract_article

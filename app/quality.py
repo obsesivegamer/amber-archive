@@ -9,8 +9,9 @@ Score is that prose word count. A higher score is a better capture. Callers
 that replace files must refuse a new capture that does not beat the stored one.
 
 Burned FT wall markers and a pricing-feature list are checked even when the
-raw page is long. The page is a wall unless 80 words of prose remain after
-the offer block is removed. One mention inside a real article stays.
+raw page is long. Offer lines, and blocks of offer lines that sit together,
+are set aside. Prose between separate offer lines still counts. The page is
+a wall when fewer than 80 words remain. One mention inside a real article stays.
 """
 
 from __future__ import annotations
@@ -122,31 +123,39 @@ def _pieces(text: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_RE.split(raw) if part.strip()]
 
 
-def _is_offer_piece(piece: str, *, aggressive: bool) -> bool:
+def _is_core_offer(piece: str) -> bool:
     if _HARD_WALL_RE.search(piece) or _ft_marker(piece) or _pricing_hits(piece):
         return True
-    if _SOFT_CTA_RE.search(piece):
-        return True
-    return bool(aggressive and _BENEFIT_RE.search(piece))
+    return bool(_SOFT_CTA_RE.search(piece))
+
+
+def _is_benefit(piece: str) -> bool:
+    return bool(_BENEFIT_RE.search(piece))
 
 
 def _prose_without_offer(text: str, *, aggressive: bool) -> str:
-    """Drop wall lines. On a burned wall, also drop the block they sit in.
+    """Drop offer lines. A burned wall also drops the pitch block around them.
 
-    Two or more FT markers, or a pricing-feature list, mark the whole span
-    from the first offer sentence through the last one. Leftover pitch lines
-    inside that span do not count as the article, and neither do benefit
-    lines outside it. A single marker only drops its own sentence.
+    A block is a contiguous run of offer or pricing lines, including benefit
+    lines that sit against those lines. Prose between two separate blocks
+    stays. The span from the first offer line to the last one is not removed.
     """
     pieces = _pieces(text)
     if not pieces:
         return ""
-    flags = [_is_offer_piece(piece, aggressive=aggressive) for piece in pieces]
-    drop = {index for index, flag in enumerate(flags) if flag}
-    if aggressive and drop:
-        first = min(drop)
-        last = max(drop)
-        drop.update(range(first, last + 1))
+    core = [_is_core_offer(piece) for piece in pieces]
+    benefit = [_is_benefit(piece) for piece in pieces]
+    drop = set(index for index, flag in enumerate(core) if flag)
+    if aggressive:
+        for index in list(drop):
+            cursor = index - 1
+            while cursor >= 0 and benefit[cursor]:
+                drop.add(cursor)
+                cursor -= 1
+            cursor = index + 1
+            while cursor < len(pieces) and (core[cursor] or benefit[cursor]):
+                drop.add(cursor)
+                cursor += 1
     return " ".join(piece for index, piece in enumerate(pieces) if index not in drop)
 
 
@@ -181,7 +190,8 @@ def grade_parts(*, article_text: str, title: str = "", page_text: str = "") -> G
     """Grade extracted article text. `page_text` catches block pages the extractor drops.
 
     FT wall markers are applied even when the raw word count is past the
-    article minimum. What matters is the prose left after the offer block.
+    article minimum. What matters is the prose left after offer lines and
+    contiguous offer blocks are removed.
     """
     source = article_text or page_text or ""
     word_count = len(source.split())

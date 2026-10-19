@@ -547,7 +547,7 @@ def test_claims_are_small_and_a_lost_owner_cannot_overwrite(tmp_data, monkeypatc
     again = dict(claimed)
     assert "fghij" in again
     assert again["fghij"] != "expired-token"
-    assert recapture._still_owner("fghij", "expired-token", START + timedelta(days=3)) is False
+    assert recapture._still_owner("fghij", "expired-token") is False
     assert recapture._release(
         "fghij",
         "expired-token",
@@ -717,6 +717,28 @@ def test_dns_and_timeout_retry_and_history_omits_the_gift(tmp_data):
     assert recapture.failure_kind(ValueError("Numeric hosts must be written as a plain IP address.")) == "ssrf"
     assert recapture.failure_kind(RuntimeError("Redirected to a blocked address: no")) == "private_redirect"
     assert recapture.failure_kind(ValueError("Could not resolve host: www.nytimes.com")) == "dns"
+
+
+def test_lease_refresh_uses_the_clock_at_refresh_time(tmp_data, monkeypatch):
+    _seed("abcde", GUARDIAN, _html("thin_body.html"))
+    refreshed = datetime(2026, 11, 2, 15, 30, tzinfo=timezone.utc)
+
+    class FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return refreshed
+            return refreshed.astimezone(tz)
+
+    monkeypatch.setattr(recapture, "datetime", FrozenClock)
+    seen = {}
+
+    def still_thin(url: str) -> str:
+        seen["lease"] = db.get_snapshot("abcde")["recapture_next_at"]
+        return _html("thin_body.html")
+
+    recapture.run(now=START, fetch=still_thin)
+    assert seen["lease"] == "2026-11-02T15:45:00Z"
 
 
 def test_save_fetch_skips_bounce_for_an_unlock_url(monkeypatch):
