@@ -26,6 +26,14 @@ from .config import ID_ALPHABET
 from .security import article_match_key, normalize_url, validate_public_http_url
 
 PUBLISHERS = frozenset({"nyt", "wsj", "ft", "wapo", "atlantic", "newyorker", "other"})
+# Display names that do not compact to the key above. Compared after
+# lowercasing, stripping a leading "the", and dropping spaces and punctuation.
+_PUBLISHER_ALIASES = {
+    "newyorktimes": "nyt",
+    "wallstreetjournal": "wsj",
+    "financialtimes": "ft",
+    "washingtonpost": "wapo",
+}
 
 # Shorter than the usual public gift window. A reported expires_at still wins
 # when it is earlier. Tune later.
@@ -117,13 +125,25 @@ def _present(find: dict, *names: str):
     return None
 
 
+def _normalize_publisher(value: str) -> str:
+    """Lowercase, drop a leading "the", then drop spaces, hyphens and punctuation."""
+    text = value.strip().lower()
+    if text.startswith("the"):
+        text = text[3:]
+    compact = re.sub(r"[^a-z0-9]", "", text)
+    return _PUBLISHER_ALIASES.get(compact, compact)
+
+
 def _publisher(find: dict) -> str:
     if "publisher" not in find or find["publisher"] in (None, ""):
         return "other"
     value = find["publisher"]
-    if not isinstance(value, str) or value.strip().lower() not in PUBLISHERS:
+    if not isinstance(value, str):
         raise ValueError("unknown publisher")
-    return value.strip().lower()
+    key = _normalize_publisher(value)
+    if key not in PUBLISHERS:
+        raise ValueError("unknown publisher")
+    return key
 
 
 def _short_text(value: object, field: str, limit: int) -> str | None:

@@ -132,6 +132,37 @@ def test_overlapping_adds_insert_one_row(tmp_data):
     assert rows[0]["match_key"] == article_match_key("http://93.184.216.34/dup")
 
 
+@pytest.mark.parametrize(
+    ("label", "publisher"),
+    [
+        ("New Yorker", "newyorker"),
+        ("The New Yorker", "newyorker"),
+        ("new-yorker", "newyorker"),
+        ("newyorker", "newyorker"),
+        ("The Atlantic", "atlantic"),
+        ("Washington Post", "wapo"),
+        ("Wall Street Journal", "wsj"),
+        ("Financial Times", "ft"),
+        ("New York Times", "nyt"),
+        ("NYT", "nyt"),
+        ("WSJ", "wsj"),
+        ("FT", "ft"),
+        ("WaPo", "wapo"),
+    ],
+)
+def test_publisher_names_normalize_to_the_allowlist_key(tmp_data, label, publisher):
+    assert add_finds([_live_find(publisher=label)]) == ["added"]
+    assert db.list_gift_candidates()[0]["publisher"] == publisher
+
+
+def test_unknown_publisher_is_rejected(tmp_data):
+    assert add_finds([_live_find(publisher="The Economist")]) == ["rejected: unknown publisher"]
+    assert add_finds([_live_find("http://93.184.216.34/other-name", publisher="nope")]) == [
+        "rejected: unknown publisher"
+    ]
+    assert db.list_gift_candidates() == []
+
+
 def test_cli_rejects_bad_finds_and_keeps_the_good_one(tmp_data, monkeypatch, capsys):
     found = _iso(_now())
     payload = json.dumps(
