@@ -71,6 +71,40 @@ def _files(folder: Path) -> dict[str, bytes]:
     return saved
 
 
+def test_reader_text_is_not_replaced_when_the_frozen_page_is_a_stub(tmp_data):
+    """The reader can already hold the article while page.html is still a stub.
+
+    A save freezes the browser HTML and writes the fuller crawler extract to
+    article.txt. Grading only the page queued a recapture, and a longer teaser
+    then replaced the article the reader was showing.
+    """
+    folder = _seed("abcde", GUARDIAN, _html("thin_body.html"))
+    full = extract_article(_html("good_article.html"), GUARDIAN)
+    (folder / "article.txt").write_text(full["article_text"], encoding="utf-8")
+    (folder / "reader.html").write_text(build_reader_html(full, GUARDIAN), encoding="utf-8")
+    db.update_snapshot(
+        "abcde",
+        word_count=full["word_count"],
+        paywalled=0,
+        recapture_state="pending",
+    )
+    before = _files(folder)
+
+    def longer_teaser(url: str) -> str:
+        raise AssertionError(url)
+
+    report = recapture.run(now=START, fetch=longer_teaser)
+    assert report["attempted"] == 0
+    assert report["replaced"] == []
+    assert _files(folder) == before
+    assert "TOKEN_GOOD_ARTICLE" in (folder / "article.txt").read_text(encoding="utf-8")
+    assert "TOKEN_THIN_BODY" in (folder / "page.html").read_text(encoding="utf-8")
+    snap = db.get_snapshot("abcde")
+    assert snap["recapture_state"] is None
+    assert snap["recapture_reason"] == "ok"
+    assert snap["word_count"] == full["word_count"]
+
+
 def test_grading_a_good_snap_does_not_touch_its_files(tmp_data):
     folder = _seed("abcde", GUARDIAN, _html("good_article.html"))
     before = _files(folder)

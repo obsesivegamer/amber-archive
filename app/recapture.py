@@ -214,15 +214,41 @@ def _read_text(path) -> str:
         return ""
 
 
+def _stronger(left: Grade, right: Grade) -> Grade:
+    """The on-disk copy a replacement has to beat.
+
+    A good reader text and a good frozen page are both worth keeping. The
+    higher score wins when neither grade would replace the other.
+    """
+    if is_better(left, right):
+        return left
+    if is_better(right, left):
+        return right
+    return left if left.score >= right.score else right
+
+
 def grade_snap(sid: str) -> Grade:
+    """Grade the saved page and the reader text, and keep the stronger one.
+
+    A capture can freeze a paywall as page.html while article.txt holds the
+    fuller copy from the crawler fetch. Grading only the page treated that
+    snap as a stub and let a longer teaser overwrite the article.
+    """
     folder = db.snap_dir(sid)
     meta = _load_meta(sid)
     url = meta.get("final_url") or meta.get("url") or ""
+    title = str(meta.get("title") or "")
     page = _read_text(folder / "page.html")
-    if page.strip():
-        return grade_html(page, url)
     text = _read_text(folder / "article.txt")
-    return grade_parts(article_text=text, title=str(meta.get("title") or ""), page_text=text)
+    page_grade = grade_html(page, url) if page.strip() else None
+    text_grade = (
+        grade_parts(article_text=text, title=title, page_text=text) if text.strip() else None
+    )
+    if page_grade is not None and text_grade is not None:
+        return _stronger(page_grade, text_grade)
+    if page_grade is not None:
+        return page_grade
+    return grade_parts(article_text=text, title=title, page_text=text)
 
 
 def _candidate_for(snap: dict, meta: dict) -> dict | None:
