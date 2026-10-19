@@ -139,6 +139,20 @@ def _forbidden_publisher_char(text: str) -> bool:
     return False
 
 
+def _compatibility_publisher_char(text: str) -> bool:
+    """True when a non-whitespace character changes under NFKC.
+
+    Fullwidth letters, the long s, and ligatures would otherwise fold into a
+    key. Whitespace such as a non-breaking space is left to fold with the name.
+    """
+    for char in text:
+        if char.isspace():
+            continue
+        if unicodedata.normalize("NFKC", char) != char:
+            return True
+    return False
+
+
 def _fold_publisher(text: str) -> str | None:
     """Collapse separators. None when the result is not a key or an alias.
 
@@ -159,10 +173,12 @@ def _fold_publisher(text: str) -> str | None:
 def _normalize_publisher(value: str) -> str | None:
     """Allowlist key for a publisher name, or None when it is not one.
 
-    NFKC must be plain ASCII. Only whitespace, hyphens and apostrophes fold
-    into a single space. The folded text must equal a key or an alias.
+    A non-whitespace character whose NFKC form differs from itself is
+    rejected, so compatibility letters cannot become a key. NFKC of what
+    remains must be plain ASCII. Only whitespace, hyphens and apostrophes
+    fold into a single space. The folded text must equal a key or an alias.
     """
-    if _forbidden_publisher_char(value):
+    if _forbidden_publisher_char(value) or _compatibility_publisher_char(value):
         return None
     text = unicodedata.normalize("NFKC", value)
     if _forbidden_publisher_char(text) or not text.isascii():

@@ -151,6 +151,7 @@ def test_overlapping_adds_insert_one_row(tmp_data):
         ("WSJ", "wsj"),
         ("FT", "ft"),
         ("WaPo", "wapo"),
+        ("New\u00a0Yorker", "newyorker"),
     ],
 )
 def test_publisher_names_normalize_to_the_allowlist_key(tmp_data, label, publisher):
@@ -171,6 +172,9 @@ def test_publisher_names_normalize_to_the_allowlist_key(tmp_data, label, publish
         "ny\u200bt",
         "n\u0301yt",
         "ny\u00adt",
+        "\uff4e\uff59\uff54",
+        "w\u017fj",
+        "\ufb01nancial times",
     ],
     ids=[
         "dotted-nyt",
@@ -183,6 +187,9 @@ def test_publisher_names_normalize_to_the_allowlist_key(tmp_data, label, publish
         "zero-width",
         "combining-mark",
         "soft-hyphen",
+        "fullwidth-nyt",
+        "long-s",
+        "ligature-ft",
     ],
 )
 def test_junk_publisher_names_are_rejected(tmp_data, label):
