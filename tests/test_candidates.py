@@ -292,6 +292,73 @@ def test_atlantic_gift_parameter_is_not_part_of_the_key(tmp_data, allow_private)
     assert len(db.list_gift_candidates()) == 1
 
 
+_ARTICLE_HOSTS = (
+    ("nyt", "nytimes.com"),
+    ("wsj", "wsj.com"),
+    ("ft", "ft.com"),
+    ("wapo", "washingtonpost.com"),
+    ("atlantic", "theatlantic.com"),
+    ("newyorker", "newyorker.com"),
+)
+_NOT_AN_ARTICLE = "rejected: unlock_url is not an allowed article URL"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.newyorker.com/magazine/2026/10/19/city-bridge",
+        "https://newyorker.com/magazine/2026/10/19/city-bridge",
+    ],
+)
+def test_newyorker_article_urls_are_accepted(tmp_data, allow_private, url):
+    assert add_finds([_live_find(url, publisher="newyorker")]) == ["added"]
+    row = db.list_gift_candidates()[0]
+    assert row["publisher"] == "newyorker"
+    assert row["unlock_url"] == url
+
+
+def test_newyorker_www_and_bare_host_are_one_article(tmp_data, allow_private):
+    bare = "https://newyorker.com/magazine/2026/10/19/city-bridge"
+    www = "https://www.newyorker.com/magazine/2026/10/19/city-bridge"
+    assert add_finds(
+        [
+            _live_find(bare, publisher="newyorker"),
+            _live_find(www, publisher="newyorker"),
+        ]
+    ) == ["added", "refreshed"]
+    assert len(db.list_gift_candidates()) == 1
+    assert db.list_gift_candidates()[0]["match_key"] == article_match_key(www)
+
+
+@pytest.mark.parametrize("path", ["/", "/newsletters", "/newsletters/"])
+def test_newyorker_non_article_paths_match_other_publications(tmp_data, allow_private, path):
+    finds = []
+    for publisher, host in _ARTICLE_HOSTS:
+        finds.append(_live_find(f"https://{host}{path}", publisher=publisher))
+        finds.append(_live_find(f"https://www.{host}{path}", publisher=publisher))
+    lines = add_finds(finds)
+    assert lines == [_NOT_AN_ARTICLE] * len(finds)
+    assert db.list_gift_candidates() == []
+
+
+def test_unrelated_domain_is_rejected(tmp_data, allow_private):
+    lines = add_finds(
+        [
+            _live_find("https://example.com/2026/10/19/story", publisher="other"),
+            _live_find(
+                "https://notnewyorker.com/magazine/2026/10/19/story",
+                publisher="newyorker",
+            ),
+            _live_find(
+                "https://newyorker.com.evil.example/magazine/2026/10/19/story",
+                publisher="newyorker",
+            ),
+        ]
+    )
+    assert lines == [_NOT_AN_ARTICLE] * 3
+    assert db.list_gift_candidates() == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
