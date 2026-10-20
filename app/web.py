@@ -10,17 +10,20 @@ from __future__ import annotations
 import asyncio
 import gzip
 import http.client
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -35,6 +38,13 @@ router = APIRouter()
 
 FEED_MAX_BYTES = 5 * 1024 * 1024
 FEED_DEADLINE_S = 15.0
+# A silent socket (Akamai accepts TLS, then sends nothing) must not hold one of
+# the 8 proxy slots for the whole deadline. This caps any stall; the deadline
+# still bounds a transfer that is merely slow.
+FEED_FIRST_BYTE_S = 5.0
+FEED_MAX_REDIRECTS = 10
+# Newest Chrome profile shipped in curl_cffi 0.9 (there is no generic "chrome").
+FEED_IMPERSONATE = "chrome131"
 FEED_MAX_IN_FLIGHT = 8
 FEED_MAX_WAITING = 64
 FEED_SLOT_WAIT_S = 8.0
@@ -136,6 +146,191 @@ def _feed_to_utf8(body: bytes, header_charset: str | None) -> str:
     return re.sub(r"(\A\s*<\?xml[^>]*?encoding\s*=\s*)([\"'])[^\"']*\2", r"\1\2utf-8\2", text, count=1)
 
 
+_FEED_REQUEST_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": FEED_ACCEPT,
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_FEED_REDIRECTS = {301, 302, 303, 307, 308}
+
+
+class _ResponseHeaders:
+    """urllib-shaped headers so the content-type check can share both clients."""
+
+    def __init__(self, headers, charset: str | None):
+        self._headers = headers
+        self._charset = charset or None
+
+    def get(self, name: str, default=None):
+        value = self._headers.get(name) if self._headers is not None else None
+        return default if value is None else value
+
+    def get_content_charset(self, failobj=None):
+        return self._charset if self._charset else failobj
+
+
+class _HeaderResponse:
+    def __init__(self, headers, charset: str | None):
+        self.headers = _ResponseHeaders(headers, charset)
+
+
+def _curl_client():
+    """The browser-like HTTP client, or None when it is not installed.
+
+    Import errors are the only reason to use urllib. A failed request must not
+    fall through to HTTP/1.1: that is the client Akamai hangs on.
+    """
+    try:
+        from curl_cffi import CurlOpt
+        from curl_cffi.const import CurlECode
+        from curl_cffi.requests import Session
+        from curl_cffi.requests.exceptions import RequestException
+    except ImportError:
+        return None
+    return CurlOpt, CurlECode, Session, RequestException
+
+
+def _curl_resolve_host(hostname: str) -> str:
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        hostname = hostname.encode("idna").decode("ascii")
+    return f"[{hostname}]" if ":" in hostname else hostname
+
+
+def _public_peer_ip(hostname: str, port: int) -> str:
+    """One public address to pin the connection to.
+
+    validate_public_http_url already rejected a private DNS answer. Pinning
+    stops a second lookup (rebinding) from connecting somewhere else, and the
+    connected peer is checked again before the body is kept.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve host: {hostname}") from exc
+    for info in infos:
+        ip = info[4][0].split("%")[0]
+        try:
+            if capture._is_public_ip(ip):
+                return ip
+        except ValueError:
+            continue
+    raise ValueError("Private or local network URLs cannot be archived.")
+
+
+def _reraise_curl(exc: BaseException, timed_out_code: int) -> None:
+    if getattr(exc, "code", None) == timed_out_code:
+        raise TimeoutError("crawler fetch took too long") from exc
+    raise exc
+
+
+def _fetch_feed_urllib(clean: str, deadline: float, on_response, on_first_chunk) -> bytes:
+    return capture._fetch(
+        clean,
+        _FEED_REQUEST_HEADERS,
+        deadline,
+        FEED_MAX_BYTES,
+        strict=True,
+        socket_timeout=FEED_DEADLINE_S,
+        on_response=on_response,
+        on_first_chunk=on_first_chunk,
+    )
+
+
+def _read_feed_body(resp, deadline: float, on_first_chunk) -> bytes:
+    chunks: list[bytes] = []
+    received = 0
+    for chunk in resp.iter_content():
+        if time.monotonic() > deadline:
+            raise TimeoutError("crawler fetch took too long")
+        if not chunk:
+            continue
+        if on_first_chunk is not None and not chunks:
+            on_first_chunk(chunk)
+        chunks.append(chunk)
+        received += len(chunk)
+        if received > FEED_MAX_BYTES:
+            raise capture.FetchTooLarge()
+    return b"".join(chunks)
+
+
+def _fetch_feed_browser(clean: str, deadline: float, on_response, on_first_chunk, client) -> bytes:
+    """GET a feed with Chrome's TLS and HTTP/2 fingerprint.
+
+    Redirects are followed here, not inside libcurl, so each Location is run
+    through validate_public_http_url. Each hop is pinned to a public address
+    and the peer libcurl actually used is checked before the body is kept.
+    """
+    CurlOpt, CurlECode, Session, RequestException = client
+    url = clean
+    redirects = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("crawler fetch took too long")
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise ValueError("URL is missing a host.")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        ip = _public_peer_ip(host, port)
+        pinned = f"{_curl_resolve_host(host)}:{port}:{_curl_resolve_host(ip)}"
+        stall = max(1, int(FEED_FIRST_BYTE_S))
+        options = {
+            CurlOpt.RESOLVE: [pinned],
+            CurlOpt.NOPROXY: "*",
+            CurlOpt.TIMEOUT_MS: max(1, int(remaining * 1000)),
+            CurlOpt.CONNECTTIMEOUT_MS: max(1, int(min(remaining, FEED_FIRST_BYTE_S) * 1000)),
+            CurlOpt.LOW_SPEED_LIMIT: 1,
+            CurlOpt.LOW_SPEED_TIME: stall,
+        }
+        with Session(
+            impersonate=FEED_IMPERSONATE,
+            trust_env=False,
+            allow_redirects=False,
+            max_redirects=0,
+            curl_options=options,
+        ) as session:
+            try:
+                resp = session.get(
+                    url,
+                    headers=_FEED_REQUEST_HEADERS,
+                    allow_redirects=False,
+                    stream=True,
+                )
+            except RequestException as exc:
+                _reraise_curl(exc, CurlECode.OPERATION_TIMEDOUT)
+            try:
+                peer = (getattr(resp, "primary_ip", "") or "").split("%")[0]
+                try:
+                    peer_ok = bool(peer) and capture._is_public_ip(peer)
+                except ValueError:
+                    peer_ok = False
+                if not peer_ok:
+                    raise ValueError("Private or local network URLs cannot be archived.")
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if status in _FEED_REDIRECTS:
+                    if redirects >= FEED_MAX_REDIRECTS:
+                        raise _FeedError(502, f"The feed server answered HTTP {status}.")
+                    location = resp.headers.get("Location") if resp.headers is not None else None
+                    if not location:
+                        raise _FeedError(502, f"The feed server answered HTTP {status}.")
+                    redirects += 1
+                    url = validate_public_http_url(urljoin(url, location))
+                    continue
+                if status < 200 or status >= 400:
+                    raise _FeedError(502, f"The feed server answered HTTP {status}.")
+                charset = getattr(resp, "charset_encoding", None)
+                on_response(_HeaderResponse(resp.headers, charset))
+                try:
+                    return _read_feed_body(resp, deadline, on_first_chunk)
+                except RequestException as exc:
+                    _reraise_curl(exc, CurlECode.OPERATION_TIMEDOUT)
+            finally:
+                resp.close()
+
+
 def _fetch_feed(raw_url: str) -> bytes:
     deadline = time.monotonic() + FEED_DEADLINE_S
     try:
@@ -161,17 +356,11 @@ def _fetch_feed(raw_url: str) -> bytes:
             raise _FeedError(502, "That address did not return a feed.")
 
     try:
-        body = capture._fetch(
-            clean,
-            {"User-Agent": USER_AGENT, "Accept": FEED_ACCEPT, "Accept-Language": "en-US,en;q=0.9"},
-            deadline,
-            FEED_MAX_BYTES,
-            strict=True,
-            # Some publishers (the Washington Post) take 8-10 s to start answering.
-            socket_timeout=FEED_DEADLINE_S,
-            on_response=on_response,
-            on_first_chunk=on_first_chunk,
-        )
+        client = _curl_client()
+        if client is None:
+            body = _fetch_feed_urllib(clean, deadline, on_response, on_first_chunk)
+        else:
+            body = _fetch_feed_browser(clean, deadline, on_response, on_first_chunk, client)
     except _FeedError:
         raise
     except capture.FetchTooLarge:
