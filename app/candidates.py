@@ -431,18 +431,29 @@ def _claim(incoming: dict) -> str:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 rows = db.load_gift_candidates(conn)
-                existing = _queue_match(rows, keys)
+                # The article row already owns this match_key. Refresh that
+                # row. Updating the gift-token row instead rewrites match_key
+                # onto the article and hits the unique index.
+                existing = next(
+                    (
+                        row
+                        for row in rows
+                        if row.get("match_key") == incoming["match_key"]
+                    ),
+                    None,
+                )
                 if existing is None:
-                    existing = next(
-                        (
-                            row
-                            for row in rows
-                            if row.get("match_key") == incoming["match_key"]
-                        ),
-                        None,
-                    )
+                    existing = _queue_match(rows, keys)
                 if existing is not None:
-                    _apply(conn, existing, _refresh_updates(existing, incoming))
+                    updates = _refresh_updates(existing, incoming)
+                    target = updates.get("match_key")
+                    if target and target != existing.get("match_key") and any(
+                        row["id"] != existing["id"] and row.get("match_key") == target
+                        for row in rows
+                    ):
+                        updates = dict(updates)
+                        del updates["match_key"]
+                    _apply(conn, existing, updates)
                     conn.commit()
                     return "refreshed"
                 db.insert_gift_candidate_in(

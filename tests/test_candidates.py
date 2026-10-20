@@ -300,6 +300,46 @@ def test_later_expiry_and_canonical(tmp_data, allow_private):
     assert rows[0]["found_at"] == _iso(found)
 
 
+def test_linking_ft_gift_to_a_queued_article_does_not_crash(tmp_data, allow_private):
+    """An article URL and its gift link are different keys until a later find joins them.
+
+    The gift row is newer, so a match on the unlock URL used to rewrite its
+    match_key onto the article row and abort the batch with IntegrityError.
+    """
+    found = _now()
+    canonical = "https://www.ft.com/content/abc123"
+    gift = "https://giftarticle.ft.com/giftarticle/actions/redeem/TOKEN1"
+    other = "https://www.ft.com/content/other-story"
+    assert add_finds(
+        [_live_find(canonical, publisher="ft", found_at=_iso(found - timedelta(hours=2)))]
+    ) == ["added"]
+    assert add_finds(
+        [_live_find(gift, publisher="ft", found_at=_iso(found - timedelta(hours=1)))]
+    ) == ["added"]
+    lines = add_finds(
+        [
+            _live_find(
+                gift,
+                publisher="ft",
+                canonical_url=canonical,
+                found_at=_iso(found),
+                expires_at=_iso(found + timedelta(days=10)),
+            ),
+            _live_find(other, publisher="ft", found_at=_iso(found)),
+        ]
+    )
+    assert lines == ["refreshed", "added"]
+    rows = db.list_gift_candidates()
+    article = next(row for row in rows if row["match_key"] == article_match_key(canonical))
+    assert article["unlock_url"] == gift
+    assert article["canonical_url"] == canonical
+    # Ten days is past the FT cap, so the stored deadline is found_at plus seven days.
+    assert article["expires_at"] == _iso(found + timedelta(days=7))
+    assert article["expires_estimated"] is True
+    assert any(row["unlock_url"] == other for row in rows)
+    assert len({row["match_key"] for row in rows}) == len(rows)
+
+
 def test_expiry_cap_differs_by_publisher(tmp_data):
     found = _now()
     lines = add_finds(
