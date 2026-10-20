@@ -605,30 +605,65 @@ def purge_expired(now: datetime | None = None) -> int:
     return db.purge_gift_candidates(format_time(moment - PURGE_AFTER))
 
 
-def _lookup_capture(row: dict, clean: str) -> tuple[str, str | None, object]:
-    from .api import _best_match, _find_matches, _is_usable, _site_name, effective_status
+def _same_stored_url(snap: dict, clean: str) -> bool:
+    """True when this snapshot was captured from ``clean``, not merely the same article.
 
-    linked = row.get("snapshot_id")
-    if linked:
-        snap = db.get_snapshot(linked)
-        if snap is not None:
-            status = effective_status(snap)
-            if status == "complete":
-                return ("exists", snap["id"], _is_usable(snap, _site_name(snap)))
-            if status in {"queued", "capturing"}:
-                return ("inflight", snap["id"], status)
+    The article match key drops gift tokens, so a paywall stub of the canonical
+    URL compares equal to the unlock URL. Those are different captures.
+    """
+    stored = snap.get("url") or ""
+    if not stored:
+        return False
+    return normalize_url(stored) == normalize_url(clean)
+
+
+def _lookup_capture(row: dict, clean: str) -> tuple[str, str | None, object]:
+    """Whether this click still needs a capture of the stored unlock URL.
+
+    A usable snapshot of the article is enough, whichever URL it was saved
+    from. So is a finished or in-flight capture of this exact unlock URL:
+    fetching that link again can spend another redemption.
+
+    A paywall stub or an in-flight capture of the canonical article is not
+    enough. The gift exists to get past that page, and joining it would also
+    turn off the canonical capture's referrer retries.
+    """
+    from .api import _best_match, _find_matches, _is_usable, _site_name, effective_status
+    from .capture import in_flight_job
+
     seen: list[str] = []
     for url in (row.get("canonical_url"), clean):
         if url and url not in seen:
             seen.append(url)
     for url in seen:
         snap, status, usable = _best_match(_find_matches(url))
-        if snap is None:
-            continue
+        if snap is not None and status == "complete" and usable:
+            return ("exists", snap["id"], True)
+
+    def consider(snap: dict) -> tuple[str, str, object] | None:
+        if not _same_stored_url(snap, clean):
+            return None
+        status = effective_status(snap)
         if status == "complete":
-            return ("exists", snap["id"], usable)
+            return ("exists", snap["id"], _is_usable(snap, _site_name(snap)))
         if status in {"queued", "capturing"}:
             return ("inflight", snap["id"], status)
+        return None
+
+    linked = row.get("snapshot_id")
+    if linked:
+        snap = db.get_snapshot(linked)
+        if snap is not None:
+            found = consider(snap)
+            if found is not None:
+                return found
+    for snap in _find_matches(clean):
+        found = consider(snap)
+        if found is not None:
+            return found
+    job = in_flight_job(clean, same_url_only=True)
+    if job is not None:
+        return ("inflight", job["id"], job["status"])
     return ("new", None, None)
 
 
