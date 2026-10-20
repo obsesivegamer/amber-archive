@@ -23,7 +23,7 @@ import time
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
@@ -190,12 +190,64 @@ def _curl_client():
     return CurlOpt, CurlECode, Session, RequestException
 
 
-def _curl_resolve_host(hostname: str) -> str:
+def _ascii_http_host(hostname: str) -> str:
+    """IDNA host used both in the request URL and in CURLOPT_RESOLVE.
+
+    curl_cffi 0.9 matches a resolve pin against the host as written in the
+    URL. Encoding only the pin leaves a Unicode URL unpinned, and libcurl
+    looks the name up again. A host that cannot be written as ASCII is
+    rejected before any connection.
+    """
+    host = hostname.strip(".").lower()
+    if not host:
+        raise ValueError("The feed host cannot be encoded as ASCII.")
     try:
-        ipaddress.ip_address(hostname)
+        ipaddress.ip_address(host)
+        return host
     except ValueError:
-        hostname = hostname.encode("idna").decode("ascii")
+        pass
+    try:
+        encoded = host.encode("idna").decode("ascii")
+        decoded = encoded.encode("ascii").decode("idna")
+    except UnicodeError as exc:
+        raise ValueError("The feed host cannot be encoded as ASCII.") from exc
+    # IDNA that deletes a character (a zero-width space, for example) would
+    # pin a different name from the one that was validated. Keep a host only
+    # when it is already the ASCII form, or the Unicode form of that form.
+    if host not in {encoded, decoded}:
+        raise ValueError("The feed host cannot be encoded as ASCII.")
+    labels = encoded.split(".")
+    if (
+        not encoded.isascii()
+        or any(label == "" or len(label) > 63 for label in labels)
+        or any(ord(ch) < 33 or ord(ch) == 127 for ch in encoded)
+    ):
+        raise ValueError("The feed host cannot be encoded as ASCII.")
+    return encoded
+
+
+def _curl_resolve_host(hostname: str) -> str:
+    """Bracket an IPv6 address the way CURLOPT_RESOLVE writes it."""
     return f"[{hostname}]" if ":" in hostname else hostname
+
+
+def _url_for_pinned_host(parsed, ascii_host: str, port: int) -> str:
+    default_port = 443 if parsed.scheme == "https" else 80
+    netloc = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    if port != default_port:
+        netloc = f"{netloc}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc, fragment=""))
+
+
+def _same_pinned_peer(peer: str, pinned_ip: str) -> bool:
+    if not peer or not pinned_ip:
+        return False
+    try:
+        if ipaddress.ip_address(peer) != ipaddress.ip_address(pinned_ip):
+            return False
+        return bool(capture._is_public_ip(peer))
+    except ValueError:
+        return False
 
 
 def _public_peer_ip(hostname: str, port: int) -> str:
@@ -232,7 +284,9 @@ def _fetch_feed_urllib(clean: str, deadline: float, on_response, on_first_chunk)
         deadline,
         FEED_MAX_BYTES,
         strict=True,
-        socket_timeout=FEED_DEADLINE_S,
+        # Same stall cap as the browser client: one silent read must not hold
+        # the slot for the whole deadline. The deadline still bounds the fetch.
+        socket_timeout=FEED_FIRST_BYTE_S,
         on_response=on_response,
         on_first_chunk=on_first_chunk,
     )
@@ -259,8 +313,8 @@ def _fetch_feed_browser(clean: str, deadline: float, on_response, on_first_chunk
     """GET a feed with Chrome's TLS and HTTP/2 fingerprint.
 
     Redirects are followed here, not inside libcurl, so each Location is run
-    through validate_public_http_url. Each hop is pinned to a public address
-    and the peer libcurl actually used is checked before the body is kept.
+    through validate_public_http_url. Each hop's URL host is rewritten to the
+    same ASCII spelling as its resolve pin, and the peer must be that address.
     """
     CurlOpt, CurlECode, Session, RequestException = client
     url = clean
@@ -273,9 +327,16 @@ def _fetch_feed_browser(clean: str, deadline: float, on_response, on_first_chunk
         host = parsed.hostname
         if not host:
             raise ValueError("URL is missing a host.")
+        ascii_host = _ascii_http_host(host)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        ip = _public_peer_ip(host, port)
-        pinned = f"{_curl_resolve_host(host)}:{port}:{_curl_resolve_host(ip)}"
+        ip = _public_peer_ip(ascii_host, port)
+        request_url = _url_for_pinned_host(parsed, ascii_host, port)
+        pinned_host = _curl_resolve_host(ascii_host)
+        pinned = f"{pinned_host}:{port}:{_curl_resolve_host(ip)}"
+        # The pin is useless unless the URL host is this exact spelling.
+        # Refuse to send rather than let libcurl resolve the name itself.
+        if urlparse(request_url).hostname != ascii_host or not pinned.startswith(f"{pinned_host}:{port}:"):
+            raise ValueError("The feed host does not match the address it would connect to.")
         stall = max(1, int(FEED_FIRST_BYTE_S))
         options = {
             CurlOpt.RESOLVE: [pinned],
@@ -294,7 +355,7 @@ def _fetch_feed_browser(clean: str, deadline: float, on_response, on_first_chunk
         ) as session:
             try:
                 resp = session.get(
-                    url,
+                    request_url,
                     headers=_FEED_REQUEST_HEADERS,
                     allow_redirects=False,
                     stream=True,
@@ -303,11 +364,7 @@ def _fetch_feed_browser(clean: str, deadline: float, on_response, on_first_chunk
                 _reraise_curl(exc, CurlECode.OPERATION_TIMEDOUT)
             try:
                 peer = (getattr(resp, "primary_ip", "") or "").split("%")[0]
-                try:
-                    peer_ok = bool(peer) and capture._is_public_ip(peer)
-                except ValueError:
-                    peer_ok = False
-                if not peer_ok:
+                if not _same_pinned_peer(peer, ip):
                     raise ValueError("Private or local network URLs cannot be archived.")
                 status = int(getattr(resp, "status_code", 0) or 0)
                 if status in _FEED_REDIRECTS:

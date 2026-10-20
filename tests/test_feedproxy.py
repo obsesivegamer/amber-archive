@@ -1,6 +1,13 @@
 """Feed proxy client: browser TLS, SSRF and size checks, urllib fallback."""
 
+import os
+import shutil
 import socket
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -263,7 +270,7 @@ def test_urllib_fallback_when_curl_is_not_installed(monkeypatch):
     assert url == FEED_URL
     assert max_bytes == web.FEED_MAX_BYTES
     assert kwargs["strict"] is True
-    assert kwargs["socket_timeout"] == web.FEED_DEADLINE_S
+    assert kwargs["socket_timeout"] == web.FEED_FIRST_BYTE_S
     assert headers["Accept"] == web.FEED_ACCEPT
 
 
@@ -313,3 +320,203 @@ def test_feedproxy_route_uses_the_browser_client(tmp_data, monkeypatch):
     assert "xml" in response.headers["content-type"]
     assert b"<rss" in response.content
     assert script.sessions[0]["impersonate"] == "chrome131"
+
+
+def test_non_ascii_redirect_is_requested_as_the_pinned_punycode_host(monkeypatch):
+    seen = []
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        seen.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, port))]
+
+    monkeypatch.setattr(
+        security,
+        "host_is_public",
+        lambda host: host in {"example.com", "bücher.example", "xn--bcher-kva.example"},
+    )
+    monkeypatch.setattr(web.socket, "getaddrinfo", getaddrinfo)
+    _forbid_urllib(monkeypatch)
+    redirect = _Response(status=302, headers={"Location": "http://bücher.example/rss.xml"}, body=b"")
+    script = _Script([redirect, _Response(body=FEED)])
+    monkeypatch.setattr(web, "_curl_client", script.client)
+    body = web._fetch_feed("https://example.com/start.xml")
+    assert b"<rss" in body
+    assert seen == ["example.com", "xn--bcher-kva.example"]
+    assert [url for url, _call in script.calls] == [
+        "https://example.com/start.xml",
+        "http://xn--bcher-kva.example/rss.xml",
+    ]
+    assert script.sessions[1]["curl_options"][_Opt.RESOLVE] == [f"xn--bcher-kva.example:80:{PUBLIC_IP}"]
+    assert redirect.read is False
+
+
+def test_host_that_cannot_be_idna_encoded_is_not_fetched(monkeypatch):
+    def getaddrinfo(*args, **kwargs):
+        raise AssertionError("resolved a host that cannot be encoded")
+
+    monkeypatch.setattr(security, "host_is_public", lambda host: True)
+    monkeypatch.setattr(web.socket, "getaddrinfo", getaddrinfo)
+    _forbid_urllib(monkeypatch)
+    script = _Script([_Response(body=FEED)])
+    monkeypatch.setattr(web, "_curl_client", script.client)
+    with pytest.raises(web._FeedError) as exc:
+        web._fetch_feed("http://foo\u200b.example/rss.xml")
+    assert exc.value.status == 502
+    assert "not allowed" in exc.value.detail
+    assert script.sessions == []
+
+
+_RESOLVE_INTERPOSE_C = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void note(const char *node) {
+    const char *path = getenv("AMBER_RESOLVE_LOG");
+    FILE *fp;
+    if (!path || !node)
+        return;
+    fp = fopen(path, "a");
+    if (!fp)
+        return;
+    fprintf(fp, "%s\n", node);
+    fclose(fp);
+}
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **res) {
+    static int (*real_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = 0;
+    if (!real_getaddrinfo)
+        real_getaddrinfo = dlsym(RTLD_NEXT, "getaddrinfo");
+    note(node ? node : "-");
+    if (node && (strcmp(node, "xn--bcher-kva.example") == 0 ||
+                 strcmp(node, "xn--bcher-kva.example.") == 0 ||
+                 strcmp(node, "bücher.example") == 0 ||
+                 strcmp(node, "bücher.example.") == 0))
+        return real_getaddrinfo("127.0.0.2", service, hints, res);
+    return real_getaddrinfo(node, service, hints, res);
+}
+"""
+
+_PINNED_CHILD = r"""
+import os
+import socket
+
+from app import capture, security, web
+
+port = int(os.environ["FEED_PORT"])
+calls = []
+
+def host_is_public(host):
+    return host in {"bücher.example", "xn--bcher-kva.example"}
+
+def getaddrinfo(host, port, *args, **kwargs):
+    calls.append(host)
+    if host != "xn--bcher-kva.example":
+        raise AssertionError("resolved " + repr(host))
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+def is_public(ip):
+    return ip == "127.0.0.1"
+
+security.host_is_public = host_is_public
+web.socket.getaddrinfo = getaddrinfo
+capture._is_public_ip = is_public
+open(os.environ["AMBER_RESOLVE_LOG"], "w").close()
+body = web._fetch_feed("http://bücher.example:%d/rss.xml" % port)
+if b"pinned-feed" not in body:
+    raise SystemExit("body was not served by the pinned listener")
+open(os.environ["FEED_CALLS"], "w").write("\n".join(calls))
+"""
+
+
+def _feed_handler(hits, body):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.headers.get("Host"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    return Handler
+
+
+def test_non_ascii_host_connects_only_to_the_pinned_address(tmp_path):
+    """A Unicode host is fetched from the pinned address and nowhere else.
+
+    Libcurl's own resolver is interposed: a second lookup of this name returns
+    127.0.0.2, where another listener is waiting. The pin has to be the only
+    way the GET is addressed, or that listener sees it.
+    """
+    pytest.importorskip("curl_cffi")
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("gcc is required to interpose getaddrinfo")
+    source = tmp_path / "resolve.c"
+    library = tmp_path / "libresolve.so"
+    source.write_text(_RESOLVE_INTERPOSE_C, encoding="utf-8")
+    compiled = subprocess.run(
+        [gcc, "-shared", "-fPIC", "-o", str(library), str(source), "-ldl"],
+        capture_output=True,
+        text=True,
+    )
+    assert compiled.returncode == 0, compiled.stderr
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    pinned_hits = []
+    unpinned_hits = []
+    pinned_body = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>pinned-feed</title></channel></rss>'
+    )
+    unpinned_body = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>unpinned-feed</title></channel></rss>'
+    )
+    pinned = ThreadingHTTPServer(("127.0.0.1", port), _feed_handler(pinned_hits, pinned_body))
+    unpinned = ThreadingHTTPServer(("127.0.0.2", port), _feed_handler(unpinned_hits, unpinned_body))
+    threads = []
+    for server in (pinned, unpinned):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        threads.append(thread)
+    log_path = tmp_path / "resolves.txt"
+    calls_path = tmp_path / "calls.txt"
+    child = tmp_path / "fetch_child.py"
+    child.write_text(_PINNED_CHILD, encoding="utf-8")
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = str(library)
+    env["AMBER_RESOLVE_LOG"] = str(log_path)
+    env["FEED_PORT"] = str(port)
+    env["FEED_CALLS"] = str(calls_path)
+    env["AMBER_DATA_DIR"] = str(tmp_path / "data")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(child)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        pinned.shutdown()
+        unpinned.shutdown()
+        for thread in threads:
+            thread.join(timeout=5)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert pinned_hits == [f"xn--bcher-kva.example:{port}"]
+    assert unpinned_hits == []
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["xn--bcher-kva.example"]
+    logged = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line]
+    assert logged == []
