@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import re
+import sqlite3
 import time
 import unicodedata
 from collections import deque
@@ -243,17 +244,21 @@ def effective_status(snap: dict) -> str:
     return status
 
 
-def _find_matches(url: str) -> list[dict]:
+def _find_matches(url: str, conn: sqlite3.Connection | None = None) -> list[dict]:
     """Snapshots of any status for this article, newest first.
 
     Compares article_match_key of the saved URL, its normalized form and the
     post-redirect final URL against the key of `url`.
+
+    ``conn`` reuses the caller's connection. The default opens one for this lookup.
     """
     key = article_match_key(url)
     if not key:
         return []
     parsed = urlparse(url if "://" in url else "https://" + url)
-    candidates = db.find_candidates(parsed.hostname or "", parsed.path.rstrip("/") or "/")
+    candidates = db.find_candidates(
+        parsed.hostname or "", parsed.path.rstrip("/") or "/", conn=conn
+    )
     return [
         snap
         for snap in candidates
