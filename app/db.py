@@ -41,6 +41,9 @@ class _ClosingConnection(sqlite3.Connection):
     ``sqlite3.Connection.__exit__`` ends the transaction and leaves the
     connection open. ``with connect()`` would otherwise leak a file handle
     on every use, until the process hits the open-file limit.
+
+    Callers must not use ``with conn:`` as a transaction scope on a
+    connection they keep using afterwards: leaving the block closes it.
     """
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -51,10 +54,20 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def connect() -> sqlite3.Connection:
+    """Open the archive database.
+
+    Unlike a plain ``sqlite3.Connection``, ``with connect() as db:`` commits
+    or rolls back and then *closes* the connection when the block ends. Do
+    not reuse ``db`` after the block, and copy rows out before leaving it.
+    """
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=_ClosingConnection)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -426,17 +439,26 @@ def get_snapshot(sid: str) -> dict | None:
         return _as_snap(row) if row else None
 
 
+# Stay well under SQLite's bound-variable limit (999 on older builds).
+_SNAPSHOT_ID_CHUNK = 500
+
+
 def load_snapshots(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict]:
     """Snapshots for these ids, read on the caller's connection."""
     wanted = [sid for sid in dict.fromkeys(ids) if sid]
     if not wanted:
         return {}
-    marks = ", ".join("?" for _ in wanted)
-    rows = conn.execute(
-        f"SELECT * FROM snapshots WHERE id IN ({marks})",
-        wanted,
-    ).fetchall()
-    return {row["id"]: _as_snap(row) for row in rows}
+    found: dict[str, dict] = {}
+    for start in range(0, len(wanted), _SNAPSHOT_ID_CHUNK):
+        chunk = wanted[start : start + _SNAPSHOT_ID_CHUNK]
+        marks = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT * FROM snapshots WHERE id IN ({marks})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            found[row["id"]] = _as_snap(row)
+    return found
 
 
 def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:

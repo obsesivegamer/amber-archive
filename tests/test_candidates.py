@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import os
@@ -1004,10 +1005,16 @@ def test_candidates_poll_does_not_leak_file_descriptors(api):
         assert response.status_code == 200
         assert len(response.json()["candidates"]) == 2
 
-    for _ in range(5):
-        poll()
-    before = _open_fd_count()
-    for _ in range(300):
-        poll()
-    after = _open_fd_count()
+    # Without the collector, a leaked connection stays open until the test
+    # ends instead of being closed by refcount or a lucky gc pass.
+    gc.disable()
+    try:
+        for _ in range(5):
+            poll()
+        before = _open_fd_count()
+        for _ in range(300):
+            poll()
+        after = _open_fd_count()
+    finally:
+        gc.enable()
     assert after <= before + 8, f"open files grew from {before} to {after}"
