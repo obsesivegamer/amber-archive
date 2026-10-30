@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -930,3 +932,89 @@ def test_saved_yesterday_is_not_on_the_live_list(tmp_data):
     db.update_gift_candidate(row["id"], snapshot_id=sid, clicked_at=yesterday)
     assert get_candidates_payload("live")["candidates"] == []
     assert get_candidates_payload("all")["candidates"][0]["status"] == "saved"
+
+
+def _open_fd_count() -> int:
+    """Open file descriptors for this process.
+
+    Linux exposes them in ``/proc/self/fd``. Otherwise use psutil when it is
+    already installed, and ``lsof`` on macOS where procfs is absent.
+    """
+    fd_dir = Path("/proc/self/fd")
+    if fd_dir.is_dir():
+        return len(list(fd_dir.iterdir()))
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        return psutil.Process().num_fds()
+    listed = subprocess.run(
+        ["lsof", "-p", str(os.getpid())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    lines = [line for line in listed.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        detail = listed.stderr.strip() or "Could not count open files"
+        raise RuntimeError(detail)
+    return len(lines) - 1
+
+
+def test_candidates_payload_opens_one_connection(tmp_data, monkeypatch):
+    """Listing reads every candidate on one connection, plus init_db's own."""
+    opened = {"n": 0}
+    real_connect = db.connect
+
+    def counting():
+        opened["n"] += 1
+        return real_connect()
+
+    monkeypatch.setattr(db, "connect", counting)
+    saved = _queue(
+        "http://93.184.216.34/saved", canonical_url="http://93.184.216.34/saved-canon"
+    )
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, saved["unlock_url"], saved["unlock_url"])
+    _make_usable(sid, saved["unlock_url"])
+    db.update_gift_candidate(saved["id"], snapshot_id=sid)
+    fresh = _queue(
+        "http://93.184.216.34/fresh", canonical_url="http://93.184.216.34/fresh-canon"
+    )
+    opened["n"] = 0
+    payload = get_candidates_payload("live")
+    assert opened["n"] == 2
+    by_id = {item["id"]: item for item in payload["candidates"]}
+    assert by_id[saved["id"]]["status"] == "saved"
+    assert by_id[fresh["id"]]["status"] == "new"
+
+
+def test_candidates_poll_does_not_leak_file_descriptors(api):
+    row = _queue(
+        "http://93.184.216.34/story", canonical_url="http://93.184.216.34/canon"
+    )
+    sid = db.allocate_id()
+    db.insert_snapshot(sid, row["unlock_url"], row["unlock_url"])
+    _make_usable(sid, row["unlock_url"])
+    db.update_gift_candidate(row["id"], snapshot_id=sid)
+    _queue("http://93.184.216.34/other", canonical_url="http://93.184.216.34/other-canon")
+
+    def poll() -> None:
+        response = api.get("/api/candidates")
+        assert response.status_code == 200
+        assert len(response.json()["candidates"]) == 2
+
+    # Without the collector, a leaked connection stays open until the test
+    # ends instead of being closed by refcount or a lucky gc pass.
+    gc.disable()
+    try:
+        for _ in range(5):
+            poll()
+        before = _open_fd_count()
+        for _ in range(300):
+            poll()
+        after = _open_fd_count()
+    finally:
+        gc.enable()
+    assert after <= before + 8, f"open files grew from {before} to {after}"

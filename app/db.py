@@ -35,11 +35,39 @@ CREATE INDEX IF NOT EXISTS idx_snaps_status ON snapshots(status);
 """
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commit or roll back, then close.
+
+    ``sqlite3.Connection.__exit__`` ends the transaction and leaves the
+    connection open. ``with connect()`` would otherwise leak a file handle
+    on every use, until the process hits the open-file limit.
+
+    Callers must not use ``with conn:`` as a transaction scope on a
+    connection they keep using afterwards: leaving the block closes it.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    """Open the archive database.
+
+    Unlike a plain ``sqlite3.Connection``, ``with connect() as db:`` commits
+    or rolls back and then *closes* the connection when the block ends. Do
+    not reuse ``db`` after the block, and copy rows out before leaving it.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=_ClosingConnection)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -408,7 +436,29 @@ def update_snapshot(sid: str, **fields: Any) -> None:
 def get_snapshot(sid: str) -> dict | None:
     with connect() as db:
         row = db.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
-    return _as_snap(row) if row else None
+        return _as_snap(row) if row else None
+
+
+# Stay well under SQLite's bound-variable limit (999 on older builds).
+_SNAPSHOT_ID_CHUNK = 500
+
+
+def load_snapshots(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict]:
+    """Snapshots for these ids, read on the caller's connection."""
+    wanted = [sid for sid in dict.fromkeys(ids) if sid]
+    if not wanted:
+        return {}
+    found: dict[str, dict] = {}
+    for start in range(0, len(wanted), _SNAPSHOT_ID_CHUNK):
+        chunk = wanted[start : start + _SNAPSHOT_ID_CHUNK]
+        marks = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT * FROM snapshots WHERE id IN ({marks})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            found[row["id"]] = _as_snap(row)
+    return found
 
 
 def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
@@ -422,19 +472,28 @@ def find_by_url(url_normalized: str, limit: int = 50) -> list[dict]:
             """,
             (url_normalized, limit),
         ).fetchall()
-    return [_as_snap(r) for r in rows]
+        return [_as_snap(r) for r in rows]
 
 
 def _like_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def find_candidates(host: str, path: str = "/", limit: int = 2000) -> list[dict]:
+def find_candidates(
+    host: str,
+    path: str = "/",
+    limit: int = 2000,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
     """Snapshots of any status whose url, url_normalized or final_url could be this article.
 
     A superset: LIKE narrows by host and path in SQL so a large archive is not
     cut off by a row cap; the caller makes the exact comparison. Newest first,
     ties broken by insertion order.
+
+    Pass ``conn`` to query a connection the caller already has open. The gift
+    queue does that so one request does not open a connection per article.
     """
     bare = host[4:] if host.startswith("www.") else host
     host_pat = f"%{_like_escape(bare)}%"
@@ -443,17 +502,22 @@ def find_candidates(host: str, path: str = "/", limit: int = 2000) -> list[dict]
         f"({col} LIKE ? ESCAPE '\\' AND {col} LIKE ? ESCAPE '\\')"
         for col in ("url_normalized", "url", "final_url")
     )
-    with connect() as db:
-        rows = db.execute(
-            f"""
+    sql = f"""
             SELECT * FROM snapshots
             WHERE {clauses}
             ORDER BY created_at DESC, rowid DESC
             LIMIT ?
-            """,
-            (host_pat, path_pat) * 3 + (limit,),
-        ).fetchall()
-    return [_as_snap(r) for r in rows]
+            """
+    params = (host_pat, path_pat) * 3 + (limit,)
+
+    def _read(db: sqlite3.Connection) -> list[dict]:
+        rows = db.execute(sql, params).fetchall()
+        return [_as_snap(r) for r in rows]
+
+    if conn is not None:
+        return _read(conn)
+    with connect() as db:
+        return _read(db)
 
 
 def search_snapshots(query: str, limit: int = 50) -> list[dict]:
@@ -471,7 +535,7 @@ def search_snapshots(query: str, limit: int = 50) -> list[dict]:
             """,
             (q, q, q, q, q, limit),
         ).fetchall()
-    return [_as_snap(r) for r in rows]
+        return [_as_snap(r) for r in rows]
 
 
 def recent_snapshots(limit: int = 12) -> list[dict]:
@@ -485,7 +549,7 @@ def recent_snapshots(limit: int = 12) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [_as_snap(r) for r in rows]
+        return [_as_snap(r) for r in rows]
 
 
 def complete_snapshots() -> list[dict]:
@@ -498,7 +562,7 @@ def complete_snapshots() -> list[dict]:
             ORDER BY created_at ASC, rowid ASC
             """
         ).fetchall()
-    return [_as_snap(row) for row in rows]
+        return [_as_snap(row) for row in rows]
 
 
 def recapture_snapshots() -> list[dict]:
@@ -514,7 +578,7 @@ def recapture_snapshots() -> list[dict]:
             ORDER BY created_at ASC, rowid ASC
             """
         ).fetchall()
-    return [_as_snap(row) for row in rows]
+        return [_as_snap(row) for row in rows]
 
 
 def complete_since(created_after: str) -> list[dict]:
@@ -527,7 +591,7 @@ def complete_since(created_after: str) -> list[dict]:
             """,
             (created_after,),
         ).fetchall()
-    return [_as_snap(r) for r in rows]
+        return [_as_snap(r) for r in rows]
 
 
 def count_snapshots() -> int:
@@ -535,13 +599,13 @@ def count_snapshots() -> int:
         row = db.execute(
             "SELECT COUNT(*) AS n FROM snapshots WHERE status = 'complete'"
         ).fetchone()
-    return int(row["n"] if row else 0)
+        return int(row["n"] if row else 0)
 
 
 def all_ids() -> list[str]:
     with connect() as db:
         rows = db.execute("SELECT id FROM snapshots").fetchall()
-    return [r["id"] for r in rows]
+        return [r["id"] for r in rows]
 
 
 def delete_snapshot(sid: str) -> bool:
@@ -697,7 +761,7 @@ def update_gift_candidate(cid: str, **fields: Any) -> None:
 def get_gift_candidate(cid: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
-    return _as_candidate(row) if row else None
+        return _as_candidate(row) if row else None
 
 
 def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
