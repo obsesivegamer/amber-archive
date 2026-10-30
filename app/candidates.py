@@ -496,8 +496,17 @@ def add_finds(finds: list) -> list[str]:
     return lines
 
 
-def derived_status(row: dict, now: datetime, effective_status) -> str:
-    """Status from expiry, dismissal and the linked snapshot. Never stored."""
+def derived_status(
+    row: dict,
+    now: datetime,
+    effective_status,
+    snapshots: dict[str, dict] | None = None,
+) -> str:
+    """Status from expiry, dismissal and the linked snapshot. Never stored.
+
+    ``snapshots`` is an id-to-row map already loaded for this request. Without
+    it, the linked snapshot is read on its own connection.
+    """
     if row.get("dismissed_at"):
         return "dismissed"
     if _parse_stored(row["expires_at"]) <= now:
@@ -505,7 +514,10 @@ def derived_status(row: dict, now: datetime, effective_status) -> str:
     snapshot_id = row.get("snapshot_id")
     if not snapshot_id:
         return "new"
-    snap = db.get_snapshot(snapshot_id)
+    if snapshots is None:
+        snap = db.get_snapshot(snapshot_id)
+    else:
+        snap = snapshots.get(snapshot_id)
     if snap is None:
         return "failed"
     status = effective_status(snap)
@@ -516,10 +528,14 @@ def derived_status(row: dict, now: datetime, effective_status) -> str:
     return "failed"
 
 
-def _saved_day(row: dict) -> str:
+def _saved_day(row: dict, snapshots: dict[str, dict] | None = None) -> str:
     stamp = row.get("clicked_at") or ""
     if not stamp and row.get("snapshot_id"):
-        snap = db.get_snapshot(row["snapshot_id"])
+        snapshot_id = row["snapshot_id"]
+        if snapshots is None:
+            snap = db.get_snapshot(snapshot_id)
+        else:
+            snap = snapshots.get(snapshot_id)
         stamp = (snap or {}).get("created_at") or ""
     return stamp[:10]
 
@@ -542,33 +558,42 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
     db.init_db()
     moment = now or datetime.now(timezone.utc)
     today = moment.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    listed = []
-    for row in db.list_gift_candidates():
-        status = derived_status(row, moment, effective_status)
-        if include == "live" and status not in {"new", "saving", "failed"}:
-            if not (status == "saved" and _saved_day(row) == today):
-                continue
-        display = row.get("canonical_url") or row["unlock_url"]
-        site = _site_name({"site_name": "", "url": display, "final_url": None, "title": ""})
-        listed.append(
-            {
-                "id": row["id"],
-                "unlock_url": row["unlock_url"],
-                "canonical_url": row.get("canonical_url"),
-                "site": site,
-                "publisher": row["publisher"],
-                "title": row.get("title"),
-                "source_url": row.get("source_url"),
-                "source_author": row.get("source_author"),
-                "found_at": row["found_at"],
-                "expires_at": row["expires_at"],
-                "expires_estimated": bool(row["expires_estimated"]),
-                "clicked_at": row.get("clicked_at"),
-                "dismissed_at": row.get("dismissed_at"),
-                "status": status,
-                "archived": _archived(row, _best_match, _find_matches),
-            }
+    with db.connect() as conn:
+        rows = db.load_gift_candidates(conn)
+        snapshots = db.load_snapshots(
+            conn, [row.get("snapshot_id") or "" for row in rows]
         )
+
+        def matches(url: str) -> list[dict]:
+            return _find_matches(url, conn)
+
+        listed = []
+        for row in rows:
+            status = derived_status(row, moment, effective_status, snapshots)
+            if include == "live" and status not in {"new", "saving", "failed"}:
+                if not (status == "saved" and _saved_day(row, snapshots) == today):
+                    continue
+            display = row.get("canonical_url") or row["unlock_url"]
+            site = _site_name({"site_name": "", "url": display, "final_url": None, "title": ""})
+            listed.append(
+                {
+                    "id": row["id"],
+                    "unlock_url": row["unlock_url"],
+                    "canonical_url": row.get("canonical_url"),
+                    "site": site,
+                    "publisher": row["publisher"],
+                    "title": row.get("title"),
+                    "source_url": row.get("source_url"),
+                    "source_author": row.get("source_author"),
+                    "found_at": row["found_at"],
+                    "expires_at": row["expires_at"],
+                    "expires_estimated": bool(row["expires_estimated"]),
+                    "clicked_at": row.get("clicked_at"),
+                    "dismissed_at": row.get("dismissed_at"),
+                    "status": status,
+                    "archived": _archived(row, _best_match, matches),
+                }
+            )
     return {"candidates": listed, "updated_at": format_time(moment)}
 
 
