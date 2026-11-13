@@ -45,6 +45,15 @@ class PushResult:
     change_seq: int
 
 
+@dataclass(frozen=True)
+class BackfillItem:
+    sid: str
+    ok: bool
+    status: int | None
+    detail: str
+    result: PushResult | None = None
+
+
 class UrllibTransport:
     def round_trip(
         self,
@@ -291,25 +300,33 @@ def backfill(
     token: str,
     *,
     transport: UrllibTransport | None = None,
-) -> list[tuple[str, PushResult]]:
+) -> list[BackfillItem]:
     """Push every complete id that ingest has not stored.
 
     A tree rsync can land snaps/<id>/ without a snapshots row. The reader
     lists rows only, so those folders stay off the phone until this runs.
+    Ids are oldest first. One rejected id is recorded and the rest still run,
+    so a bad old snapshot cannot wedge every newer capture.
     """
     client = transport or UrllibTransport()
     have = stored_ids(ingest_url, token, transport=client)
-    pushed = []
+    outcome: list[BackfillItem] = []
     for sid in complete_ids(source):
         if sid in have:
             continue
-        folder = source / "snaps" / sid
-        if folder.is_symlink() or not folder.is_dir():
-            raise PushError(f"no snapshot directory for {sid}")
-        pushed.append(
-            (sid, push_snapshot(source, sid, ingest_url, token, transport=client))
-        )
-    return pushed
+        try:
+            folder = source / "snaps" / sid
+            if folder.is_symlink() or not folder.is_dir():
+                raise PushError(f"no snapshot directory for {sid}")
+            result = push_snapshot(source, sid, ingest_url, token, transport=client)
+        except PushRejected as exc:
+            outcome.append(BackfillItem(sid, False, exc.status, exc.detail))
+            continue
+        except (PushError, urllib.error.URLError, TimeoutError, OSError) as exc:
+            outcome.append(BackfillItem(sid, False, None, str(exc)))
+            continue
+        outcome.append(BackfillItem(sid, True, result.status, "", result))
+    return outcome
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -337,10 +354,10 @@ def main(argv: list[str] | None = None) -> int:
         token = read_token_file(args.token_file)
         source = args.data_dir if args.data_dir is not None else DATA_DIR
         if args.backfill:
-            results = backfill(source, args.ingest_url, token)
+            items = backfill(source, args.ingest_url, token)
         else:
             result = push_snapshot(source, args.snapshot_id, args.ingest_url, token)
-            results = [(args.snapshot_id, result)]
+            items = [BackfillItem(args.snapshot_id, True, result.status, "", result)]
     except (TokenFileError, PushError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -350,13 +367,22 @@ def main(argv: list[str] | None = None) -> int:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         print(f"push failed: {exc}", file=sys.stderr)
         return 1
-    for sid, result in results:
-        print(
-            f"{result.status} {sid} "
-            f"revision={result.revision} change_seq={result.change_seq}"
-        )
+    ok = 0
+    failed = 0
+    for item in items:
+        if item.ok and item.result is not None:
+            ok += 1
+            print(
+                f"{item.result.status} {item.sid} "
+                f"revision={item.result.revision} change_seq={item.result.change_seq}"
+            )
+            continue
+        failed += 1
+        status = "-" if item.status is None else str(item.status)
+        print(f"FAIL {item.sid} {status} {item.detail}", file=sys.stderr)
     if args.backfill:
-        print(f"backfill {len(results)}")
+        print(f"backfill {ok} ok, {failed} failed")
+        return 1 if failed else 0
     return 0
 
 

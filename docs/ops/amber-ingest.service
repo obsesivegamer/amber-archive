@@ -10,6 +10,9 @@ Environment=AMBER_INGEST_HOST=127.0.0.1
 Environment=AMBER_INGEST_PORT=8082
 ExecStart=%h/apps/amber-archive/.venv/bin/python -m app.library_ingest
 Restart=on-failure
+# Exit 76 means ingest-store-id does not match the database. Restarting
+# would loop until someone deletes that file on purpose.
+RestartPreventExitStatus=76
 
 [Install]
 WantedBy=default.target

@@ -29,6 +29,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -471,7 +472,10 @@ def _prepare_unlocked(data_dir: Path) -> None:
             "ingest-store-id does not match the database; keeping snapshot directories"
         )
         _recover_unlocked(data_dir)
-        raise SystemExit("amber ingest: database was replaced; refusing to start")
+        # 76 is RestartPreventExitStatus= in the sample unit, so a replaced
+        # database does not restart in a loop. Other exits still use 1.
+        print("amber ingest: database was replaced; refusing to start", file=sys.stderr)
+        raise SystemExit(76)
     _ensure_store_identity(data_dir)
     _recover_unlocked(data_dir)
 
@@ -788,6 +792,51 @@ def _retain_blob(data_dir: Path, sha: str) -> None:
         conn.close()
 
 
+def _release_payload_blobs(data_dir: Path, payload: object) -> None:
+    """Drop blob refs from a revision POST that did not commit.
+
+    Each PUT increments a ref. Commit and the idempotent 200 path release
+    them. A 4xx or 5xx after those PUTs must release too, or the count
+    never returns to zero.
+    """
+    if not isinstance(payload, dict):
+        return
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return
+    listed: list[dict] = []
+    seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        sha = item.get("sha256")
+        if not isinstance(sha, str):
+            continue
+        sha = sha.lower()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        listed.append({"path": "meta.json", "sha256": sha, "size": 0})
+    if not listed:
+        return
+    try:
+        _release_blobs(
+            data_dir,
+            RevisionDoc(
+                sid="",
+                revision=0,
+                op="",
+                match_key="",
+                row={},
+                files=listed,
+                row_json="",
+                files_json="",
+            ),
+        )
+    except Exception:
+        log.exception("could not release blob refs after a failed revision")
+
+
 def _release_blobs(data_dir: Path, doc: RevisionDoc) -> None:
     """Drop one reference per hash. Unlink the blob only at zero.
 
@@ -999,6 +1048,7 @@ def create_app(
 
     @app.post("/v1/revisions")
     def post_revision(request: Request) -> JSONResponse:
+        payload: object = None
         try:
             _authorize(request)
             media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -1018,8 +1068,10 @@ def create_app(
                 raise IngestError(400, "body must be a JSON object")
             result = commit_document(request.app.state.data_dir, payload)
         except IngestError as exc:
+            _release_payload_blobs(request.app.state.data_dir, payload)
             return _error(exc)
         except Exception:
+            _release_payload_blobs(request.app.state.data_dir, payload)
             log.exception("revision commit failed")
             return JSONResponse(status_code=500, content={"detail": "commit failed"})
         return JSONResponse(

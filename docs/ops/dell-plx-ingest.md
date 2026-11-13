@@ -47,7 +47,16 @@ curl -sS http://127.0.0.1:8081/healthz
 
 ## Prerequisite: hourly rsync
 
-`scripts/sync-from-mac.sh` in amber-reader excludes `amber.sqlite3` from the tree copy, then rsyncs a Mac `.backup` snapshot onto `DEST_PATH/amber.sqlite3`. That second copy replaces the ingest database. The replacement has no `library_revisions` or `library_changes` table, so the next push of the same id is treated as revision 1 and `change_seq` starts again at 1. A journal left from a crash then looks unpublished. Ingest writes a random id in `library_meta` and in `ingest-store-id`. If that file is present and the database does not contain the same id, startup exits and a commit answers 503, and recovery logs and leaves `snaps/<id>` in place. Do not delete `ingest-store-id` to "clear" that state.
+`scripts/sync-from-mac.sh` in amber-reader excludes `amber.sqlite3` from the tree copy, then rsyncs a Mac `.backup` snapshot onto `DEST_PATH/amber.sqlite3`. That second copy replaces the ingest database. The replacement has no `library_revisions` or `library_changes` table, so the next push of the same id is treated as revision 1 and `change_seq` starts again at 1. A journal left from a crash then looks unpublished. Ingest writes a random id in `library_meta` and in `ingest-store-id`. If that file is present and the database does not contain the same id, startup exits 76 and a commit answers 503, and recovery logs and leaves `snaps/<id>` in place. The sample unit sets `RestartPreventExitStatus=76` so systemd does not restart that exit in a loop.
+
+To accept the database that is there now and fill it again:
+
+```bash
+rm /home/jerem/apps/amber-reader/data/ingest-store-id
+systemctl --user start amber-ingest
+```
+
+Startup writes a new id into the file and into `library_meta`. Then run `--backfill` by hand. That push replaces each `snaps/<id>/` it sends.
 
 `--delete` removes names that are not excluded and are absent on the Mac. `blobs/`, `ingest-staging/`, `ingest-previous/`, `ingest-journal/`, and `ingest-store-id` are only on Dell-PLX, so `--delete` removes them. `ingest-store-id` is the sentinel that tells ingest the database was replaced. It has to survive `--delete`.
 
@@ -73,7 +82,9 @@ AMBER_DATA_DIR="$HOME/Documents/amber-archive/data" \
   --token-file "$HOME/Library/Application Support/amber/ingest.token"
 ```
 
-`--backfill` asks ingest which ids it has stored and pushes every local `complete` id that is missing. That write is what creates the row the phone lists. `backfill 0` means every complete id is already stored.
+`--backfill` asks ingest which ids it has stored and pushes every local `complete` id that is missing. That write is what creates the row the phone lists. `backfill 0 ok, 0 failed` means every complete id is already stored. One bad id prints `FAIL <id> <status> <detail>` and the rest still run. A non-zero exit means at least one id failed.
+
+The first backfill after cutover re-uploads the whole library. Rows that arrived in an old database copy are not in `library_revisions`, so every complete id counts as missing, and ingest replaces each `snaps/<id>/` it receives. Run that first backfill by hand and let it finish before scheduling it hourly. Two overlapping backfills are safe. The second one uploads ids the first one has not stored yet, which is slow and does not corrupt the library.
 
 The block to leave out is:
 
@@ -162,6 +173,9 @@ Environment=AMBER_INGEST_HOST=127.0.0.1
 Environment=AMBER_INGEST_PORT=8082
 ExecStart=%h/apps/amber-archive/.venv/bin/python -m app.library_ingest
 Restart=on-failure
+# Exit 76 means ingest-store-id does not match the database. Restarting
+# would loop until someone deletes that file on purpose.
+RestartPreventExitStatus=76
 
 [Install]
 WantedBy=default.target

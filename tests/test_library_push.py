@@ -64,10 +64,17 @@ def write_token(path: Path, token: str = TOKEN) -> Path:
     return path
 
 
-def write_mac(data: Path, sid: str = SID, *, status: str = "complete", title: str = TITLE) -> None:
+def write_mac(
+    data: Path,
+    sid: str = SID,
+    *,
+    status: str = "complete",
+    title: str = TITLE,
+    created_at: str = CREATED,
+) -> None:
     snap = data / "snaps" / sid
     (snap / "res").mkdir(parents=True)
-    meta = {"id": sid, "title": title, "url": URL, "final_url": URL, "created_at": CREATED}
+    meta = {"id": sid, "title": title, "url": URL, "final_url": URL, "created_at": created_at}
     files = {
         "page.html": "<p>page</p>\n",
         "reader.html": "<article>reader</article>\n",
@@ -99,7 +106,7 @@ def write_mac(data: Path, sid: str = SID, *, status: str = "complete", title: st
                 None,
                 None,
                 None,
-                CREATED,
+                created_at,
                 200,
                 1200,
                 0,
@@ -632,10 +639,55 @@ def test_backfill_pushes_only_ids_ingest_has_not_stored(tmp_path):
     transport = _AppTransport(app)
     assert push_snapshot(mac, SID, "http://ingest", TOKEN, transport=transport).status == 201
     pushed = backfill(mac, "http://ingest", TOKEN, transport=transport)
-    assert [sid for sid, _result in pushed] == [SIBLING]
-    assert pushed[0][1].status == 201
+    assert [item.sid for item in pushed] == [SIBLING]
+    assert pushed[0].ok and pushed[0].result is not None
+    assert pushed[0].result.status == 201
     assert {row["id"] for row in reader_rows(library)} == {SID, SIBLING}
     assert backfill(mac, "http://ingest", TOKEN, transport=transport) == []
+
+
+def test_backfill_continues_after_a_rejected_id(tmp_path, monkeypatch, capsys):
+    mac = tmp_path / "mac"
+    older = "23456"
+    write_mac(mac, older, title="Old and broken", created_at="2020-01-01T00:00:00Z")
+    write_mac(mac, created_at="2026-10-09T19:25:47Z")
+    import shutil
+
+    shutil.rmtree(mac / "snaps" / older)
+    library, token, app = boot(tmp_path)
+    transport = _AppTransport(app)
+    items = backfill(mac, "http://ingest", TOKEN, transport=transport)
+    assert [(item.sid, item.ok) for item in items] == [(older, False), (SID, True)]
+    assert items[0].status is None
+    assert "no snapshot directory" in items[0].detail
+    assert items[1].result is not None and items[1].result.status == 201
+    assert {row["id"] for row in reader_rows(library)} == {SID}
+
+    from app.library_push import BackfillItem, PushResult
+
+    def fake_backfill(source, ingest_url, token_value, transport=None):
+        return [
+            BackfillItem(older, False, 400, "too many files"),
+            BackfillItem(SID, True, 201, "", PushResult(201, 1, 2)),
+        ]
+
+    monkeypatch.setattr("app.library_push.backfill", fake_backfill)
+    code = main(
+        [
+            "--backfill",
+            "--ingest-url",
+            "http://ingest",
+            "--token-file",
+            str(token),
+            "--data-dir",
+            str(mac),
+        ]
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert f"FAIL {older} 400 too many files" in captured.err
+    assert f"201 {SID} revision=1 change_seq=2" in captured.out
+    assert "backfill 1 ok, 1 failed" in captured.out
 
 
 def test_replaced_database_keeps_snapshots_and_refuses_work(tmp_path):
@@ -661,8 +713,9 @@ def test_replaced_database_keeps_snapshots_and_refuses_work(tmp_path):
     for suffix in ("", "-wal", "-shm"):
         path = library / f"amber.sqlite3{suffix}"
         path.unlink(missing_ok=True)
-    with pytest.raises(SystemExit, match="replaced"):
+    with pytest.raises(SystemExit) as caught:
         prepare_store(library)
+    assert caught.value.code == 76
     assert (library / "snaps" / SID / "article.txt").read_bytes() == original
     assert (journal / f"{SID}.json").is_file()
     response = transport.http.post(
@@ -673,6 +726,44 @@ def test_replaced_database_keeps_snapshots_and_refuses_work(tmp_path):
     assert response.status_code == 503
     assert response.json()["detail"] == "database was replaced"
     assert (library / "snaps" / SID / "article.txt").read_bytes() == original
+
+
+def test_failed_revision_releases_the_blob_ref(tmp_path):
+    library, _token, app = boot(tmp_path)
+    body = b"only-once"
+    digest = sha256_hex(body)
+    http = _AppTransport(app).http
+    stored = http.put(f"/v1/blobs/{digest}", content=body, headers=auth_headers())
+    assert stored.status_code == 201
+    document = {
+        "id": SID,
+        "revision": 2,
+        "op": "upsert",
+        "row": {
+            "url": URL,
+            "url_normalized": "https://ft.com/content/abc",
+            "final_url": URL,
+            "title": TITLE,
+            "site_name": None,
+            "author": None,
+            "published_at": None,
+            "description": None,
+            "created_at": CREATED,
+            "http_status": None,
+            "word_count": None,
+            "paywalled": False,
+            "status": "complete",
+            "error": None,
+        },
+        "files": [{"path": "meta.json", "sha256": digest, "size": len(body)}],
+    }
+    rejected = http.post(
+        "/v1/revisions",
+        content=json.dumps(document).encode(),
+        headers={**auth_headers(), "Content-Type": "application/json"},
+    )
+    assert rejected.status_code == 409
+    assert not library_ingest.blob_path(library, digest).exists()
 
 
 def test_blob_refcount_keeps_a_hash_another_push_still_needs(tmp_path):
