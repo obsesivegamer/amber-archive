@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.library_contract import ID_RE, SNAPSHOTS_DDL, sha256_hex
+from app import library_ingest
 from app.library_ingest import commit_document, create_app, prepare_store
 from app.library_push import PushError, PushResult, main, push_snapshot, snapshot_push
 
@@ -451,6 +452,29 @@ def test_startup_removes_stale_staging(tmp_path):
     assert not junk.exists()
     assert (library / "snaps" / SID / "article.txt").read_text(encoding="utf-8") == ARTICLE
     assert [row["id"] for row in reader_rows(library)] == [SID]
+
+
+def test_connect_closes_when_pragma_setup_fails(tmp_path, monkeypatch):
+    opened = []
+    real_connect = sqlite3.connect
+
+    class Boom(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if "foreign_keys" in sql:
+                raise sqlite3.OperationalError("boom")
+            return super().execute(sql, *args)
+
+    def spy(*args, **kwargs):
+        conn = real_connect(*args, factory=Boom, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr("app.library_ingest.sqlite3.connect", spy)
+    with pytest.raises(sqlite3.OperationalError, match="boom"):
+        library_ingest._connect(tmp_path / "library")
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
 
 
 def test_loose_token_file_is_refused(tmp_path):

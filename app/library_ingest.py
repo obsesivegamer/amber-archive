@@ -127,12 +127,21 @@ def blob_path(data_dir: Path, sha: str) -> Path:
 
 
 def _connect(data_dir: Path) -> sqlite3.Connection:
+    """Open the library database. Callers close it on every path, including errors.
+
+    Setup failures close the handle here. A PRAGMA error otherwise leaves the
+    descriptor open, and ingest is the process that keeps accepting requests.
+    """
     data_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(data_dir / "amber.sqlite3")
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
