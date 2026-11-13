@@ -22,7 +22,7 @@ file:<amber.sqlite3>?mode=ro&immutable=1
 
 That open is safe when rsync replaces the database by rename, because the reader keeps the inode it already mapped. Ingest does not replace the file. It commits in WAL mode and runs `wal_checkpoint(TRUNCATE)` on the live file. An immutable reader can see a torn page or `SQLITE_CORRUPT` during that checkpoint.
 
-Apply this change in the amber-reader checkout and restart the reader before starting ingest. The patch file is `docs/ops/amber-reader-mode-ro.patch`. If `patch` rejects the hunk, change the URI in `_connect` to the `mode=ro` line below and update `open_readonly`'s docstring the same way.
+Apply this change in the amber-reader checkout at `4b985cf` and restart the reader before starting ingest. `docs/ops/amber-reader-mode-ro.patch` is a `git diff` of `app/index.py` (blob `0059481bfc612fd8b059cc55c38f14994be75337`) and of `tests/test_stories.py::test_sqlite_index_is_what_the_list_reads`. That test asserted the list open created no `-wal`. `mode=ro` creates `-wal` and `-shm`, so the patch expects those files after the list call. `git apply` and `patch -p1` both accept it.
 
 ```diff
 -    uri = "file:{}?mode=ro&immutable=1".format(quote(str(DB_PATH), safe="/:"))
@@ -34,7 +34,7 @@ Apply this change in the amber-reader checkout and restart the reader before sta
 +    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
 ```
 
-`open_readonly`'s docstring changes with it: a `mode=ro` open may create `-shm` beside the database, and the process user has to be allowed to. Both processes run as `jerem`.
+`open_readonly`'s docstring changes with it: a `mode=ro` open may create `-wal` and `-shm` beside the database, and the process user has to be allowed to. Both processes run as `jerem`.
 
 ```bash
 cd "$HOME/apps/amber-reader"
@@ -47,9 +47,9 @@ curl -sS http://127.0.0.1:8081/healthz
 
 ## Prerequisite: hourly rsync
 
-`scripts/sync-from-mac.sh` in amber-reader excludes `amber.sqlite3` from the tree copy, then rsyncs a Mac `.backup` snapshot onto `DEST_PATH/amber.sqlite3`. That second copy replaces the ingest database. The replacement has no `library_revisions` or `library_changes` table, so the next push of the same id is treated as revision 1 and `change_seq` starts again at 1. A journal left from a crash then looks unpublished, and startup recovery deletes `snaps/<id>`.
+`scripts/sync-from-mac.sh` in amber-reader excludes `amber.sqlite3` from the tree copy, then rsyncs a Mac `.backup` snapshot onto `DEST_PATH/amber.sqlite3`. That second copy replaces the ingest database. The replacement has no `library_revisions` or `library_changes` table, so the next push of the same id is treated as revision 1 and `change_seq` starts again at 1. A journal left from a crash then looks unpublished. Ingest writes a random id in `library_meta` and in `ingest-store-id`. If that file is present and the database does not contain the same id, startup exits and a commit answers 503, and recovery logs and leaves `snaps/<id>` in place. Do not delete `ingest-store-id` to "clear" that state.
 
-`--delete` removes names that are not excluded and are absent on the Mac. `blobs/`, `ingest-staging/`, `ingest-previous/`, `ingest-journal/`, and `ingest.lock` are only on Dell-PLX, so `--delete` removes them.
+`--delete` removes names that are not excluded and are absent on the Mac. `blobs/`, `ingest-staging/`, `ingest-previous/`, `ingest-journal/`, and `ingest-store-id` are only on Dell-PLX, so `--delete` removes them. `ingest-store-id` is the sentinel that tells ingest the database was replaced. It has to survive `--delete`.
 
 Do this in `scripts/sync-from-mac.sh` before enabling ingest. Add these excludes next to the existing `--exclude='/homepage.json'` lines. A leading slash anchors at the data root, which is the rule that script already uses, and `--delete` does not remove an excluded name.
 
@@ -58,10 +58,24 @@ Do this in `scripts/sync-from-mac.sh` before enabling ingest. Add these excludes
 --exclude='/ingest-staging/'
 --exclude='/ingest-previous/'
 --exclude='/ingest-journal/'
---exclude='/ingest.lock'
+--exclude='/ingest-store-id'
 ```
 
-Skip the second rsync, the block that installs `$DB_SNAP` as `amber.sqlite3`:
+There is no `ingest.lock`. Do not add an exclude for it.
+
+Skip the second rsync, the block that installs `$DB_SNAP` as `amber.sqlite3`. A tree rsync of `snaps/<id>/` does not make that id show on the phone. amber-reader lists `snapshots` rows when the database opens (`list_snapshots` uses the SQL backend). A folder with no row stays hidden. In place of the database install, run a backfill from the Mac after ingest is up, and on the same schedule the database copy used to have:
+
+```bash
+cd "$HOME/Documents/amber-archive"
+AMBER_DATA_DIR="$HOME/Documents/amber-archive/data" \
+  .venv/bin/python -m app.library_push --backfill \
+  --ingest-url https://dell-plx-reader.tailf9612a.ts.net:8443 \
+  --token-file "$HOME/Library/Application Support/amber/ingest.token"
+```
+
+`--backfill` asks ingest which ids it has stored and pushes every local `complete` id that is missing. That write is what creates the row the phone lists. `backfill 0` means every complete id is already stored.
+
+The block to leave out is:
 
 ```bash
 if [[ -n "$DB_SNAP" ]]; then

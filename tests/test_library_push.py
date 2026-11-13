@@ -24,7 +24,14 @@ from fastapi.testclient import TestClient
 from app.library_contract import ID_RE, SNAPSHOTS_DDL, sha256_hex, snapshot_relpath
 from app import library_ingest
 from app.library_ingest import commit_document, create_app, prepare_store
-from app.library_push import PushError, PushResult, main, push_snapshot, snapshot_push
+from app.library_push import (
+    PushError,
+    PushResult,
+    backfill,
+    main,
+    push_snapshot,
+    snapshot_push,
+)
 
 SID = "K7mQp"
 SIBLING = "mN3pQ"
@@ -595,7 +602,7 @@ def test_revision_rejects_a_path_outside_the_snapshot(tmp_path):
     assert not (library / "snaps" / SID).exists()
 
 
-def test_checkpoint_requires_a_finished_wal():
+def test_checkpoint_logs_when_the_wal_stays_busy(caplog):
     class _Cursor:
         def __init__(self, row):
             self._row = row
@@ -607,16 +614,87 @@ def test_checkpoint_requires_a_finished_wal():
         def execute(self, _sql):
             return _Cursor((1, 4, 1))
 
-    with pytest.raises(library_ingest.IngestError) as caught:
-        library_ingest._checkpoint(_Busy())
-    assert caught.value.status == 503
-    assert caught.value.detail == "database checkpoint is busy"
+    library_ingest._checkpoint(_Busy())
+    assert "wal checkpoint incomplete" in caplog.text
 
     class _Done:
         def execute(self, _sql):
             return _Cursor((0, 3, 3))
 
     library_ingest._checkpoint(_Done())
+
+
+def test_backfill_pushes_only_ids_ingest_has_not_stored(tmp_path):
+    mac = tmp_path / "mac"
+    write_mac(mac)
+    write_mac(mac, SIBLING, title="Sibling Story")
+    library, _token, app = boot(tmp_path)
+    transport = _AppTransport(app)
+    assert push_snapshot(mac, SID, "http://ingest", TOKEN, transport=transport).status == 201
+    pushed = backfill(mac, "http://ingest", TOKEN, transport=transport)
+    assert [sid for sid, _result in pushed] == [SIBLING]
+    assert pushed[0][1].status == 201
+    assert {row["id"] for row in reader_rows(library)} == {SID, SIBLING}
+    assert backfill(mac, "http://ingest", TOKEN, transport=transport) == []
+
+
+def test_replaced_database_keeps_snapshots_and_refuses_work(tmp_path):
+    mac = tmp_path / "mac"
+    write_mac(mac)
+    library, _token, app = boot(tmp_path)
+    transport = _AppTransport(app)
+    assert push_snapshot(mac, SID, "http://ingest", TOKEN, transport=transport).status == 201
+    original = (library / "snaps" / SID / "article.txt").read_bytes()
+    journal = library / "ingest-journal"
+    journal.mkdir(exist_ok=True)
+    (journal / f"{SID}.json").write_text(
+        json.dumps(
+            {
+                "id": SID,
+                "revision": 9,
+                "had_previous": False,
+                "staging": "gone",
+            }
+        ),
+        encoding="utf-8",
+    )
+    for suffix in ("", "-wal", "-shm"):
+        path = library / f"amber.sqlite3{suffix}"
+        path.unlink(missing_ok=True)
+    with pytest.raises(SystemExit, match="replaced"):
+        prepare_store(library)
+    assert (library / "snaps" / SID / "article.txt").read_bytes() == original
+    assert (journal / f"{SID}.json").is_file()
+    response = transport.http.post(
+        "/v1/revisions",
+        content=b"{}",
+        headers={**auth_headers(), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "database was replaced"
+    assert (library / "snaps" / SID / "article.txt").read_bytes() == original
+
+
+def test_blob_refcount_keeps_a_hash_another_push_still_needs(tmp_path):
+    library, _token, _app = boot(tmp_path)
+    body = b"same-bytes"
+    digest = sha256_hex(body)
+    assert library_ingest.install_blob(library, digest, body) is True
+    assert library_ingest.install_blob(library, digest, body) is False
+    doc = library_ingest.RevisionDoc(
+        sid=SID,
+        revision=1,
+        op="upsert",
+        match_key="",
+        row={},
+        files=[{"path": "meta.json", "sha256": digest, "size": len(body)}],
+        row_json="",
+        files_json="",
+    )
+    library_ingest._release_blobs(library, doc)
+    assert library_ingest.blob_path(library, digest).is_file()
+    library_ingest._release_blobs(library, doc)
+    assert not library_ingest.blob_path(library, digest).exists()
 
 
 def test_connect_closes_when_pragma_setup_fails(tmp_path, monkeypatch):

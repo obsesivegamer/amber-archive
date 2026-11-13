@@ -50,10 +50,15 @@ class UrllibTransport:
         self,
         method: str,
         url: str,
-        body: bytes,
+        body: bytes | None,
         headers: dict[str, str],
     ) -> tuple[int, dict]:
-        request = urllib.request.Request(url, data=body, method=method, headers=headers)
+        request = urllib.request.Request(
+            url,
+            data=body if body else None,
+            method=method,
+            headers=headers,
+        )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 raw = response.read()
@@ -231,12 +236,93 @@ def _read_row(db_path: Path, sid: str) -> dict:
     }
 
 
+def complete_ids(source: Path) -> list[str]:
+    """Complete snapshot ids on disk, oldest first."""
+    db_path = source / "amber.sqlite3"
+    if not db_path.is_file():
+        raise PushError("archive database is missing")
+    uri = "file:{}?mode=ro".format(quote(str(db_path), safe="/:"))
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id FROM snapshots
+            WHERE status = 'complete'
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise PushError("could not list complete snapshots") from exc
+    finally:
+        conn.close()
+    found = []
+    for row in rows:
+        sid = row["id"]
+        if isinstance(sid, str) and ID_RE.fullmatch(sid):
+            found.append(sid)
+    return found
+
+
+def stored_ids(ingest_url: str, token: str, *, transport: UrllibTransport | None = None) -> set[str]:
+    """Ids ingest has already stored. The reader lists these rows, not bare folders."""
+    client = transport or UrllibTransport()
+    status, payload = client.round_trip(
+        "GET",
+        ingest_url.rstrip("/") + "/v1/revisions",
+        None,
+        {"Authorization": f"Bearer {token}"},
+    )
+    if status != 200:
+        raise PushRejected(status, _detail(payload))
+    revisions = payload.get("revisions")
+    if not isinstance(revisions, list):
+        raise PushError("ingest revisions response has no list")
+    found = set()
+    for item in revisions:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            found.add(item["id"])
+    return found
+
+
+def backfill(
+    source: Path,
+    ingest_url: str,
+    token: str,
+    *,
+    transport: UrllibTransport | None = None,
+) -> list[tuple[str, PushResult]]:
+    """Push every complete id that ingest has not stored.
+
+    A tree rsync can land snaps/<id>/ without a snapshots row. The reader
+    lists rows only, so those folders stay off the phone until this runs.
+    """
+    client = transport or UrllibTransport()
+    have = stored_ids(ingest_url, token, transport=client)
+    pushed = []
+    for sid in complete_ids(source):
+        if sid in have:
+            continue
+        folder = source / "snaps" / sid
+        if folder.is_symlink() or not folder.is_dir():
+            raise PushError(f"no snapshot directory for {sid}")
+        pushed.append(
+            (sid, push_snapshot(source, sid, ingest_url, token, transport=client))
+        )
+    return pushed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m app.library_push",
         description="Push one complete snapshot to Dell-PLX ingest.",
     )
-    parser.add_argument("snapshot_id", metavar="id")
+    parser.add_argument("snapshot_id", nargs="?", metavar="id")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Push every complete id ingest has not stored.",
+    )
     parser.add_argument("--ingest-url", required=True)
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument(
@@ -245,10 +331,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Archive data directory. Defaults to AMBER_DATA_DIR or the repo data directory.",
     )
     args = parser.parse_args(argv)
+    if args.backfill == (args.snapshot_id is not None):
+        parser.error("pass an id or --backfill")
     try:
         token = read_token_file(args.token_file)
         source = args.data_dir if args.data_dir is not None else DATA_DIR
-        result = push_snapshot(source, args.snapshot_id, args.ingest_url, token)
+        if args.backfill:
+            results = backfill(source, args.ingest_url, token)
+        else:
+            result = push_snapshot(source, args.snapshot_id, args.ingest_url, token)
+            results = [(args.snapshot_id, result)]
     except (TokenFileError, PushError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -258,10 +350,13 @@ def main(argv: list[str] | None = None) -> int:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         print(f"push failed: {exc}", file=sys.stderr)
         return 1
-    print(
-        f"{result.status} {args.snapshot_id} "
-        f"revision={result.revision} change_seq={result.change_seq}"
-    )
+    for sid, result in results:
+        print(
+            f"{result.status} {sid} "
+            f"revision={result.revision} change_seq={result.change_seq}"
+        )
+    if args.backfill:
+        print(f"backfill {len(results)}")
     return 0
 
 

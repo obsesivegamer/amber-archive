@@ -161,10 +161,30 @@ def _connect(data_dir: Path) -> sqlite3.Connection:
     return conn
 
 
+_META_DDL = """
+CREATE TABLE IF NOT EXISTS library_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+_BLOB_REFS_DDL = """
+CREATE TABLE IF NOT EXISTS library_blob_refs (
+    sha256 TEXT PRIMARY KEY,
+    refs INTEGER NOT NULL
+);
+"""
+
+_STORE_FILE = "ingest-store-id"
+_STORE_KEY = "store_id"
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SNAPSHOTS_DDL)
     conn.executescript(REVISIONS_DDL)
     conn.executescript(CHANGES_DDL)
+    conn.executescript(_META_DDL)
+    conn.executescript(_BLOB_REFS_DDL)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
     if "paywalled" not in columns:
         conn.execute("ALTER TABLE snapshots ADD COLUMN paywalled INTEGER")
@@ -190,13 +210,14 @@ def _checkpoint(conn: sqlite3.Connection) -> None:
             return
         if attempt + 1 < _CHECKPOINT_TRIES:
             time.sleep(_CHECKPOINT_PAUSE_S)
+    # The row is already committed. A mode=ro reader can see the WAL.
+    # Failing the request would make a successful push look lost.
     log.warning(
         "wal checkpoint incomplete busy=%s log=%s checkpointed=%s",
         last[0],
         last[1],
         last[2],
     )
-    raise IngestError(503, "database checkpoint is busy")
 
 
 def _checkpoint_db(data_dir: Path) -> None:
@@ -271,6 +292,101 @@ def _recover_journals(
             leftover.unlink(missing_ok=True)
 
 
+def _store_file(data_dir: Path) -> Path:
+    return data_dir / _STORE_FILE
+
+
+def _read_store_file(data_dir: Path) -> str | None:
+    path = _store_file(data_dir)
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    return text or None
+
+
+def _db_store_id(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM library_meta WHERE key = ?",
+        (_STORE_KEY,),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    return str(row[0])
+
+
+def _write_store_file(data_dir: Path, store_id: str) -> None:
+    path = _store_file(data_dir)
+    tmp = data_dir / ".ingest-store-id.tmp"
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(store_id + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(data_dir)
+
+
+def store_was_replaced(data_dir: Path) -> bool:
+    """True when ingest-store-id is present and the database does not hold it.
+
+    The hourly rsync can install a Mac database over amber.sqlite3. The
+    sentinel file is not in that copy. Treating the new database as empty
+    would make recovery delete snapshot directories.
+    """
+    file_id = _read_store_file(data_dir)
+    if not file_id:
+        return False
+    if not (data_dir / "amber.sqlite3").is_file():
+        return True
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        return _db_store_id(conn) != file_id
+    finally:
+        conn.close()
+
+
+def _ensure_store_identity(data_dir: Path) -> None:
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        db_id = _db_store_id(conn)
+        file_id = _read_store_file(data_dir)
+        if db_id and file_id == db_id:
+            return
+        if db_id and not file_id:
+            _write_store_file(data_dir, db_id)
+            return
+        if not db_id and not file_id:
+            store_id = secrets.token_hex(16)
+            conn.execute(
+                "INSERT INTO library_meta (key, value) VALUES (?, ?)",
+                (_STORE_KEY, store_id),
+            )
+            conn.commit()
+            _write_store_file(data_dir, store_id)
+            return
+    finally:
+        conn.close()
+
+
+def _refuse_if_replaced(data_dir: Path) -> None:
+    if store_was_replaced(data_dir):
+        raise IngestError(503, "database was replaced")
+
+
+def stored_revisions(data_dir: Path) -> list[dict]:
+    _refuse_if_replaced(data_dir)
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT id, revision FROM library_revisions ORDER BY id"
+        ).fetchall()
+        return [{"id": row["id"], "revision": int(row["revision"])} for row in rows]
+    finally:
+        conn.close()
+
+
 def _recover_journal(
     data_dir: Path,
     path: Path,
@@ -278,6 +394,12 @@ def _recover_journal(
     staging_root: Path,
     previous_root: Path,
 ) -> None:
+    if store_was_replaced(data_dir):
+        log.error(
+            "database was replaced; keeping snapshot files and %s",
+            path.name,
+        )
+        return
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -344,6 +466,13 @@ def _prepare_unlocked(data_dir: Path) -> None:
         _checkpoint(conn)
     finally:
         conn.close()
+    if store_was_replaced(data_dir):
+        log.error(
+            "ingest-store-id does not match the database; keeping snapshot directories"
+        )
+        _recover_unlocked(data_dir)
+        raise SystemExit("amber ingest: database was replaced; refusing to start")
+    _ensure_store_identity(data_dir)
     _recover_unlocked(data_dir)
 
 
@@ -643,15 +772,55 @@ def _discard_backup(data_dir: Path, sid: str) -> None:
         _fsync_dir(journal_root)
 
 
+def _retain_blob(data_dir: Path, sha: str) -> None:
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO library_blob_refs (sha256, refs) VALUES (?, 1)
+            ON CONFLICT(sha256) DO UPDATE SET refs = refs + 1
+            """,
+            (sha,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _release_blobs(data_dir: Path, doc: RevisionDoc) -> None:
-    """Drop blob names that the snapshot directory now holds."""
+    """Drop one reference per hash. Unlink the blob only at zero.
+
+    Two pushes can share a hash. Unlinking on the first commit removes the
+    bytes the second commit still has to link.
+    """
     seen: set[str] = set()
-    for item in doc.files:
-        sha = item["sha256"]
-        if sha in seen:
-            continue
-        seen.add(sha)
-        blob_path(data_dir, sha).unlink(missing_ok=True)
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        for item in doc.files:
+            sha = item["sha256"]
+            if sha in seen:
+                continue
+            seen.add(sha)
+            row = conn.execute(
+                "SELECT refs FROM library_blob_refs WHERE sha256 = ?",
+                (sha,),
+            ).fetchone()
+            if row is None:
+                continue
+            refs = int(row["refs"]) - 1
+            if refs > 0:
+                conn.execute(
+                    "UPDATE library_blob_refs SET refs = ? WHERE sha256 = ?",
+                    (refs, sha),
+                )
+                continue
+            conn.execute("DELETE FROM library_blob_refs WHERE sha256 = ?", (sha,))
+            blob_path(data_dir, sha).unlink(missing_ok=True)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _rollback_publish(data_dir: Path) -> None:
@@ -665,6 +834,7 @@ def _rollback_publish(data_dir: Path) -> None:
 
 def commit_document(data_dir: Path, payload: dict) -> CommitResult:
     with _LOCK:
+        _refuse_if_replaced(data_dir)
         doc = _parse(payload)
         conn = _connect(data_dir)
         try:
@@ -699,21 +869,26 @@ def install_blob(data_dir: Path, sha: str, body: bytes) -> bool:
     """Store ``body`` under ``sha``. Return True when this call wrote it."""
     with _LOCK:
         dest = blob_path(data_dir, sha)
-        if dest.is_file() and dest.stat().st_size == len(body) and _hash_file(dest) == sha:
-            return False
-        _mkdir(dest.parent)
-        tmp = dest.parent / f".{sha}.{secrets.token_hex(4)}.tmp"
-        try:
-            with tmp.open("wb") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, dest)
-            _fsync_dir(dest.parent)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
-        return True
+        created = not (
+            dest.is_file()
+            and dest.stat().st_size == len(body)
+            and _hash_file(dest) == sha
+        )
+        if created:
+            _mkdir(dest.parent)
+            tmp = dest.parent / f".{sha}.{secrets.token_hex(4)}.tmp"
+            try:
+                with tmp.open("wb") as handle:
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, dest)
+                _fsync_dir(dest.parent)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+        _retain_blob(data_dir, sha)
+        return created
 
 
 def _error(exc: IngestError) -> JSONResponse:
@@ -791,6 +966,15 @@ def create_app(
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True}
+
+    @app.get("/v1/revisions")
+    def list_revisions(request: Request) -> JSONResponse:
+        try:
+            _authorize(request)
+            revisions = stored_revisions(request.app.state.data_dir)
+        except IngestError as exc:
+            return _error(exc)
+        return JSONResponse(status_code=200, content={"revisions": revisions})
 
     @app.put("/v1/blobs/{sha256}")
     def put_blob(sha256: str, request: Request) -> JSONResponse:

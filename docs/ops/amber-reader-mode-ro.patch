@@ -1,6 +1,9 @@
+diff --git a/app/index.py b/app/index.py
+index 0059481..91d8d87 100644
 --- a/app/index.py
 +++ b/app/index.py
-@@ -70,20 +70,18 @@ def _connect() -> sqlite3.Connection | None:
+@@ -74,16 +74,13 @@ def _sort_key(snap: dict[str, Any]) -> str:
+ def _connect() -> sqlite3.Connection | None:
      if not DB_PATH.is_file():
          return None
 -    # The Mac sync ships a sqlite3 .backup, not the live file. With no
@@ -15,21 +18,16 @@
 -    uri = "file:{}?mode=ro&immutable=1".format(quote(str(DB_PATH), safe="/:"))
 +    # Ingest writes this live file and runs wal_checkpoint(TRUNCATE) into it.
 +    # immutable=1 maps the bytes and does not take a WAL lock, so that
-+    # checkpoint can tear a read. mode=ro shares the lock. It may create
-+    # -shm next to the database, so the reader user has to be the ingest
-+    # user (jerem) and the directory has to be a Linux filesystem.
++    # checkpoint can tear a read. mode=ro shares the lock and may create
++    # -wal and -shm next to the database. The reader user has to be the
++    # ingest user, and the directory has to be a Linux filesystem.
 +    # Each request opens its own connection.
 +    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
      try:
          conn = sqlite3.connect(uri, uri=True)
          conn.row_factory = sqlite3.Row
-         conn.execute("select 1 from snapshots limit 1")
-         return conn
-     except sqlite3.Error:
-         # A schema drift or a half-finished rsync: neither should take the
-         # reader down. Fall back to meta.json.
-         return None
-@@ -96,8 +94,8 @@ def _connect() -> sqlite3.Connection | None:
+@@ -96,9 +93,10 @@ def _connect() -> sqlite3.Connection | None:
+ 
  
  def open_readonly() -> sqlite3.Connection | None:
 -    """The synced database, immutable, or None when it cannot be read.
@@ -37,6 +35,23 @@
  
 -    Callers close the connection. It creates no -wal or -shm files.
 +    Callers close the connection. A mode=ro open of a WAL database may
-+    create -shm beside amber.sqlite3. The process user must be allowed to.
++    create -wal and -shm beside amber.sqlite3.
      """
      return _connect()
+ 
+diff --git a/tests/test_stories.py b/tests/test_stories.py
+index 716de8b..86608cd 100644
+--- a/tests/test_stories.py
++++ b/tests/test_stories.py
+@@ -7,8 +7,9 @@
+     body = _listed(auth)
+     assert [item["id"] for item in body["snapshots"]] == ["VwY5z"]
+     assert _listed(auth)["snapshots"][0]["id"] == "VwY5z"
+-    assert not (data / "amber.sqlite3-wal").exists()
+-    assert not (data / "amber.sqlite3-shm").exists()
++    # mode=ro takes the WAL lock and creates the sidecars. immutable=1 did not.
++    assert (data / "amber.sqlite3-wal").exists()
++    assert (data / "amber.sqlite3-shm").exists()
+ 
+ 
+ def test_symlinked_article_outside_the_tree_is_not_a_story(auth, archive, tmp_path):
