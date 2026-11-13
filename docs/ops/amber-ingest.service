@@ -1,0 +1,15 @@
+[Unit]
+Description=Amber library ingest
+
+[Service]
+WorkingDirectory=%h/apps/amber-archive
+Environment=PYTHONUNBUFFERED=1
+Environment=AMBER_DATA_DIR=%h/apps/amber-reader/data
+Environment=AMBER_INGEST_TOKEN_FILE=%h/.config/amber/ingest.token
+Environment=AMBER_INGEST_HOST=127.0.0.1
+Environment=AMBER_INGEST_PORT=8082
+ExecStart=%h/apps/amber-archive/.venv/bin/python -m app.library_ingest
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
