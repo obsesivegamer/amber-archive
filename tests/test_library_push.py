@@ -1,8 +1,11 @@
 """Push one complete snapshot into an empty library and read it back.
 
-The list query is amber-reader's ``list_snapshots`` (``app/index.py``): open
-``amber.sqlite3`` with ``mode=ro&immutable=1`` and select rows whose status is
-``complete``. Ids that are not the 5-character archive alphabet are dropped.
+The list query follows amber-reader's ``list_snapshots`` once the required
+reader patch is applied: open ``amber.sqlite3`` with ``mode=ro`` (no
+``immutable``) and select rows whose status is ``complete``. Ids that are not
+the 5-character archive alphabet are dropped. ``immutable=1`` is only used
+after the response returns, to check that the checkpoint landed in the main
+file. It is not a safe concurrent open while ingest is writing.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from urllib.parse import quote, urlparse
 import pytest
 from fastapi.testclient import TestClient
 
-from app.library_contract import ID_RE, SNAPSHOTS_DDL, sha256_hex
+from app.library_contract import ID_RE, SNAPSHOTS_DDL, sha256_hex, snapshot_relpath
 from app import library_ingest
 from app.library_ingest import commit_document, create_app, prepare_store
 from app.library_push import PushError, PushResult, main, push_snapshot, snapshot_push
@@ -109,10 +112,9 @@ def boot(tmp_path: Path):
     return library, token, app
 
 
-def reader_rows(data_dir: Path) -> list[dict]:
-    """amber-reader's sqlite list: immutable open, status complete, valid ids."""
+def _open_rows(data_dir: Path, query: str) -> list[dict]:
     db_path = data_dir / "amber.sqlite3"
-    uri = "file:{}?mode=ro&immutable=1".format(quote(str(db_path), safe="/:"))
+    uri = "file:{}?{}".format(quote(str(db_path), safe="/:"), query)
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -131,6 +133,16 @@ def reader_rows(data_dir: Path) -> list[dict]:
         return found
     finally:
         conn.close()
+
+
+def reader_rows(data_dir: Path) -> list[dict]:
+    """The reader open this slice requires: mode=ro, no immutable flag."""
+    return _open_rows(data_dir, "mode=ro")
+
+
+def checkpointed_rows(data_dir: Path) -> list[dict]:
+    """Open the main file alone, after the request has returned."""
+    return _open_rows(data_dir, "mode=ro&immutable=1")
 
 
 def insert_snapshot(db_path: Path, sid: str, title: str, created_at: str) -> None:
@@ -182,6 +194,7 @@ def test_push_lists_on_the_reader_and_repeat_is_idempotent(tmp_path):
     assert first.change_seq == 1
 
     rows = reader_rows(library)
+    assert [row["id"] for row in checkpointed_rows(library)] == [SID]
     assert [row["id"] for row in rows] == [SID]
     assert rows[0]["title"] == TITLE
     assert rows[0]["status"] == "complete"
@@ -193,6 +206,9 @@ def test_push_lists_on_the_reader_and_repeat_is_idempotent(tmp_path):
     assert (snap / "reader.html").read_bytes() == (mac_snap / "reader.html").read_bytes()
     assert (snap / "res" / "site.css").read_bytes() == (mac_snap / "res" / "site.css").read_bytes()
     assert json.loads((snap / "meta.json").read_text(encoding="utf-8"))["title"] == TITLE
+    blobs = library / "blobs"
+    if blobs.exists():
+        assert [path for path in blobs.rglob("*") if path.is_file()] == []
 
     sentinel = snap / "from-rsync.txt"
     sentinel.write_text("leave me\n", encoding="utf-8")
@@ -305,14 +321,24 @@ def _next_revision(mac: Path) -> tuple[dict, bytes]:
     return document, article
 
 
-def _put_article(app, article: bytes) -> None:
-    digest = sha256_hex(article)
-    response = _AppTransport(app).http.put(
-        f"/v1/blobs/{digest}",
-        content=article,
-        headers=auth_headers(),
-    )
-    assert response.status_code == 201
+def _put_revision_blobs(app, mac: Path, document: dict, article: bytes) -> None:
+    """Upload every hash in ``document``. A finished commit drops the blob store."""
+    http = _AppTransport(app).http
+    snap = mac / "snaps" / SID
+    sent: set[str] = set()
+    for item in document["files"]:
+        digest = item["sha256"]
+        if digest in sent:
+            continue
+        sent.add(digest)
+        data = article if item["path"] == "article.txt" else (snap / item["path"]).read_bytes()
+        assert sha256_hex(data) == digest
+        response = http.put(
+            f"/v1/blobs/{digest}",
+            content=data,
+            headers=auth_headers(),
+        )
+        assert response.status_code in (200, 201)
 
 
 def test_sql_error_keeps_the_previous_snapshot(tmp_path, monkeypatch):
@@ -323,7 +349,7 @@ def test_sql_error_keeps_the_previous_snapshot(tmp_path, monkeypatch):
     assert push_snapshot(mac, SID, "http://ingest", TOKEN, transport=transport).status == 201
     original = (library / "snaps" / SID / "article.txt").read_bytes()
     document, article = _next_revision(mac)
-    _put_article(app, article)
+    _put_revision_blobs(app, mac, document, article)
 
     def boom(_data_dir, _doc):
         raise RuntimeError("disk died")
@@ -356,7 +382,7 @@ def test_restart_after_kill_keeps_the_previous_snapshot(tmp_path, monkeypatch):
     ).status == 201
     original = (library / "snaps" / SID / "article.txt").read_bytes()
     document, article = _next_revision(mac)
-    _put_article(app, article)
+    _put_revision_blobs(app, mac, document, article)
 
     def die(_data_dir, _doc):
         raise _Killed()
@@ -452,6 +478,145 @@ def test_startup_removes_stale_staging(tmp_path):
     assert not junk.exists()
     assert (library / "snaps" / SID / "article.txt").read_text(encoding="utf-8") == ARTICLE
     assert [row["id"] for row in reader_rows(library)] == [SID]
+
+
+def test_crash_between_renames_restores_the_previous_snapshot(tmp_path):
+    mac = tmp_path / "mac"
+    write_mac(mac)
+    library, _token, app = boot(tmp_path)
+    assert push_snapshot(
+        mac, SID, "http://ingest", TOKEN, transport=_AppTransport(app)
+    ).status == 201
+    original = (library / "snaps" / SID / "article.txt").read_bytes()
+    backup_root = library / "ingest-previous"
+    backup_root.mkdir(exist_ok=True)
+    os.rename(library / "snaps" / SID, backup_root / SID)
+    staging_name = f"{SID}-2-deadbeef"
+    staging = library / "ingest-staging" / staging_name
+    staging.mkdir(parents=True)
+    (staging / "article.txt").write_bytes(b"unpublished\n")
+    journal = library / "ingest-journal"
+    journal.mkdir(exist_ok=True)
+    (journal / f"{SID}.json").write_text(
+        json.dumps(
+            {
+                "id": SID,
+                "revision": 2,
+                "had_previous": True,
+                "staging": staging_name,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepare_store(library)
+    assert (library / "snaps" / SID / "article.txt").read_bytes() == original
+    assert not staging.exists()
+    assert not (journal / f"{SID}.json").exists()
+    assert reader_rows(library)[0]["title"] == TITLE
+
+
+def test_corrupt_journal_leaves_the_committed_snapshot(tmp_path):
+    mac = tmp_path / "mac"
+    write_mac(mac)
+    library, _token, app = boot(tmp_path)
+    assert push_snapshot(
+        mac, SID, "http://ingest", TOKEN, transport=_AppTransport(app)
+    ).status == 201
+    original = (library / "snaps" / SID / "article.txt").read_bytes()
+    journal = library / "ingest-journal"
+    journal.mkdir(exist_ok=True)
+    (journal / f"{SID}.json").write_text("{", encoding="utf-8")
+    (journal / "not-an-object.json").write_text("[1, 2]", encoding="utf-8")
+
+    prepare_store(library)
+    assert (library / "snaps" / SID / "article.txt").read_bytes() == original
+    assert reader_rows(library)[0]["title"] == TITLE
+    assert list(journal.glob("*.json")) == []
+
+
+def test_snapshot_paths_inside_the_tree():
+    assert snapshot_relpath("page.html") == "page.html"
+    assert snapshot_relpath("res") == "res"
+    assert snapshot_relpath("res/site.css") == "res/site.css"
+    for blocked in (
+        "../x",
+        "..",
+        "/etc/passwd",
+        "res/../../x",
+        "res/a/b",
+        "res\\x",
+        "foo/bar",
+        "",
+    ):
+        assert snapshot_relpath(blocked) is None
+
+
+def test_revision_rejects_a_path_outside_the_snapshot(tmp_path):
+    library, _token, app = boot(tmp_path)
+    http = _AppTransport(app).http
+    digest = "a" * 64
+    document = {
+        "id": SID,
+        "revision": 1,
+        "op": "upsert",
+        "match_key": "ft.com/content/abc",
+        "row": {
+            "url": URL,
+            "url_normalized": "https://ft.com/content/abc",
+            "final_url": URL,
+            "title": TITLE,
+            "site_name": "Financial Times",
+            "author": None,
+            "published_at": None,
+            "description": None,
+            "created_at": CREATED,
+            "http_status": 200,
+            "word_count": 1200,
+            "paywalled": False,
+            "status": "complete",
+            "error": None,
+        },
+        "files": [
+            {"path": "meta.json", "sha256": digest, "size": 2},
+            {"path": "../outside.txt", "sha256": digest, "size": 2},
+            {"path": "res/a/b.css", "sha256": digest, "size": 2},
+        ],
+    }
+    response = http.post(
+        "/v1/revisions",
+        content=json.dumps(document).encode(),
+        headers={**auth_headers(), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert isinstance(response.json()["detail"], str)
+    assert not (library / "outside.txt").exists()
+    assert not (tmp_path / "outside.txt").exists()
+    assert not (library / "snaps" / SID).exists()
+
+
+def test_checkpoint_requires_a_finished_wal():
+    class _Cursor:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Busy:
+        def execute(self, _sql):
+            return _Cursor((1, 4, 1))
+
+    with pytest.raises(library_ingest.IngestError) as caught:
+        library_ingest._checkpoint(_Busy())
+    assert caught.value.status == 503
+    assert caught.value.detail == "database checkpoint is busy"
+
+    class _Done:
+        def execute(self, _sql):
+            return _Cursor((0, 3, 3))
+
+    library_ingest._checkpoint(_Done())
 
 
 def test_connect_closes_when_pragma_setup_fails(tmp_path, monkeypatch):

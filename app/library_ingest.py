@@ -2,8 +2,12 @@
 
 One complete snapshot arrives as ``PUT /v1/blobs/{sha256}`` and
 ``POST /v1/revisions``. This process writes ``snaps/<id>/`` and the
-``snapshots`` row amber-reader already lists, then checkpoints the database
-so a ``mode=ro&immutable=1`` open sees the commit.
+``snapshots`` row amber-reader lists, then checkpoints the database.
+
+The phone reader has to open that file with ``mode=ro`` and no ``immutable``
+flag before ingest is started. ``immutable=1`` maps the file and does not
+take a WAL lock, so a checkpoint into the live file can tear a read.
+``docs/ops/dell-plx-ingest.md`` has the patch.
 
 The commit order is the one in the library plan: stage the directory, fsync,
 rename it into ``snaps/<id>``, then insert the snapshot row and ``change_seq``
@@ -26,6 +30,7 @@ import secrets
 import shutil
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +57,8 @@ from .library_contract import (
 log = logging.getLogger("amber.library_ingest")
 
 _LOCK = threading.Lock()
+_CHECKPOINT_TRIES = 5
+_CHECKPOINT_PAUSE_S = 0.05
 _OPTIONAL_STRINGS = (
     "final_url",
     "title",
@@ -110,6 +117,15 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _mkdir(path: Path) -> None:
+    """Create ``path`` and fsync it and its parent so the directory entry is durable."""
+    path.mkdir(parents=True, exist_ok=True)
+    _fsync_dir(path)
+    parent = path.parent
+    if parent.exists():
+        _fsync_dir(parent)
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -155,9 +171,32 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _checkpoint(conn: sqlite3.Connection) -> None:
-    # amber-reader opens the file immutable and does not read a -wal sidecar.
-    # The committed rows have to be in the main database file.
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    """Copy the WAL into the main file and truncate it.
+
+    ``PRAGMA wal_checkpoint`` returns ``(busy, log, checkpointed)``. A reader
+    holding a WAL frame sets ``busy`` above zero and leaves ``log`` ahead of
+    ``checkpointed``. Retry, then fail the request so the caller does not
+    treat a partial checkpoint as done.
+    """
+    last = (1, 0, 0)
+    for attempt in range(_CHECKPOINT_TRIES):
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None:
+            last = (1, 0, 0)
+        else:
+            last = (int(row[0]), int(row[1]), int(row[2]))
+        busy, log_frames, checkpointed = last
+        if busy == 0 and log_frames == checkpointed:
+            return
+        if attempt + 1 < _CHECKPOINT_TRIES:
+            time.sleep(_CHECKPOINT_PAUSE_S)
+    log.warning(
+        "wal checkpoint incomplete busy=%s log=%s checkpointed=%s",
+        last[0],
+        last[1],
+        last[2],
+    )
+    raise IngestError(503, "database checkpoint is busy")
 
 
 def _checkpoint_db(data_dir: Path) -> None:
@@ -205,12 +244,7 @@ def _rm(path: Path) -> None:
 def _recover_unlocked(data_dir: Path) -> None:
     """Put back the previous snapshot when a rename never got its SQL commit."""
     snaps, staging_root, previous_root, journal_root = _dirs(data_dir)
-    if journal_root.is_dir():
-        for path in sorted(journal_root.glob("*.json")):
-            _recover_journal(data_dir, path, snaps, staging_root, previous_root)
-        for leftover in list(journal_root.iterdir()):
-            if leftover.name.endswith(".tmp"):
-                leftover.unlink(missing_ok=True)
+    _recover_journals(data_dir, snaps, staging_root, previous_root, journal_root)
     if staging_root.is_dir():
         for child in list(staging_root.iterdir()):
             _rm(child)
@@ -219,6 +253,22 @@ def _recover_unlocked(data_dir: Path) -> None:
         for tmp in blobs.rglob("*.tmp"):
             tmp.unlink(missing_ok=True)
     _checkpoint_db(data_dir)
+
+
+def _recover_journals(
+    data_dir: Path,
+    snaps: Path,
+    staging_root: Path,
+    previous_root: Path,
+    journal_root: Path,
+) -> None:
+    if not journal_root.is_dir():
+        return
+    for path in sorted(journal_root.glob("*.json")):
+        _recover_journal(data_dir, path, snaps, staging_root, previous_root)
+    for leftover in list(journal_root.iterdir()):
+        if leftover.name.endswith(".tmp"):
+            leftover.unlink(missing_ok=True)
 
 
 def _recover_journal(
@@ -231,6 +281,9 @@ def _recover_journal(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        return
+    if not isinstance(payload, dict):
         path.unlink(missing_ok=True)
         return
     sid = payload.get("id")
@@ -282,8 +335,8 @@ def prepare_store(data_dir: Path) -> None:
 
 
 def _prepare_unlocked(data_dir: Path) -> None:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "snaps").mkdir(parents=True, exist_ok=True)
+    _mkdir(data_dir)
+    _mkdir(data_dir / "snaps")
     conn = _connect(data_dir)
     try:
         _ensure_schema(conn)
@@ -413,11 +466,15 @@ def _copy_blobs(data_dir: Path, staging: Path, doc: RevisionDoc) -> None:
         if src.stat().st_size != item["size"]:
             raise IngestError(400, f"size does not match blob {item['sha256']}")
         dest = staging / item["path"]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with src.open("rb") as inp, dest.open("wb") as out:
-            shutil.copyfileobj(inp, out, length=1024 * 1024)
-            out.flush()
-            os.fsync(out.fileno())
+        _mkdir(dest.parent)
+        try:
+            os.link(src, dest)
+        except OSError:
+            with src.open("rb") as inp, dest.open("wb") as out:
+                shutil.copyfileobj(inp, out, length=1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+        _fsync_dir(dest.parent)
 
 
 def _fsync_tree(root: Path) -> None:
@@ -432,9 +489,19 @@ def _fsync_tree(root: Path) -> None:
 
 
 def _stage_and_swap(data_dir: Path, doc: RevisionDoc) -> None:
+    """Stage, fsync, then rename into ``snaps/<id>``.
+
+    When the id already exists the previous directory is renamed aside and
+    the staging directory is renamed into its place. Those are two renames,
+    so a crash between them leaves the id missing. The journal is written
+    first, and startup moves ``ingest-previous/<id>`` back. ``renameat2``
+    ``RENAME_EXCHANGE`` would make that swap one syscall. It is not used:
+    the two-step order is the one recovery already understands, and a
+    missing id for that window is the failure mode the journal covers.
+    """
     snaps, staging_root, previous_root, journal_root = _dirs(data_dir)
-    snaps.mkdir(parents=True, exist_ok=True)
-    staging_root.mkdir(parents=True, exist_ok=True)
+    _mkdir(snaps)
+    _mkdir(staging_root)
     final = snaps / doc.sid
     if final.is_symlink():
         raise IngestError(400, "snapshot path is a symlink")
@@ -443,7 +510,7 @@ def _stage_and_swap(data_dir: Path, doc: RevisionDoc) -> None:
     had_previous = final.exists()
     staging_name = f"{doc.sid}-{doc.revision}-{secrets.token_hex(4)}"
     staging = staging_root / staging_name
-    staging.mkdir()
+    _mkdir(staging)
     _copy_blobs(data_dir, staging, doc)
     _fsync_tree(staging)
     _write_journal(
@@ -458,7 +525,7 @@ def _stage_and_swap(data_dir: Path, doc: RevisionDoc) -> None:
     )
     backup = previous_root / doc.sid
     if had_previous:
-        previous_root.mkdir(parents=True, exist_ok=True)
+        _mkdir(previous_root)
         if backup.exists() or backup.is_symlink():
             _rm(backup)
         os.rename(final, backup)
@@ -469,7 +536,7 @@ def _stage_and_swap(data_dir: Path, doc: RevisionDoc) -> None:
 
 
 def _write_journal(journal_root: Path, sid: str, payload: dict) -> None:
-    journal_root.mkdir(parents=True, exist_ok=True)
+    _mkdir(journal_root)
     target = journal_root / f"{sid}.json"
     tmp = journal_root / f".{sid}.{secrets.token_hex(4)}.tmp"
     data = _canon(payload).encode("utf-8")
@@ -488,14 +555,6 @@ def _apply_sql(data_dir: Path, doc: RevisionDoc) -> int:
         conn.execute("BEGIN IMMEDIATE")
         stored = _stored_revision(conn, doc.sid)
         stored_rev = int(stored["revision"]) if stored else 0
-        if stored and doc.revision == stored_rev:
-            conn.rollback()
-            detail = (
-                "stored revision does not match this body"
-                if not _same(stored, doc)
-                else "revision is not stored + 1"
-            )
-            raise IngestError(409, detail, revision=stored_rev)
         if doc.revision != stored_rev + 1:
             conn.rollback()
             raise IngestError(409, "revision is not stored + 1", revision=stored_rev)
@@ -584,9 +643,28 @@ def _discard_backup(data_dir: Path, sid: str) -> None:
         _fsync_dir(journal_root)
 
 
+def _release_blobs(data_dir: Path, doc: RevisionDoc) -> None:
+    """Drop blob names that the snapshot directory now holds."""
+    seen: set[str] = set()
+    for item in doc.files:
+        sha = item["sha256"]
+        if sha in seen:
+            continue
+        seen.add(sha)
+        blob_path(data_dir, sha).unlink(missing_ok=True)
+
+
+def _rollback_publish(data_dir: Path) -> None:
+    """Undo journals from a commit that raised. Startup runs the wider scan."""
+    snaps, staging_root, previous_root, journal_root = _dirs(data_dir)
+    _recover_journals(data_dir, snaps, staging_root, previous_root, journal_root)
+    if staging_root.is_dir():
+        for child in list(staging_root.iterdir()):
+            _rm(child)
+
+
 def commit_document(data_dir: Path, payload: dict) -> CommitResult:
     with _LOCK:
-        _prepare_unlocked(data_dir)
         doc = _parse(payload)
         conn = _connect(data_dir)
         try:
@@ -597,6 +675,7 @@ def commit_document(data_dir: Path, payload: dict) -> CommitResult:
         stored_rev = int(stored["revision"]) if stored else 0
         if stored and doc.revision == stored_rev:
             if _same(stored, doc):
+                _release_blobs(data_dir, doc)
                 return CommitResult(200, int(stored["change_seq"]), doc.sid, doc.revision)
             raise IngestError(
                 409,
@@ -609,9 +688,10 @@ def commit_document(data_dir: Path, payload: dict) -> CommitResult:
             _stage_and_swap(data_dir, doc)
             seq = _apply_sql(data_dir, doc)
         except Exception:
-            _recover_unlocked(data_dir)
+            _rollback_publish(data_dir)
             raise
         _discard_backup(data_dir, doc.sid)
+        _release_blobs(data_dir, doc)
         return CommitResult(201, seq, doc.sid, doc.revision)
 
 
@@ -621,7 +701,7 @@ def install_blob(data_dir: Path, sha: str, body: bytes) -> bool:
         dest = blob_path(data_dir, sha)
         if dest.is_file() and dest.stat().st_size == len(body) and _hash_file(dest) == sha:
             return False
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir(dest.parent)
         tmp = dest.parent / f".{sha}.{secrets.token_hex(4)}.tmp"
         try:
             with tmp.open("wb") as handle:
@@ -656,6 +736,13 @@ def _authorize(request: Request) -> None:
         ok = False
     if not ok:
         raise IngestError(401, "unauthorized")
+
+
+def _body_bytes(request: Request) -> bytes:
+    """Read the body from a sync endpoint running in the AnyIO worker thread."""
+    import anyio
+
+    return anyio.from_thread.run(request.body)
 
 
 def _content_length(request: Request, cap: int, cap_detail: str) -> int:
@@ -706,14 +793,14 @@ def create_app(
         return {"ok": True}
 
     @app.put("/v1/blobs/{sha256}")
-    async def put_blob(sha256: str, request: Request) -> JSONResponse:
+    def put_blob(sha256: str, request: Request) -> JSONResponse:
         try:
             _authorize(request)
             sha = sha256.lower()
             if not SHA256_RE.fullmatch(sha):
                 raise IngestError(400, "sha256 must be 64 hex characters")
             length = _content_length(request, MAX_BLOB_BYTES, "blob exceeds 32 MiB")
-            body = await request.body()
+            body = _body_bytes(request)
             if len(body) != length:
                 raise IngestError(400, "Content-Length does not match body")
             if sha256_hex(body) != sha:
@@ -727,7 +814,7 @@ def create_app(
         )
 
     @app.post("/v1/revisions")
-    async def post_revision(request: Request) -> JSONResponse:
+    def post_revision(request: Request) -> JSONResponse:
         try:
             _authorize(request)
             media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -736,7 +823,7 @@ def create_app(
             length = _content_length(
                 request, MAX_REVISION_BYTES, "revision body exceeds 1 MiB"
             )
-            raw = await request.body()
+            raw = _body_bytes(request)
             if len(raw) != length:
                 raise IngestError(400, "Content-Length does not match body")
             try:

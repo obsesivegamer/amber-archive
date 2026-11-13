@@ -1,32 +1,117 @@
 # Push one snapshot to Dell-PLX
 
-The phone library goes stale because the Mac is the only machine that starts a copy, and that copy is an hourly rsync of a live SQLite file. This slice is the first path that does not use that job.
+The phone library goes stale because the Mac is the only machine that starts a copy, and that copy is an hourly rsync of a live SQLite file. This slice uploads one snapshot that is already `complete`. An ingest process on Dell-PLX writes `snaps/<id>/` and the `snapshots` row. Capture stays on the Mac. This document is the runbook. Nothing here is applied by the change that added it.
 
-A command on the Mac reads one snapshot already marked `complete` and uploads it. An ingest process on Dell-PLX writes `snaps/<id>/` and the `snapshots` row that amber-reader already lists (`status = 'complete'`). Capture and the hourly rsync stay as they are. This document is the runbook. Nothing here is applied by the change that added it.
+Two things have to change on the reader host before the first ingest commit. The hourly rsync installs a Mac database snapshot over `amber.sqlite3`, which drops `library_revisions` and `library_changes`. The reader opens that file with `immutable=1`, which maps the bytes and does not take a WAL lock, while ingest checkpoints the same live file.
 
 ## Where the code lives
 
 Ingest is `app/library_ingest.py` in this repo. The Mac command is `app/library_push.py`.
 
-Dell-PLX should run this writer, and amber-reader should stay a reader of the same data directory. The writer belongs next to the snapshot schema it commits, in the repo that already owns that schema. `python -m app.library_ingest` loads this module and FastAPI. It does not import Playwright, Chromium, or the capture app. Install `requirements-ingest.txt` on Dell-PLX. The Mac keeps the full capture environment and runs the push command from this same checkout.
+The writer belongs next to the snapshot schema it commits. `python -m app.library_ingest` loads that module and FastAPI. It does not import Playwright, Chromium, or the capture app. Install `requirements-ingest.txt` on Dell-PLX. The Mac keeps the full capture environment and runs the push command from this same checkout.
 
-amber-reader is unchanged. It opens `amber.sqlite3` read-only and, when that file is usable, lists `status = 'complete'`. Ingest is the only writer of that database. After each commit it checkpoints the WAL so the reader's immutable open sees the row in the main file.
+amber-reader stays the process that serves archived HTML. It needs the patch in the next section before it shares a data directory with ingest. Ingest is the only writer of `amber.sqlite3` after that cutover.
+
+## Prerequisite: reader open mode
+
+`gareygoosey/amber-reader` `app/index.py` builds this URI:
+
+```text
+file:<amber.sqlite3>?mode=ro&immutable=1
+```
+
+That open is safe when rsync replaces the database by rename, because the reader keeps the inode it already mapped. Ingest does not replace the file. It commits in WAL mode and runs `wal_checkpoint(TRUNCATE)` on the live file. An immutable reader can see a torn page or `SQLITE_CORRUPT` during that checkpoint.
+
+Apply this change in the amber-reader checkout and restart the reader before starting ingest. The patch file is `docs/ops/amber-reader-mode-ro.patch`. If `patch` rejects the hunk, change the URI in `_connect` to the `mode=ro` line below and update `open_readonly`'s docstring the same way.
+
+```diff
+-    uri = "file:{}?mode=ro&immutable=1".format(quote(str(DB_PATH), safe="/:"))
++    # Ingest writes this live file and runs wal_checkpoint(TRUNCATE) into it.
++    # immutable=1 maps the bytes and does not take a WAL lock, so that
++    # checkpoint can tear a read. mode=ro shares the lock. It may create
++    # -shm next to the database, so the reader user has to be the ingest
++    # user (jerem) and the directory has to be a Linux filesystem.
++    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
+```
+
+`open_readonly`'s docstring changes with it: a `mode=ro` open may create `-shm` beside the database, and the process user has to be allowed to. Both processes run as `jerem`.
+
+```bash
+cd "$HOME/apps/amber-reader"
+patch -p1 < /path/to/amber-archive/docs/ops/amber-reader-mode-ro.patch
+systemctl --user restart amber-reader
+curl -sS http://127.0.0.1:8081/healthz
+```
+
+`/healthz` should still report `backend=sqlite`.
+
+## Prerequisite: hourly rsync
+
+`scripts/sync-from-mac.sh` in amber-reader excludes `amber.sqlite3` from the tree copy, then rsyncs a Mac `.backup` snapshot onto `DEST_PATH/amber.sqlite3`. That second copy replaces the ingest database. The replacement has no `library_revisions` or `library_changes` table, so the next push of the same id is treated as revision 1 and `change_seq` starts again at 1. A journal left from a crash then looks unpublished, and startup recovery deletes `snaps/<id>`.
+
+`--delete` removes names that are not excluded and are absent on the Mac. `blobs/`, `ingest-staging/`, `ingest-previous/`, `ingest-journal/`, and `ingest.lock` are only on Dell-PLX, so `--delete` removes them.
+
+Do this in `scripts/sync-from-mac.sh` before enabling ingest. Add these excludes next to the existing `--exclude='/homepage.json'` lines. A leading slash anchors at the data root, which is the rule that script already uses, and `--delete` does not remove an excluded name.
+
+```bash
+--exclude='/blobs/'
+--exclude='/ingest-staging/'
+--exclude='/ingest-previous/'
+--exclude='/ingest-journal/'
+--exclude='/ingest.lock'
+```
+
+Skip the second rsync, the block that installs `$DB_SNAP` as `amber.sqlite3`:
+
+```bash
+if [[ -n "$DB_SNAP" ]]; then
+  DB_RSYNC=(rsync "${RSYNC_COMMON[@]}")
+  [[ $DRY_RUN -eq 1 ]] && DB_RSYNC+=(--dry-run)
+  "${DB_RSYNC[@]}" "$DB_SNAP" "$TARGET:$DEST_PATH/amber.sqlite3"
+fi
+```
+
+Leave that block out, or guard it so it does not run once ingest owns the database. The tree copy already excludes `amber.sqlite3`, `amber.sqlite3-wal`, and `amber.sqlite3-shm`. Those excludes stay, so the tree copy does not replace the live database or the reader's `-shm`.
+
+Until both edits are in the script that the Mac LaunchAgent runs, do not let that agent write this data directory.
+
+## Cutover order
+
+1. Confirm the data directory is on the WSL ext4 disk under `/home/jerem`. `/mnt/c` is the Windows drive, and SQLite locking there is a different filesystem.
+
+   ```bash
+   df -T /home/jerem/apps/amber-reader/data
+   ```
+
+2. Confirm the user manager stays up, and that systemd is pid 1 in this distro.
+
+   ```bash
+   loginctl show-user jerem -p Linger
+   grep -A2 '^\[boot\]' /etc/wsl.conf
+   ```
+
+   `Linger=yes` is required. If it is `no`: `sudo loginctl enable-linger jerem`. `/etc/wsl.conf` needs:
+
+   ```ini
+   [boot]
+   systemd=true
+   ```
+
+   A distro that was started before that line was added needs `wsl --shutdown` from Windows and a new session before `systemctl is-system-running` succeeds.
+
+3. Apply the reader patch above and restart amber-reader.
+4. Edit `sync-from-mac.sh` with the excludes and without the `amber.sqlite3` install. Disable the Mac LaunchAgent until that edit is what the agent runs.
+5. Install and start ingest, then publish the port, then run the Mac command.
 
 ## Layout
 
-Ingest and amber-reader share one data directory on the WSL ext4 disk under `/home/jerem`. The reader's unit uses `%h/apps/amber-reader/data`, which for user `jerem` is `/home/jerem/apps/amber-reader/data`. If the live reader already uses a different directory, point `AMBER_DATA_DIR` at that directory. It has to be a Linux filesystem under `/home/jerem`. `/mnt/c` is the Windows drive, and SQLite locking there is a different filesystem.
-
-```bash
-df -T /home/jerem/apps/amber-reader/data
-```
-
-The path in that output is under `/home/jerem` and the type is `ext4` (or another Linux filesystem on the WSL disk).
+Ingest and amber-reader share one data directory. The reader's unit uses `%h/apps/amber-reader/data`, which for user `jerem` is `/home/jerem/apps/amber-reader/data`. If the live reader already uses a different directory on that ext4 disk, point `AMBER_DATA_DIR` at that directory.
 
 Ingest binds `127.0.0.1:8082`. The reader stays on `127.0.0.1:8081`. The bearer token is a file mode `0600`. It is a different secret from `AMBER_READER_PASSWORD`.
 
 ## Dell-PLX
 
-Inside the Ubuntu distro, as `jerem`. The user manager that already runs amber-reader is the one that runs this unit. `loginctl enable-linger` for that user is already part of the reader setup.
+Inside the Ubuntu distro, as `jerem`, after the prerequisites above.
 
 ```bash
 mkdir -p "$HOME/apps"
@@ -74,9 +159,16 @@ Publish that loopback port on the tailnet with `tailscale serve`. This is a seco
 tailscale serve --bg --https=8443 http://127.0.0.1:8082
 ```
 
-That serves `https://dell-plx-reader.tailf9612a.ts.net:8443`. Use `tailscale serve`. `tailscale funnel` would publish the write API on the public internet.
+That serves `https://dell-plx-reader.tailf9612a.ts.net:8443`. Use `tailscale serve`. `tailscale funnel` publishes the write API on the public internet, so it is the wrong command here.
 
-Copy the token file to the Mac with `scp` and `chmod 600`. The token is one line. A trailing newline is ignored.
+Copy the token to the Mac, then set the mode again on the Mac side. A trailing newline is ignored.
+
+```bash
+install -d -m 700 "$HOME/Library/Application Support/amber"
+scp jerem@dell-plx-reader:.config/amber/ingest.token \
+  "$HOME/Library/Application Support/amber/ingest.token"
+chmod 600 "$HOME/Library/Application Support/amber/ingest.token"
+```
 
 ## Mac
 
@@ -84,18 +176,14 @@ From the archive checkout, with the data directory that already holds the snapsh
 
 ```bash
 cd "$HOME/Documents/amber-archive"
-install -d -m 700 "$HOME/Library/Application Support/amber"
-# ingest.token was copied from Dell-PLX; mode 0600
-chmod 600 "$HOME/Library/Application Support/amber/ingest.token"
-
 AMBER_DATA_DIR="$HOME/Documents/amber-archive/data" \
   .venv/bin/python -m app.library_push K7mQp \
   --ingest-url https://dell-plx-reader.tailf9612a.ts.net:8443 \
   --token-file "$HOME/Library/Application Support/amber/ingest.token"
 ```
 
-A new snapshot prints `201 K7mQp revision=1 change_seq=1`. The same command again prints `200 K7mQp revision=1 change_seq=1` and does not add a second directory or a second row. The phone list is the reader's `/saved` page after the reader password. The reader process does not need a restart.
+A new snapshot prints `201 K7mQp revision=1 change_seq=1`. The same command again prints `200 K7mQp revision=1 change_seq=1` and does not add a second directory or a second row. The phone list is the reader's `/saved` page after the reader password. Restart the reader after the mode=ro patch. A later push does not need another restart.
 
 Revision 1 is the only revision this command sends. A later slice bumps the revision when the files change. Ingest answers 409, with `detail` and the stored revision, when the number is anything other than the stored revision or one past it. The same id and revision, with the same bytes, is 200.
 
-The hourly rsync can keep running. Ingest replaces only the id it was given and leaves every other `snaps/<id>/` directory in place. A second push of an id that is already stored does not rewrite that directory, so a file the rsync added beside the snapshot bytes stays.
+The two renames that publish an existing id leave a gap where `snaps/<id>` is missing. The journal is written first. Startup moves `ingest-previous/<id>` back if the SQL transaction did not commit. `renameat2(RENAME_EXCHANGE)` would close that gap in one syscall. Recovery is written for the two-step order, so that is the order the code uses.

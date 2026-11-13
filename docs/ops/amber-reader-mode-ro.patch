@@ -1,0 +1,42 @@
+--- a/app/index.py
++++ b/app/index.py
+@@ -70,20 +70,18 @@ def _connect() -> sqlite3.Connection | None:
+     if not DB_PATH.is_file():
+         return None
+-    # The Mac sync ships a sqlite3 .backup, not the live file. With no
+-    # -wal the Mac sync opens the source immutable=1; with a live -wal it uses
+-    # -readonly .backup. Either way this file holds the committed rows,
+-    # the Mac database is not checkpointed, and -wal/-shm are not
+-    # shipped. The backup stays in WAL mode, so mode=ro alone would try
+-    # to create those sidecars here. immutable=1 reads the file as it
+-    # stands and creates nothing. Each request opens its own connection,
+-    # and rsync replaces the file by rename, so the next read sees the
+-    # new copy.
+-    uri = "file:{}?mode=ro&immutable=1".format(quote(str(DB_PATH), safe="/:"))
++    # Ingest writes this live file and runs wal_checkpoint(TRUNCATE) into it.
++    # immutable=1 maps the bytes and does not take a WAL lock, so that
++    # checkpoint can tear a read. mode=ro shares the lock. It may create
++    # -shm next to the database, so the reader user has to be the ingest
++    # user (jerem) and the directory has to be a Linux filesystem.
++    # Each request opens its own connection.
++    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
+     try:
+         conn = sqlite3.connect(uri, uri=True)
+         conn.row_factory = sqlite3.Row
+         conn.execute("select 1 from snapshots limit 1")
+         return conn
+     except sqlite3.Error:
+         # A schema drift or a half-finished rsync: neither should take the
+         # reader down. Fall back to meta.json.
+         return None
+@@ -96,8 +94,8 @@ def _connect() -> sqlite3.Connection | None:
+ 
+ def open_readonly() -> sqlite3.Connection | None:
+-    """The synced database, immutable, or None when it cannot be read.
++    """The library database, mode=ro, or None when it cannot be read.
+ 
+-    Callers close the connection. It creates no -wal or -shm files.
++    Callers close the connection. A mode=ro open of a WAL database may
++    create -shm beside amber.sqlite3. The process user must be allowed to.
+     """
+     return _connect()
