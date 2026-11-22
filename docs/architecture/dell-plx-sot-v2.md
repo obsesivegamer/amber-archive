@@ -1,6 +1,6 @@
 # Dell-PLX as the Amber source of truth — plan v2
 
-Status: revised after the Claude Opus 5.5 review (verdict **ISSUES**). 22 November 2026, America/New_York. No builder has been launched. No deploy, merge, or machine change is authorized by this document.
+Status: revised after the Claude Opus 5.5 review (verdict **ISSUES**). 22 November 2026, America/New_York. Jeremy accepted every default in §10. This file stays the spec. The code on this branch implements Phase 0, the Mac allocator and push-on-save from Phase 0.5, and the Phase 1 import worker. Phase 2 pull is not in this branch. No deploy, merge, or machine change is authorized by this document.
 
 This supersedes `/workspace/amber-sot/plan.md`. The review is at `/workspace/amber-sot/opus-review.md`. Findings below were checked against `amber-archive` `main` `8c42ec2e`, with one correction noted in §7 (dedup helpers already accept a `conn`).
 

@@ -215,3 +215,5 @@ A new snapshot prints `201 K7mQp revision=1 change_seq=1`. The same command agai
 Revision 1 is the only revision this command sends. A later slice bumps the revision when the files change. Ingest answers 409, with `detail` and the stored revision, when the number is anything other than the stored revision or one past it. The same id and revision, with the same bytes, is 200.
 
 The two renames that publish an existing id leave a gap where `snaps/<id>` is missing. The journal is written first. Startup moves `ingest-previous/<id>` back if the SQL transaction did not commit. `renameat2(RENAME_EXCHANGE)` would close that gap in one syscall. Recovery is written for the two-step order, so that is the order the code uses.
+
+Gift Links imports are a separate process. `docs/ops/dell-plx-import.md` is the runbook for that worker. It freezes HTML in a private scratch directory and commits only by calling this ingest API. It does not replace ingest, and it does not write `amber.sqlite3` itself.

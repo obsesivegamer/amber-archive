@@ -877,3 +877,22 @@ def test_ingest_import_does_not_load_capture():
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_backfill_pushes_a_cosmetic_duplicate(tmp_path, caplog):
+    """A second id for a URL already on Dell-PLX is pushed and logged, not refused."""
+    import logging
+
+    mac = tmp_path / "mac"
+    write_mac(mac, SID)
+    write_mac(mac, SIBLING)
+    library, _token, app = boot(tmp_path)
+    transport = _AppTransport(app)
+    first = push_snapshot(mac, SID, "http://ingest", TOKEN, transport=transport)
+    assert first.status == 201
+    with caplog.at_level(logging.WARNING, logger="amber.library_ingest"):
+        items = backfill(mac, "http://ingest", TOKEN, transport=transport)
+    assert [(item.sid, item.ok) for item in items] == [(SIBLING, True)]
+    assert "keeping both" in caplog.text
+    assert SIBLING in caplog.text
+    assert {row["id"] for row in reader_rows(library)} == {SID, SIBLING}

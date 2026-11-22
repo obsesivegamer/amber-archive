@@ -11,7 +11,10 @@ Capture is not involved. Set ``AMBER_DATA_DIR`` to the Mac archive, or pass
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
+import os
 import sqlite3
 import sys
 import urllib.error
@@ -20,9 +23,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from . import db
 from .config import DATA_DIR
 from .library_contract import ID_RE, TokenFileError, read_token_file, sha256_hex, snapshot_relpath
 from .security import article_match_key
+
+log = logging.getLogger("amber.library_push")
+
+# In-flight push tasks. Held so the event loop does not drop them, and so
+# tests can wait until a save's push has finished.
+_push_tasks: set[asyncio.Task] = set()
 
 
 class PushError(Exception):
@@ -294,6 +304,97 @@ def stored_ids(ingest_url: str, token: str, *, transport: UrllibTransport | None
     return found
 
 
+def _push_settings() -> tuple[str, str] | None:
+    """Ingest URL and bearer token from the environment, or None.
+
+    Unset means this Mac is not pushing yet. Hourly ``--backfill`` is the
+    catch-up either way. A bad token file is logged and skipped; it does not
+    fail the save that just completed.
+    """
+    url = os.environ.get("AMBER_INGEST_URL", "").strip()
+    raw = os.environ.get("AMBER_INGEST_TOKEN_FILE", "").strip()
+    if not url or not raw:
+        return None
+    try:
+        token = read_token_file(Path(raw))
+    except (TokenFileError, OSError) as exc:
+        log.error(
+            "ingest token file cannot be read (%s); hourly backfill will retry",
+            type(exc).__name__,
+        )
+        return None
+    return url, token
+
+
+def _push_now(sid: str) -> None:
+    settings = _push_settings()
+    if settings is None:
+        return
+    url, token = settings
+    try:
+        result = push_snapshot(db.DATA_DIR, sid, url, token)
+    except Exception as exc:
+        log.error(
+            "push of %s failed (%s); hourly backfill will retry",
+            sid,
+            type(exc).__name__,
+        )
+        return
+    log.info("pushed %s status=%s revision=%s", sid, result.status, result.revision)
+
+
+async def _run_push(sid: str, thumbnail: asyncio.Task | None) -> None:
+    if thumbnail is not None:
+        try:
+            await thumbnail
+        except Exception as exc:
+            log.error(
+                "thumbnail for %s failed (%s); pushing the snapshot anyway",
+                sid,
+                type(exc).__name__,
+            )
+    await asyncio.to_thread(_push_now, sid)
+
+
+def schedule_library_push_after(sid: str, thumbnail: asyncio.Task | None = None) -> None:
+    """Push ``sid`` once ``thumbnail`` has finished, if ingest is configured.
+
+    The thumbnail task is the one that writes ``snaps/<id>/screenshot.jpg``.
+    Pushing first would publish revision 1 without it, and nothing in this
+    build writes revision 2. No running loop and no thumbnail: push on a
+    daemon thread. No running loop but a thumbnail still in flight: skip and
+    let hourly backfill pick the id up after the file lands.
+    """
+    if _push_settings() is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        if thumbnail is not None:
+            return
+        import threading
+
+        threading.Thread(target=_push_now, args=(sid,), daemon=True).start()
+        return
+    task = loop.create_task(_run_push(sid, thumbnail))
+    _push_tasks.add(task)
+    task.add_done_callback(_push_tasks.discard)
+
+
+def schedule_library_push(sid: str) -> None:
+    """Push a snapshot whose files are already complete."""
+    schedule_library_push_after(sid, None)
+
+
+async def await_pending_pushes() -> None:
+    """Wait for pushes scheduled on this loop. Tests use this."""
+    while _push_tasks:
+        pending = list(_push_tasks)
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 def backfill(
     source: Path,
     ingest_url: str,
@@ -307,6 +408,10 @@ def backfill(
     lists rows only, so those folders stay off the phone until this runs.
     Ids are oldest first. One rejected id is recorded and the rest still run,
     so a bad old snapshot cannot wedge every newer capture.
+
+    An id whose URL is already stored under a different id is still pushed.
+    ``GET /v1/revisions`` does not return URLs, and refusing would leave that
+    Mac id off the phone forever. Ingest logs the repeated match_key.
     """
     client = transport or UrllibTransport()
     have = stored_ids(ingest_url, token, transport=client)

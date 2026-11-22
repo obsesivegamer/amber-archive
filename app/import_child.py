@@ -16,9 +16,11 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 from . import db
 from .config import ROOT
+from .library_contract import ID_RE as SNAPSHOT_ID_RE
 
 MAX_TAGS = 60_000
 MAX_DEPTH = 400
@@ -183,13 +185,22 @@ def measure_parsed_tree(html: str) -> None:
 
 
 async def ingest_in_child(
-    html: str, url: str, title: str, final_url: str
+    html: str,
+    url: str,
+    title: str,
+    final_url: str,
+    *,
+    allocate: Callable[[], str] | None = None,
 ) -> str:
     """Pre-check, then ingest in a child process. Returns the snapshot id.
 
     Raises TooComplex for pages that are rejected, time out or exceed the
     memory cap; any other failure surfaces as RuntimeError. A snapshot row is
     inserted up front so a killed child never leaves one behind.
+
+    ``allocate`` overrides the Mac allocator. The Dell import worker passes
+    one that returns a Z-prefixed id checked against the live library. The
+    default stays ``db.allocate_id``, which never emits that prefix.
     """
     await asyncio.to_thread(check_complexity, html)
     url = url.strip()
@@ -197,7 +208,9 @@ async def ingest_in_child(
         url = "https://" + url
 
     def reserve() -> str:
-        sid = db.allocate_id()
+        sid = allocate() if allocate is not None else db.allocate_id()
+        if not isinstance(sid, str) or not SNAPSHOT_ID_RE.fullmatch(sid):
+            raise RuntimeError("allocator returned an id outside the archive alphabet")
         # Before the insert, so no reader ever sees the row as an orphan.
         importing.add(sid)
         try:

@@ -121,3 +121,7 @@ BLOCKED_HOST_SNIPPETS = (
 
 ID_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 ID_LENGTH = 5
+# Leading character reserved for Dell-PLX snapshot ids. Mac allocators never
+# emit it. Legacy Mac ids may already start with it, so Dell still checks the
+# live store before using one.
+DELL_ID_PREFIX = "Z"

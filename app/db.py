@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import DB_PATH, ID_ALPHABET, ID_LENGTH, SNAPS_DIR, DATA_DIR
+from .config import DATA_DIR, DB_PATH, DELL_ID_PREFIX, ID_ALPHABET, ID_LENGTH, SNAPS_DIR
 from .extract import PAYWALL_WORD_LIMIT, article_is_paywalled
 
 SCHEMA = """
@@ -393,11 +393,37 @@ def _as_snap(row: sqlite3.Row) -> dict:
     return snap
 
 
+def new_snapshot_id(partition: str) -> str:
+    """One random snapshot id in ``mac`` or ``dell``.
+
+    Mac ids never start with ``DELL_ID_PREFIX``. Dell ids always do. The other
+    four characters still use the full archive alphabet. This does not check
+    the store; callers that might collide with a legacy id have to.
+    """
+    if partition == "mac":
+        first_alphabet = ID_ALPHABET.replace(DELL_ID_PREFIX, "")
+        if not first_alphabet or DELL_ID_PREFIX not in ID_ALPHABET:
+            raise RuntimeError("snapshot alphabet has no Dell prefix to reserve")
+        first = secrets.choice(first_alphabet)
+    elif partition == "dell":
+        first = DELL_ID_PREFIX
+    else:
+        raise ValueError(f"unknown id partition {partition}")
+    rest = "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_LENGTH - 1))
+    return first + rest
+
+
 def _new_id() -> str:
-    return "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_LENGTH))
+    return new_snapshot_id("mac")
 
 
 def allocate_id() -> str:
+    """Allocate a Mac snapshot id. Never starts with the Dell prefix.
+
+    Imports, Playwright saves, and ``ingest_html`` all come through here.
+    The id is checked against this process's own database, which on the Mac
+    is the Mac archive.
+    """
     with connect() as db:
         for _ in range(32):
             sid = _new_id()

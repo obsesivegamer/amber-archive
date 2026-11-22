@@ -11,6 +11,7 @@ import unicodedata
 from collections import deque
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -22,6 +23,7 @@ from .candidates import dismiss_candidate, get_candidates_payload, save_candidat
 from .config import ID_ALPHABET, ID_LENGTH
 from .import_child import TooComplex, blocked_for, importing, ingest_in_child
 from .ingest import screenshot_reader
+from .library_push import schedule_library_push_after
 from .security import article_match_key, normalize_url, validate_public_http_url
 
 log = logging.getLogger("amber.api")
@@ -116,6 +118,13 @@ def _read(sid: str, name: str) -> str:
         return ""
 
 
+def _read_in(folder: Path, name: str) -> str:
+    try:
+        return (folder / name).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def _blocks(scopes: list, selector: str) -> str:
     paragraphs = []
     seen: set[int] = set()
@@ -132,8 +141,11 @@ def _blocks(scopes: list, selector: str) -> str:
 
 @lru_cache(maxsize=512)
 def _derive_text(sid: str, stamp: tuple) -> str:
-    flat = _read(sid, "article.txt")
-    html = _read(sid, "article.html")
+    # stamp[0] is the snapshot folder. Usable checks for a library row have
+    # to read that folder: this process's snap dir may be a scratch tree.
+    folder = Path(stamp[0]) if stamp else db.snap_dir(sid)
+    flat = _read_in(folder, "article.txt")
+    html = _read_in(folder, "article.html")
     if not html:
         return flat
     soup = BeautifulSoup(html, "lxml")
@@ -148,9 +160,9 @@ def _derive_text(sid: str, stamp: tuple) -> str:
     return text or flat
 
 
-def _article_text(sid: str) -> str:
-    folder = db.snap_dir(sid)
-    stamp = []
+def _article_text(sid: str, snaps_dir: Path | None = None) -> str:
+    folder = (snaps_dir if snaps_dir is not None else db.SNAPS_DIR) / sid
+    stamp: list[object] = [str(folder)]
     for name in ("article.txt", "article.html"):
         try:
             stamp.append(folder.joinpath(name).stat().st_mtime_ns)
@@ -159,14 +171,14 @@ def _article_text(sid: str) -> str:
     return _derive_text(sid, tuple(stamp))
 
 
-def _is_usable(snap: dict, site: str) -> bool:
+def _is_usable(snap: dict, site: str, snaps_dir: Path | None = None) -> bool:
     if snap["status"] != "complete":
         return False
     if int(snap.get("word_count") or 0) < MIN_USABLE_WORDS:
         return False
     if _title_is_just_a_name(snap, site):
         return False
-    text = _article_text(snap["id"])
+    text = _article_text(snap["id"], snaps_dir)
     words = len(text.split())
     if words < MIN_USABLE_WORDS:
         return False
@@ -271,11 +283,17 @@ def _find_matches(url: str, conn: sqlite3.Connection | None = None) -> list[dict
     ]
 
 
-def _best_match(matches: list[dict]) -> tuple[dict | None, str, bool]:
+def _best_match(
+    matches: list[dict], snaps_dir: Path | None = None
+) -> tuple[dict | None, str, bool]:
     """Pick the snapshot a client should use: (snapshot, effective status, usable).
 
     Preference: complete and usable, then in flight, then complete but
     unusable, then failed. Each group is newest first.
+
+    ``snaps_dir`` is where article files are read for the usable check. The
+    default is this process's snapshot directory. The Dell import worker
+    passes the shared library's ``snaps/`` because its own data dir is scratch.
     """
     complete: list[dict] = []
     in_flight: dict | None = None
@@ -289,7 +307,7 @@ def _best_match(matches: list[dict]) -> tuple[dict | None, str, bool]:
         else:
             failed = failed or snap
     for snap in complete:
-        if _is_usable(snap, _site_name(snap)):
+        if _is_usable(snap, _site_name(snap), snaps_dir):
             return snap, "complete", True
     if in_flight:
         return in_flight, effective_status(in_flight), False
@@ -558,6 +576,56 @@ def _imported_bytes_today() -> int:
     return sum(size for _, size in _import_ledger)
 
 
+def parse_import_fields(body: object) -> tuple[str, str, str, int, str, bool]:
+    """Validate a ``POST /api/import`` object.
+
+    Returns ``(clean_url, final_url, html, html_bytes, title, force)``.
+    Raises ``HTTPException`` with the status and detail this route has
+    always returned. URL checks do DNS, so callers run this off the event loop.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+        raise HTTPException(400, 'Body must be a JSON object with a string "url".')
+    html = body.get("html")
+    if not isinstance(html, str) or len(html.strip()) < MIN_IMPORT_HTML_CHARS:
+        raise HTTPException(
+            400, f'"html" must be a string of at least {MIN_IMPORT_HTML_CHARS} characters.'
+        )
+    try:
+        html_bytes = len(html.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise HTTPException(400, '"html" is not valid Unicode text.') from None
+    title = body.get("title")
+    if title is not None and not isinstance(title, str):
+        raise HTTPException(400, '"title" must be a string.')
+    title = " ".join((title or "").split())[:MAX_IMPORT_TITLE_CHARS]
+    force = body.get("force", False)
+    if force is None:
+        force = False
+    if not isinstance(force, bool):
+        raise HTTPException(400, '"force" must be true or false.')
+    final_raw = body.get("final_url")
+    if final_raw is not None and not isinstance(final_raw, str):
+        raise HTTPException(400, '"final_url" must be a string.')
+
+    try:
+        clean = validate_public_http_url(body["url"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    final = clean
+    if final_raw is not None and final_raw.strip():
+        try:
+            final = validate_public_http_url(final_raw)
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith(("Private or local", "Local URLs", "Numeric hosts")):
+                # Stable strings: the extension maps these distinctly.
+                raise HTTPException(400, "final_url is a private or local address") from exc
+            raise HTTPException(400, f"final_url: {message}") from exc
+        if not _same_site(clean, final):
+            raise HTTPException(400, "final_url is a different site")
+    return clean, final, html, html_bytes, title, force
+
+
 async def _read_body_capped(request: Request, limit: int, deadline: float = MAX_BODY_SECONDS) -> bytes:
     """Read the request body: 413 as soon as it passes `limit`, 408 past `deadline` seconds."""
     declared = request.headers.get("content-length", "")
@@ -616,46 +684,9 @@ async def import_page(request: Request):
         except (ValueError, RecursionError) as exc:
             raise HTTPException(400, "Body must be valid JSON.") from exc
         del raw
-        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
-            raise HTTPException(400, 'Body must be a JSON object with a string "url".')
-        html = body.get("html")
-        if not isinstance(html, str) or len(html.strip()) < MIN_IMPORT_HTML_CHARS:
-            raise HTTPException(
-                400, f'"html" must be a string of at least {MIN_IMPORT_HTML_CHARS} characters.'
-            )
-        try:
-            html_bytes = len(html.encode("utf-8"))
-        except UnicodeEncodeError:
-            raise HTTPException(400, '"html" is not valid Unicode text.') from None
-        title = body.get("title")
-        if title is not None and not isinstance(title, str):
-            raise HTTPException(400, '"title" must be a string.')
-        title = " ".join((title or "").split())[:MAX_IMPORT_TITLE_CHARS]
-        force = body.get("force", False)
-        if force is None:
-            force = False
-        if not isinstance(force, bool):
-            raise HTTPException(400, '"force" must be true or false.')
-        final_raw = body.get("final_url")
-        if final_raw is not None and not isinstance(final_raw, str):
-            raise HTTPException(400, '"final_url" must be a string.')
-
-        try:
-            clean = await asyncio.to_thread(validate_public_http_url, body["url"])
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        final = clean
-        if final_raw is not None and final_raw.strip():
-            try:
-                final = await asyncio.to_thread(validate_public_http_url, final_raw)
-            except ValueError as exc:
-                message = str(exc)
-                if message.startswith(("Private or local", "Local URLs", "Numeric hosts")):
-                    # Stable strings: the extension maps these distinctly.
-                    raise HTTPException(400, "final_url is a private or local address") from exc
-                raise HTTPException(400, f"final_url: {message}") from exc
-            if not _same_site(clean, final):
-                raise HTTPException(400, "final_url is a different site")
+        clean, final, html, html_bytes, title, force = await asyncio.to_thread(
+            parse_import_fields, body
+        )
 
         if not force:
             def usable_copy() -> dict | None:
@@ -692,10 +723,14 @@ async def import_page(request: Request):
     finally:
         release_import_slot()
 
+    thumbnail_task = None
     if reserve_thumbnail():
-        task = asyncio.create_task(run_reserved_thumbnail(sid, screenshot_reader))
-        _thumbnail_tasks.add(task)
-        task.add_done_callback(_thumbnail_tasks.discard)
+        thumbnail_task = asyncio.create_task(run_reserved_thumbnail(sid, screenshot_reader))
+        _thumbnail_tasks.add(thumbnail_task)
+        thumbnail_task.add_done_callback(_thumbnail_tasks.discard)
+    # Push after the thumbnail file is in snaps/<id>/, when one was scheduled.
+    # A missing ingest configuration is a no-op; hourly backfill is the catch-up.
+    schedule_library_push_after(sid, thumbnail_task)
     snap_title = snap.get("title")
     return JSONResponse(
         {
