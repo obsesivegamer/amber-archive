@@ -350,7 +350,7 @@ def thumbnail_hold_active(source: Path, sid: str, *, now: float | None = None) -
 
 
 def _already_stored(exc: PushRejected) -> bool:
-    """Revision 1 is already on Dell-PLX. A different body is not an error.
+    """Revision 1 is already on Dell-PLX. A different body is not a failure.
 
     Push-on-save and backfill can both send the same id. The first write
     wins. The second is success: this build does not replace revision 1.
@@ -361,6 +361,13 @@ def _already_stored(exc: PushRejected) -> bool:
         "stored revision does not match" in exc.detail
         or "revision is not stored + 1" in exc.detail
     )
+
+
+def _note_already_stored(sid: str, exc: PushRejected) -> None:
+    if "stored revision does not match" in exc.detail:
+        log.warning("snapshot %s is already stored with a different body", sid)
+        return
+    log.info("snapshot %s is already stored", sid)
 
 
 def _push_settings() -> tuple[str, str] | None:
@@ -394,7 +401,7 @@ def _push_now(sid: str) -> None:
         result = push_snapshot(db.DATA_DIR, sid, url, token)
     except PushRejected as exc:
         if _already_stored(exc):
-            log.info("snapshot %s is already stored", sid)
+            _note_already_stored(sid, exc)
             return
         log.error(
             "push of %s failed (%s); hourly backfill will retry",
@@ -503,7 +510,7 @@ def backfill(
             result = push_snapshot(source, sid, ingest_url, token, transport=client)
         except PushRejected as exc:
             if _already_stored(exc):
-                log.info("snapshot %s is already stored", sid)
+                _note_already_stored(sid, exc)
                 outcome.append(BackfillItem(sid, True, 200, ""))
                 continue
             outcome.append(BackfillItem(sid, False, exc.status, exc.detail))

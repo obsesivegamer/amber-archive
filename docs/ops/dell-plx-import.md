@@ -23,7 +23,7 @@ Pull the commit in each checkout and restart the app so new ids come from the Ma
 
 Push-on-save reads two variables. Set them on the app's LaunchAgent, not only on the hourly job. The URL is the tailnet ingest port, the same one `--backfill` already uses. `http://127.0.0.1:8082` is the ingest bind on Dell-PLX; it is not reachable from the Mac.
 
-An import's thumbnail can still be rendering when the hourly backfill runs. The app writes `push-hold/<id>` for that wait, and backfill leaves the id for the next run. That skip is not a failure and does not show up in `backfill N ok, 0 failed`. Push-on-save publishes revision 1 after the thumbnail attempt. A second push of an id Dell-PLX already stored is success. It is logged as already stored, not as an error, and it does not replace revision 1.
+An import's thumbnail can still be rendering when the hourly backfill runs. The app writes `push-hold/<id>` for that wait, and backfill leaves the id for the next run. That skip is not a failure and does not show up in `backfill N ok, 0 failed`. Push-on-save publishes revision 1 after the thumbnail attempt. A second push of an id Dell-PLX already stored is success and does not replace revision 1. The same body is an info log. A different body is a warning.
 
 ```bash
 AMBER_INGEST_URL=https://dell-plx-reader.tailf9612a.ts.net:8443
@@ -125,8 +125,8 @@ Not this step. When it is cut over, and only after the Mac backfill above has re
 
 - Base URL `https://dell-plx-reader.tailf9612a.ts.net:8444`, path `POST /api/import`, bearer import token.
 - Same JSON body as today. Do not send `force` on a retry.
-- Treat `201` and `409 {"detail": "already archived", "id": ...}` as success. That `409` is any complete snapshot of the URL, including a page that is not usable (under 120 words, or a title that is only the site name). A retry does not get a second id. The Mac `POST /api/import` still requires a usable snapshot; this worker does not.
-- `400`, `415`, and `422` are permanent and get reported. `422` with `Library ingest rejected the snapshot.` means ingest refused the body (its 400, 401, 413, or another 4xx). Retrying it will not succeed.
+- Treat `201` and `409 {"detail": "already archived", "id": ...}` as success. That `409` is a usable snapshot of the URL, or a retry of the same HTML body this worker committed in the last 24 hours. A short Mac teaser is not a `409`. Posting the full article then returns `201` and a new id. Do not treat every complete row as already archived.
+- `400`, `415`, and `422` are permanent and get reported. `422` with `Library ingest rejected the snapshot.` means ingest refused the body (its 400, 413, or another 4xx that is not 401, 403, 408, or 429). Retrying it will not succeed. Ingest `401` and `403` arrive as `503` because they mean the worker's ingest token, and the HTML should be kept.
 - `503` (`Library ingest is unavailable.`, `Could not allocate a snapshot id.`, `Could not read the library.`) and `429` retry with backoff. Those `503`s do not keep the import budget charge. Client timeout at least 90 s. Network errors retry the same way.
 - Keep the HTML until Phase 2 is live, or 14 days, whichever is longer. No fallback to the Mac.
 - Alert after 6 hours of failed retries.

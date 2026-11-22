@@ -276,6 +276,30 @@ def test_mac_url_already_in_the_library_returns_that_id(worker, monkeypatch):
     assert not any(item.startswith("Z") for item in _ids(library))
 
 
+def test_short_mac_teaser_does_not_block_a_full_import(worker):
+    """A Mac teaser of the same URL is not already archived.
+
+    Gift Links treats 409 as success and then drops the HTML. The stock short
+    fixture for https://www.ft.com/content/abc (K7mQp) must not eat a later
+    full article.
+    """
+    app, library, _transport = worker
+    mac = library.parent / "mac-teaser"
+    write_mac(mac)
+    from app.library_push import push_snapshot
+
+    result = push_snapshot(mac, SID, "http://ingest", TOKEN, transport=app.state.transport)
+    assert result.status == 201
+    with TestClient(app) as client:
+        response = _post(client, url=URL)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["usable"] is True
+    assert body["id"].startswith("Z")
+    assert body["id"] != SID
+    assert set(_ids(library)) == {SID, body["id"]}
+
+
 def test_crash_before_push_then_retry_commits_one_id(tmp_path, monkeypatch):
     _assert_one_commit_after_crash(tmp_path, monkeypatch, where="before_push")
 
@@ -695,6 +719,18 @@ def test_short_page_retry_keeps_one_id(worker):
     assert _ids(library) == [first.json()["id"]]
 
 
+def test_a_larger_body_after_a_short_commit_is_a_new_id(worker):
+    app, library, _transport = worker
+    with TestClient(app) as client:
+        short = _post(client, html=_short_html())
+        full = _post(client)
+    assert short.status_code == 201, short.text
+    assert full.status_code == 201, full.text
+    assert full.json()["id"] != short.json()["id"]
+    assert full.json()["usable"] is True
+    assert set(_ids(library)) == {short.json()["id"], full.json()["id"]}
+
+
 def test_library_read_error_is_retryable_and_stores_nothing(worker, monkeypatch):
     def boom(_path):
         raise sqlite3.OperationalError("database is locked")
@@ -754,4 +790,23 @@ def test_ingest_400_is_a_permanent_422(worker):
         response = _post(client)
     assert response.status_code == 422
     assert response.json()["detail"] == "Library ingest rejected the snapshot."
+    assert _ids(library) == []
+
+
+def test_ingest_401_is_a_retryable_503(worker):
+    app, library, transport = worker
+    original = transport.round_trip
+
+    def round_trip(method, url, body, headers):
+        if method == "POST" and urlparse(url).path == "/v1/revisions":
+            return 401, {"detail": "unauthorized"}
+        return original(method, url, body, headers)
+
+    transport.round_trip = round_trip
+    with TestClient(app) as client:
+        response = _post(client)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Library ingest is unavailable."
+    ledger = json.loads((app.state.state_dir / "budget.json").read_text(encoding="utf-8"))
+    assert ledger == []
     assert _ids(library) == []

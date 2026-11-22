@@ -223,11 +223,11 @@ def _matches(address: str, conn: sqlite3.Connection) -> list[dict]:
 
 
 def archived_copy(library_dir: Path, addresses: list[str]) -> dict | None:
-    """A complete snapshot of one of ``addresses`` in the shared library.
+    """A complete usable snapshot of one of ``addresses`` in the shared library.
 
-    Usable or not. A short page is still that page: a retry must not mint a
-    second id. The Mac route still requires a usable copy; this worker does
-    not. A missing database raises, so dedup does not silently turn off.
+    A short or teaser row is not "already archived". Gift Links posts the full
+    article for URLs the Mac only captured as a teaser, and a 409 would make
+    it drop that HTML. A missing database raises, so dedup does not turn off.
     """
     db_path = library_dir / "amber.sqlite3"
     if not db_path.is_file():
@@ -245,12 +245,98 @@ def archived_copy(library_dir: Path, addresses: list[str]) -> dict | None:
                 ordered.append(snap)
         if not ordered:
             return None
-        found, status, _usable = _best_match(ordered, snaps_dir=snaps)
-        if found is not None and status == "complete":
+        found, status, usable = _best_match(ordered, snaps_dir=snaps)
+        if found is not None and status == "complete" and usable:
             return found
         return None
     finally:
         conn.close()
+
+
+_RECENT_S = 24 * 3600
+_recent_lock = threading.Lock()
+
+
+def _recent_path(state_dir: Path) -> Path:
+    return state_dir / "recent.json"
+
+
+def _read_recent(path: Path) -> list[tuple[str, str, int, int]]:
+    """Commits this worker made, newest last. Raises OSError when unreadable."""
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise OSError("recent import ledger cannot be read") from exc
+    if not isinstance(raw, list):
+        raise OSError("recent import ledger cannot be read")
+    cutoff = int(time.time()) - _RECENT_S
+    rows: list[tuple[str, str, int, int]] = []
+    for item in raw:
+        if (
+            not isinstance(item, list)
+            or len(item) != 4
+            or not isinstance(item[0], str)
+            or not item[0]
+            or not isinstance(item[1], str)
+            or not ID_RE.fullmatch(item[1])
+            or isinstance(item[2], bool)
+            or not isinstance(item[2], int)
+            or isinstance(item[3], bool)
+            or not isinstance(item[3], int)
+            or item[3] < 0
+        ):
+            raise OSError("recent import ledger cannot be read")
+        if item[2] >= cutoff:
+            rows.append((item[0], item[1], item[2], item[3]))
+    return rows
+
+
+def _write_recent(path: Path, rows: list[tuple[str, str, int, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps([list(row) for row in rows], separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def recent_replay(state_dir: Path, keys: list[str], nbytes: int) -> str | None:
+    """Id of a recent commit by this worker of the same URL and body size.
+
+    A different body, or a snapshot this worker did not commit, is not a replay.
+    """
+    wanted = {key for key in keys if key}
+    if not wanted:
+        return None
+    path = _recent_path(state_dir)
+    with _recent_lock:
+        try:
+            rows = _read_recent(path)
+        except OSError as exc:
+            raise HTTPException(503, "Recent import ledger cannot be read.") from exc
+    for key, sid, _stamp, size in reversed(rows):
+        if key in wanted and size == nbytes:
+            return sid
+    return None
+
+
+def remember_commit(state_dir: Path, keys: list[str], sid: str, nbytes: int) -> None:
+    """Record a commit so a retry of this same body returns 409."""
+    if not ID_RE.fullmatch(sid):
+        return
+    fresh = [key for key in keys if isinstance(key, str) and key]
+    if not fresh:
+        return
+    path = _recent_path(state_dir)
+    stamp = int(time.time())
+    with _recent_lock:
+        rows = _read_recent(path)
+        for key in fresh:
+            rows.append((key, sid, stamp, nbytes))
+        _write_recent(path, rows)
 
 
 def _ledger_path(state_dir: Path) -> Path:
@@ -475,10 +561,11 @@ async def _freeze_and_commit(
                     release_dell_id(sid)
                     cleanup.remove(sid)
                     continue
-                if exc.status in {408, 429} or exc.status >= 500:
+                if exc.status in {401, 403, 408, 429} or exc.status >= 500:
+                    # 401 and 403 are the ingest token, not the client's import
+                    # token. Gift Links retries 503; a 422 would drop the HTML.
                     raise HTTPException(503, "Library ingest is unavailable.") from None
-                # 400, 401, 413 and any other 4xx will not succeed on retry.
-                # Gift Links treats 422 as permanent and retries every 5xx.
+                # 400, 413 and any other 4xx will not succeed on retry.
                 raise HTTPException(422, "Library ingest rejected the snapshot.") from None
             except (PushError, urllib.error.URLError, TimeoutError, OSError):
                 raise HTTPException(503, "Library ingest is unavailable.") from None
@@ -634,6 +721,17 @@ def create_app(
                                 {"detail": "already archived", "id": existing["id"]},
                                 status_code=409,
                             )
+                        replay = await asyncio.to_thread(
+                            recent_replay,
+                            request.app.state.state_dir,
+                            keys,
+                            html_bytes,
+                        )
+                        if replay is not None:
+                            return JSONResponse(
+                                {"detail": "already archived", "id": replay},
+                                status_code=409,
+                            )
                     charged = await asyncio.to_thread(
                         charge_budget, request.app.state.state_dir, html_bytes
                     )
@@ -662,6 +760,19 @@ def create_app(
                         raise HTTPException(
                             422, "Could not turn that HTML into a snapshot."
                         ) from None
+                    try:
+                        await asyncio.to_thread(
+                            remember_commit,
+                            request.app.state.state_dir,
+                            keys,
+                            payload["id"],
+                            html_bytes,
+                        )
+                    except OSError as exc:
+                        log.error(
+                            "recent import record failed (%s)",
+                            type(exc).__name__,
+                        )
                 except HTTPException as exc:
                     if exc.status_code == 503 and charged is not None:
                         try:

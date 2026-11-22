@@ -164,7 +164,8 @@ def test_already_stored_push_is_quiet(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr("app.library_push.push_snapshot", fake)
     with caplog.at_level(logging.DEBUG, logger="amber.library_push"):
         _push_now("K7mQp")
-    assert "already stored" in caplog.text
+    assert "already stored with a different body" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
     assert not any(record.levelno >= logging.ERROR for record in caplog.records)
 
 

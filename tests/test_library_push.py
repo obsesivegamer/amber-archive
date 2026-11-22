@@ -945,5 +945,6 @@ def test_backfill_treats_an_already_stored_revision_as_success(tmp_path, caplog)
     with caplog.at_level(logging.DEBUG, logger="amber.library_push"):
         items = backfill(mac, "http://ingest", TOKEN, transport=Conflict())
     assert [(item.sid, item.ok, item.status) for item in items] == [(SID, True, 200)]
-    assert "already stored" in caplog.text
+    assert "already stored with a different body" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
     assert not any(record.levelno >= logging.ERROR for record in caplog.records)
