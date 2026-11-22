@@ -895,4 +895,6 @@ def test_backfill_pushes_a_cosmetic_duplicate(tmp_path, caplog):
     assert [(item.sid, item.ok) for item in items] == [(SIBLING, True)]
     assert "keeping both" in caplog.text
     assert SIBLING in caplog.text
+    assert SID in caplog.text
+    assert "ft.com" not in caplog.text
     assert {row["id"] for row in reader_rows(library)} == {SID, SIBLING}

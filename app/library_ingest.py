@@ -700,9 +700,8 @@ def _warn_duplicate_match_key(conn: sqlite3.Connection, doc: RevisionDoc) -> Non
     if other is None:
         return
     log.warning(
-        "snapshot %s reuses match_key %s already stored as %s; keeping both",
+        "snapshot %s repeats an article already stored as %s; keeping both",
         doc.sid,
-        doc.match_key,
         other["id"],
     )
 
