@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import re
 import sqlite3
 import time
-import unicodedata
 from collections import deque
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
@@ -22,7 +20,7 @@ from .candidates import dismiss_candidate, get_candidates_payload, save_candidat
 from .config import ID_ALPHABET, ID_LENGTH
 from .import_child import TooComplex, blocked_for, importing, ingest_in_child
 from .ingest import screenshot_reader
-from .security import article_match_key, normalize_url, validate_public_http_url
+from .security import article_match_key, normalize_url, same_site as _same_site, validate_public_http_url
 
 log = logging.getLogger("amber.api")
 router = APIRouter(prefix="/api")
@@ -431,89 +429,6 @@ _thumbnail_tasks: set[asyncio.Task] = set()
 _import_ledger: deque[tuple[float, int]] = deque()
 # One Chromium at a time for import thumbnails.
 _screenshot_gate = asyncio.Semaphore(1)
-
-# Public suffixes (registrable domain = suffix plus one label), including
-# shared-hosting suffixes where every subdomain belongs to a different owner.
-_PUBLIC_SUFFIXES = frozenset(
-    "co.uk org.uk ac.uk gov.uk me.uk ltd.uk plc.uk com.au net.au org.au edu.au gov.au "
-    "co.nz org.nz govt.nz co.jp or.jp ne.jp ac.jp go.jp com.br net.br org.br com.cn net.cn "
-    "org.cn com.hk com.sg com.tw com.mx com.ar com.tr com.ua co.in net.in org.in co.za "
-    "co.kr or.kr co.il co.id com.my com.ph com.pk com.eg com.sa com.ng "
-    "github.io gitlab.io blogspot.com herokuapp.com vercel.app netlify.app pages.dev "
-    "workers.dev web.app firebaseapp.com azurewebsites.net cloudfront.net "
-    "s3.amazonaws.com appspot.com wordpress.com "
-    "substack.com medium.com wixsite.com myshopify.com tumblr.com squarespace.com "
-    "ghost.io notion.site".split()
-)
-_S3_LABEL_RE = re.compile(r"^s3(?:$|[-.].*)")
-
-
-def _punycode_host(host: str) -> str:
-    """UTS 46-ish fallback when the `idna` package is missing: NFKC and
-    lower-case, then punycode per label. Deliberately not IDNA 2003, so ß stays
-    ß (xn--zca) and does not collapse into ss."""
-    labels = []
-    for label in host.split("."):
-        if label.isascii():
-            labels.append(label)
-        else:
-            try:
-                labels.append("xn--" + label.encode("punycode").decode("ascii"))
-            except UnicodeError:
-                labels.append(label)
-    return ".".join(labels)
-
-
-def _host_key(url: str) -> str:
-    """Lower-cased IDNA 2008 (A-label) host, after NFKC so full-width forms compare equal."""
-    host = unicodedata.normalize("NFKC", urlparse(url).hostname or "").lower().rstrip(".")
-    if host.isascii():
-        return host
-    try:
-        import idna
-
-        return idna.encode(host, uts46=True, transitional=False).decode("ascii")
-    except ImportError:
-        return _punycode_host(host)
-    except Exception:
-        return _punycode_host(host)
-
-
-def _registrable_domain(host: str) -> str:
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        pass
-    labels = host.split(".")
-    if host.endswith(".amazonaws.com"):
-        # bucket.s3.amazonaws.com, bucket.s3.<region>.amazonaws.com,
-        # bucket.s3-<region>.amazonaws.com: the whole host names one owner.
-        if any(_S3_LABEL_RE.match(label) for label in labels[:-2]):
-            return host
-    for i in range(1, len(labels)):
-        if ".".join(labels[i:]) in _PUBLIC_SUFFIXES:
-            return ".".join(labels[i - 1:])
-    return ".".join(labels[-2:])
-
-
-def _port_class(url: str) -> int | str:
-    try:
-        port = urlparse(url).port
-    except ValueError:
-        return "invalid"
-    return "default" if port in (None, 80, 443) else port
-
-
-def _same_site(a: str, b: str) -> bool:
-    try:
-        host_a, host_b = _host_key(a), _host_key(b)
-        if not host_a or not host_b or _port_class(a) != _port_class(b):
-            return False
-    except ValueError:
-        return False
-    return host_a == host_b or _registrable_domain(host_a) == _registrable_domain(host_b)
-
 
 def claim_import_slot() -> None:
     """Take one of the MAX_IMPORTS_IN_FLIGHT slots, or refuse with 429.

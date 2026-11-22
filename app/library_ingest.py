@@ -1,7 +1,10 @@
 """Ingest process for the Dell-PLX library.
 
 One complete snapshot arrives as ``PUT /v1/blobs/{sha256}`` and
-``POST /v1/revisions``. This process writes ``snaps/<id>/`` and the
+``POST /v1/revisions``. ``POST /v1/import`` accepts the same JSON as the
+Mac's ``POST /api/import`` and commits it through that same journal.
+``GET /v1/changes`` and ``GET /v1/snapshots/{id}/files/{path}`` are how the
+Mac pull reads a commit back. This process writes ``snaps/<id>/`` and the
 ``snapshots`` row amber-reader lists, then checkpoints the database.
 
 The phone reader has to open that file with ``mode=ro`` and no ``immutable``
@@ -15,9 +18,11 @@ in one transaction. A crash after the rename and before that transaction is
 rolled back on the next startup. Startup also deletes leftover staging
 directories.
 
-This module is the writer. It does not import capture, Playwright, or the
-HTML importer, and it does not serve archived HTML. Run it with
-``python -m app.library_ingest``. The Mac command is ``python -m app.library_push``.
+This module is the writer. Importing it does not load capture, Playwright,
+or the HTML extractor. ``POST /v1/import`` loads the extractor when a request
+arrives. It does not serve archived HTML. Run it with
+``python -m app.library_ingest``. The Mac commands are
+``python -m app.library_push`` and ``python -m app.library_pull``.
 """
 
 from __future__ import annotations
@@ -36,13 +41,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from .config import ID_ALPHABET, ID_LENGTH
 from .library_contract import (
     CHANGES_DDL,
     ID_RE,
     MAX_BLOB_BYTES,
     MAX_FILES,
+    MAX_IMPORT_BODY_BYTES,
     MAX_REVISION_BYTES,
     REVISIONS_DDL,
     SHA256_RE,
@@ -57,7 +64,8 @@ from .library_contract import (
 
 log = logging.getLogger("amber.library_ingest")
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
+_CHANGES_LIMIT = 100
 _CHECKPOINT_TRIES = 5
 _CHECKPOINT_PAUSE_S = 0.05
 _OPTIONAL_STRINGS = (
@@ -70,7 +78,7 @@ _OPTIONAL_STRINGS = (
     "error",
 )
 _OPTIONAL_INTS = ("http_status", "word_count")
-_TOP_LEVEL = {"id", "revision", "op", "match_key", "row", "files"}
+_TOP_LEVEL = {"id", "revision", "op", "match_key", "row", "files", "content_sha256"}
 
 
 class IngestError(Exception):
@@ -91,6 +99,15 @@ class RevisionDoc:
     files: list[dict]
     row_json: str
     files_json: str
+    content_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredImport:
+    sid: str
+    revision: int
+    change_seq: int
+    content_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -189,6 +206,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
     if "paywalled" not in columns:
         conn.execute("ALTER TABLE snapshots ADD COLUMN paywalled INTEGER")
+    rev_cols = {row[1] for row in conn.execute("PRAGMA table_info(library_revisions)")}
+    if "content_sha256" not in rev_cols:
+        conn.execute("ALTER TABLE library_revisions ADD COLUMN content_sha256 TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_library_rev_match ON library_revisions(match_key)"
+    )
 
 
 def _checkpoint(conn: sqlite3.Connection) -> None:
@@ -497,6 +520,11 @@ def _parse(payload: dict) -> RevisionDoc:
         match_key = ""
     if not isinstance(match_key, str):
         raise IngestError(400, "match_key must be a string")
+    content_sha = payload.get("content_sha256")
+    if content_sha is not None:
+        if not isinstance(content_sha, str) or not SHA256_RE.fullmatch(content_sha.lower()):
+            raise IngestError(400, "content_sha256 must be 64 hex characters")
+        content_sha = content_sha.lower()
     row = _normalize_row(payload.get("row"))
     files = _normalize_files(payload.get("files"))
     return RevisionDoc(
@@ -508,6 +536,7 @@ def _parse(payload: dict) -> RevisionDoc:
         files=files,
         row_json=_canon(row),
         files_json=_canon(files),
+        content_sha256=content_sha,
     )
 
 
@@ -712,16 +741,20 @@ def _apply_sql(data_dir: Path, doc: RevisionDoc) -> int:
         conn.execute(
             """
             INSERT INTO library_revisions (
-                id, revision, op, match_key, change_seq, files_json, row_json
+                id, revision, op, match_key, change_seq, files_json, row_json,
+                content_sha256
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 revision = excluded.revision,
                 op = excluded.op,
                 match_key = excluded.match_key,
                 change_seq = excluded.change_seq,
                 files_json = excluded.files_json,
-                row_json = excluded.row_json
+                row_json = excluded.row_json,
+                content_sha256 = COALESCE(
+                    excluded.content_sha256, library_revisions.content_sha256
+                )
             """,
             (
                 doc.sid,
@@ -731,6 +764,7 @@ def _apply_sql(data_dir: Path, doc: RevisionDoc) -> int:
                 seq,
                 doc.files_json,
                 doc.row_json,
+                doc.content_sha256,
             ),
         )
         wire_row = dict(doc.row)
@@ -949,7 +983,157 @@ def _error(exc: IngestError) -> JSONResponse:
     )
 
 
-def _authorize(request: Request) -> None:
+def hold():
+    """The ingest lock. Re-entrant so an import can commit while it holds it."""
+    return _LOCK
+
+
+def allocate_snapshot_id(data_dir: Path) -> str:
+    """A free 5-character id. Caller holds the ingest lock."""
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        taken = {row[0] for row in conn.execute("SELECT id FROM snapshots")}
+        taken.update(row[0] for row in conn.execute("SELECT id FROM library_revisions"))
+    finally:
+        conn.close()
+    snaps = data_dir / "snaps"
+    for _ in range(32):
+        sid = "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_LENGTH))
+        if sid in taken:
+            continue
+        path = snaps / sid
+        if path.exists() or path.is_symlink():
+            continue
+        return sid
+    raise IngestError(500, "could not allocate a snapshot id")
+
+
+def snapshot_brief(data_dir: Path, sid: str) -> dict | None:
+    """Title, URL, and word count for one stored row. None when the id is absent."""
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT url, title, word_count FROM snapshots WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "url": row["url"],
+            "title": row["title"],
+            "word_count": row["word_count"],
+        }
+    finally:
+        conn.close()
+
+
+def imports_for_key(data_dir: Path, match_key: str) -> list[StoredImport]:
+    """Stored upserts whose match_key is this article. Caller may hold the lock."""
+    if not match_key:
+        return []
+    _refuse_if_replaced(data_dir)
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT id, revision, change_seq, content_sha256
+            FROM library_revisions
+            WHERE match_key = ? AND op = 'upsert'
+            """,
+            (match_key,),
+        ).fetchall()
+    finally:
+        conn.close()
+    found = []
+    for row in rows:
+        sha = row["content_sha256"]
+        found.append(
+            StoredImport(
+                sid=str(row["id"]),
+                revision=int(row["revision"]),
+                change_seq=int(row["change_seq"]),
+                content_sha256=str(sha) if isinstance(sha, str) and sha else None,
+            )
+        )
+    return found
+
+
+def list_changes(data_dir: Path, after: int, limit: int = _CHANGES_LIMIT) -> list[dict]:
+    """Commits with ``change_seq`` greater than ``after``, oldest first."""
+    if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+        raise IngestError(400, "after must be an integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise IngestError(400, "limit is invalid")
+    _refuse_if_replaced(data_dir)
+    conn = _connect(data_dir)
+    try:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT body_json FROM library_changes
+            WHERE change_seq > ?
+            ORDER BY change_seq
+            LIMIT ?
+            """,
+            (after, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    changes = []
+    for row in rows:
+        item = json.loads(row["body_json"])
+        if isinstance(item, dict):
+            changes.append(item)
+    return changes
+
+
+def read_snapshot_file(data_dir: Path, sid: str, rel: str) -> bytes:
+    """Bytes of one committed snapshot file. Symlinks are refused."""
+    if not isinstance(sid, str) or not ID_RE.fullmatch(sid):
+        raise IngestError(400, "id must be a 5-character snapshot id")
+    path = snapshot_relpath(rel)
+    if path is None:
+        raise IngestError(400, "path is not inside the snapshot")
+    _refuse_if_replaced(data_dir)
+    root = data_dir / "snaps" / sid
+    if root.is_symlink() or not root.is_dir():
+        raise IngestError(404, "file not found")
+    target = root / path
+    if target.is_symlink() or not target.is_file():
+        raise IngestError(404, "file not found")
+    root_real = root.resolve()
+    file_real = target.resolve()
+    if os.path.commonpath((root_real, file_real)) != str(root_real):
+        raise IngestError(400, "path is not inside the snapshot")
+    return target.read_bytes()
+
+
+def commit_new_revision(
+    data_dir: Path,
+    document: dict,
+    blobs: list[tuple[str, bytes]],
+) -> CommitResult:
+    """Install blob bytes and commit one revision.
+
+    On failure the blob refs taken here are released. A successful commit
+    releases them itself, after the snapshot directory holds the bytes.
+    """
+    started = False
+    try:
+        for digest, data in blobs:
+            started = True
+            install_blob(data_dir, digest, data)
+        return commit_document(data_dir, document)
+    except Exception:
+        if started:
+            _release_payload_blobs(data_dir, document)
+        raise
+
+
+def _authorize(request: Request, *, allow_import: bool = False) -> None:
     header = request.headers.get("authorization", "")
     scheme, _, presented = header.partition(" ")
     if scheme.lower() != "bearer" or presented == "" or presented != presented.strip():
@@ -958,8 +1142,17 @@ def _authorize(request: Request) -> None:
         ok = tokens_equal(presented, request.app.state.token)
     except UnicodeError:
         ok = False
-    if not ok:
-        raise IngestError(401, "unauthorized")
+    if ok:
+        return
+    extra = getattr(request.app.state, "import_token", "") or ""
+    if allow_import and extra:
+        try:
+            ok = tokens_equal(presented, extra)
+        except UnicodeError:
+            ok = False
+        if ok:
+            return
+    raise IngestError(401, "unauthorized")
 
 
 def _body_bytes(request: Request) -> bytes:
@@ -1002,15 +1195,30 @@ def _resolve(data_dir: Path | None, token_file: Path | None) -> tuple[Path, str]
     return data_dir, token
 
 
+def _import_token(path: Path | None) -> str:
+    """The optional importer bearer token. Empty when the file is not configured."""
+    if path is None:
+        raw = os.environ.get("AMBER_IMPORT_TOKEN_FILE", "").strip()
+        if not raw:
+            return ""
+        path = Path(raw)
+    try:
+        return read_token_file(path)
+    except TokenFileError as exc:
+        raise SystemExit(f"amber ingest: {exc}") from exc
+
+
 def create_app(
     data_dir: Path | None = None,
     token_file: Path | None = None,
+    import_token_file: Path | None = None,
 ) -> FastAPI:
     data_dir, token = _resolve(data_dir, token_file)
     prepare_store(data_dir)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.data_dir = data_dir
     app.state.token = token
+    app.state.import_token = _import_token(import_token_file)
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -1082,6 +1290,57 @@ def create_app(
                 "change_seq": result.change_seq,
             },
         )
+
+    @app.get("/v1/changes")
+    def get_changes(request: Request) -> JSONResponse:
+        try:
+            _authorize(request)
+            raw = request.query_params.get("after", "0")
+            if not raw.isdecimal():
+                raise IngestError(400, "after must be an integer")
+            changes = list_changes(request.app.state.data_dir, int(raw))
+        except IngestError as exc:
+            return _error(exc)
+        return JSONResponse(status_code=200, content={"changes": changes})
+
+    @app.get("/v1/snapshots/{sid}/files/{path:path}")
+    def get_snapshot_file(sid: str, path: str, request: Request) -> Response:
+        try:
+            _authorize(request)
+            body = read_snapshot_file(request.app.state.data_dir, sid, path)
+        except IngestError as exc:
+            return _error(exc)
+        return Response(content=body, media_type="application/octet-stream")
+
+    @app.post("/v1/import")
+    def post_import(request: Request) -> JSONResponse:
+        try:
+            _authorize(request, allow_import=True)
+            media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if media != "application/json":
+                raise IngestError(415, "Send the request as application/json.")
+            length = _content_length(
+                request, MAX_IMPORT_BODY_BYTES, "Request body is too large."
+            )
+            raw = _body_bytes(request)
+            if len(raw) != length:
+                raise IngestError(400, "Content-Length does not match body")
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, RecursionError, UnicodeError):
+                raise IngestError(400, "Body must be valid JSON.") from None
+            if not isinstance(payload, dict):
+                raise IngestError(400, 'Body must be a JSON object with a string "url".')
+            # Loaded here so importing this module does not pull the extractor.
+            from .library_import import accept_import
+
+            result = accept_import(request.app.state.data_dir, payload)
+        except IngestError as exc:
+            return _error(exc)
+        except Exception as exc:
+            log.error("import failed: %s", type(exc).__name__)
+            return JSONResponse(status_code=500, content={"detail": "import failed"})
+        return JSONResponse(status_code=result.status, content=result.body)
 
     return app
 

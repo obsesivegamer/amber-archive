@@ -1,4 +1,8 @@
-# Dell-PLX ingest only. The capture stack (Playwright, Chromium, extractors)
-# stays on the Mac. See docs/ops/dell-plx-ingest.md.
+# Dell-PLX ingest. Playwright and Chromium stay on the Mac.
+# POST /v1/import uses the same HTML extractor as the Mac, without Playwright.
+# See docs/ops/dell-plx-ingest.md and docs/ops/dell-plx-import.md.
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
+beautifulsoup4>=4.12.3
+lxml>=5.3.0
+readability-lxml>=0.8.1
