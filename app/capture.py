@@ -1134,6 +1134,11 @@ async def run_job(job_id: str) -> None:
     job["status"] = "complete"
     job["title"] = meta["title"]
     job.pop("_capture_started", None)
+    # The screenshot is already in snaps/<id>/. Push now; hourly backfill
+    # catches a Dell-PLX that was down. No-op until AMBER_INGEST_URL is set.
+    from .library_push import schedule_library_push
+
+    schedule_library_push(sid)
 
 
 async def fetch_document(url: str, *, skip_referrer_bounce: bool = False) -> dict:

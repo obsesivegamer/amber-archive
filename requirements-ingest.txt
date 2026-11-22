@@ -1,0 +1,4 @@
+# Dell-PLX ingest only. The capture stack (Playwright, Chromium, extractors)
+# stays on the Mac. See docs/ops/dell-plx-ingest.md.
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
