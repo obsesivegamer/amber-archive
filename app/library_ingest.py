@@ -108,6 +108,8 @@ class StoredImport:
     revision: int
     change_seq: int
     content_sha256: str | None
+    match_key: str = ""
+    urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1029,33 +1031,48 @@ def snapshot_brief(data_dir: Path, sid: str) -> dict | None:
         conn.close()
 
 
-def imports_for_key(data_dir: Path, match_key: str) -> list[StoredImport]:
-    """Stored upserts whose match_key is this article. Caller may hold the lock."""
-    if not match_key:
-        return []
+def stored_imports(data_dir: Path) -> list[StoredImport]:
+    """Every upsert, including the URLs on its row.
+
+    ``match_key`` is the final URL's key, which is what a later push sends.
+    The row still carries the requested URL, so an import of that address can
+    find this id.
+    """
     _refuse_if_replaced(data_dir)
     conn = _connect(data_dir)
     try:
         _ensure_schema(conn)
         rows = conn.execute(
             """
-            SELECT id, revision, change_seq, content_sha256
+            SELECT id, revision, change_seq, content_sha256, match_key, row_json
             FROM library_revisions
-            WHERE match_key = ? AND op = 'upsert'
-            """,
-            (match_key,),
+            WHERE op = 'upsert'
+            """
         ).fetchall()
     finally:
         conn.close()
     found = []
     for row in rows:
+        urls: list[str] = []
+        try:
+            body = json.loads(row["row_json"])
+        except (TypeError, json.JSONDecodeError):
+            body = None
+        if isinstance(body, dict):
+            for field in ("url", "url_normalized", "final_url"):
+                value = body.get(field)
+                if isinstance(value, str) and value:
+                    urls.append(value)
         sha = row["content_sha256"]
+        match_key = row["match_key"]
         found.append(
             StoredImport(
                 sid=str(row["id"]),
                 revision=int(row["revision"]),
                 change_seq=int(row["change_seq"]),
                 content_sha256=str(sha) if isinstance(sha, str) and sha else None,
+                match_key=match_key if isinstance(match_key, str) else "",
+                urls=tuple(urls),
             )
         )
     return found

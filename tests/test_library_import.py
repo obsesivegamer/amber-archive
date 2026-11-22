@@ -208,6 +208,49 @@ def test_import_of_different_html_for_the_same_url_conflicts(tmp_path):
     assert [row["id"] for row in reader_rows(library)] == [sid]
 
 
+def test_import_of_the_original_url_finds_the_final_url_row(tmp_path):
+    library, client = boot(tmp_path)
+    html = article("City Council Approves Bridge", MARK)
+    requested = "https://1.1.1.1/stories/bridge-src"
+    final = "https://1.1.1.1/stories/bridge"
+    created = client.post(
+        "/v1/import",
+        json=payload(html=html, url=requested, final_url=final),
+        headers=auth(IMPORT),
+    )
+    assert created.status_code == 201
+    sid = created.json()["id"]
+
+    original_only = client.post(
+        "/v1/import",
+        json=payload(html=html, url=requested),
+        headers=auth(IMPORT),
+    )
+    assert original_only.status_code == 200
+    assert original_only.json()["id"] == sid
+
+    canonical = client.post(
+        "/v1/import",
+        json=payload(html=html, url=final),
+        headers=auth(IMPORT),
+    )
+    assert canonical.status_code == 200
+    assert canonical.json()["id"] == sid
+
+    conflict = client.post(
+        "/v1/import",
+        json=payload(
+            html=article("City Council Approves Bridge", "close the ferry instead"),
+            url=requested,
+        ),
+        headers=auth(IMPORT),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["id"] == sid
+    assert change_seqs(library) == [1]
+    assert [path.name for path in (library / "snaps").iterdir() if path.is_dir()] == [sid]
+
+
 def test_import_rejects_a_private_url_and_a_different_final_site(tmp_path):
     _library, client = boot(tmp_path)
     private = client.post(

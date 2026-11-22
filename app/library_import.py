@@ -24,7 +24,7 @@ from .library_ingest import (
     allocate_snapshot_id,
     commit_new_revision,
     hold,
-    imports_for_key,
+    stored_imports,
     snapshot_brief,
 )
 from .reader import build_reader_html
@@ -132,14 +132,19 @@ def _keys(final: str, url: str) -> list[str]:
 
 
 def _match(data_dir, keys: list[str], content_sha: str) -> tuple[StoredImport | None, bool]:
+    wanted = set(keys)
     found: list[StoredImport] = []
     seen: set[str] = set()
-    for key in keys:
-        for item in imports_for_key(data_dir, key):
-            if item.sid in seen:
-                continue
-            seen.add(item.sid)
-            found.append(item)
+    for item in stored_imports(data_dir):
+        if item.sid in seen:
+            continue
+        hit = item.match_key in wanted or any(
+            article_match_key(url) in wanted for url in item.urls
+        )
+        if not hit:
+            continue
+        seen.add(item.sid)
+        found.append(item)
     exact = [item for item in found if item.content_sha256 == content_sha]
     if exact:
         return max(exact, key=lambda item: item.change_seq), True
