@@ -681,6 +681,31 @@ def _write_journal(journal_root: Path, sid: str, payload: dict) -> None:
     _fsync_dir(journal_root)
 
 
+def _warn_duplicate_match_key(conn: sqlite3.Connection, doc: RevisionDoc) -> None:
+    """Log when a new id repeats a match_key. Keep the row.
+
+    One URL with two ids, one from each machine, is cosmetic. Backfill and
+    this commit both store it. Refusing would leave the Mac copy stranded.
+    """
+    if not doc.match_key:
+        return
+    other = conn.execute(
+        """
+        SELECT id FROM library_revisions
+        WHERE match_key = ? AND id != ?
+        LIMIT 1
+        """,
+        (doc.match_key, doc.sid),
+    ).fetchone()
+    if other is None:
+        return
+    log.warning(
+        "snapshot %s repeats an article already stored as %s; keeping both",
+        doc.sid,
+        other["id"],
+    )
+
+
 def _apply_sql(data_dir: Path, doc: RevisionDoc) -> int:
     conn = _connect(data_dir)
     try:
@@ -691,6 +716,7 @@ def _apply_sql(data_dir: Path, doc: RevisionDoc) -> int:
         if doc.revision != stored_rev + 1:
             conn.rollback()
             raise IngestError(409, "revision is not stored + 1", revision=stored_rev)
+        _warn_duplicate_match_key(conn, doc)
         seq = int(
             conn.execute(
                 "SELECT COALESCE(MAX(change_seq), 0) + 1 AS n FROM library_changes"

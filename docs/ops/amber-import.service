@@ -1,0 +1,23 @@
+[Unit]
+Description=Amber library import worker
+After=amber-ingest.service
+
+[Service]
+WorkingDirectory=%h/apps/amber-archive
+Environment=PYTHONUNBUFFERED=1
+Environment=AMBER_LIBRARY_DIR=%h/apps/amber-reader/data
+Environment=AMBER_IMPORT_SCRATCH_DIR=%h/.local/share/amber/import-scratch
+Environment=AMBER_IMPORT_STATE_DIR=%h/.local/share/amber/import-state
+Environment=AMBER_IMPORT_TOKEN_FILE=%h/.config/amber/import.token
+Environment=AMBER_INGEST_TOKEN_FILE=%h/.config/amber/ingest.token
+Environment=AMBER_INGEST_URL=http://127.0.0.1:8082
+Environment=AMBER_IMPORT_HOST=127.0.0.1
+Environment=AMBER_IMPORT_PORT=8083
+# Thumbnails need Playwright Chromium. Off until that browser is installed.
+# A shot is taken before the push, or skipped. Never after the commit.
+Environment=AMBER_IMPORT_THUMBNAILS=0
+ExecStart=%h/apps/amber-archive/.venv/bin/python -m app.library_import
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

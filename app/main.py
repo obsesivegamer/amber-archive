@@ -352,6 +352,9 @@ async def import_html(request: Request):
         release_import_slot()
     if reserve_thumbnail():
         await run_reserved_thumbnail(sid, screenshot_reader)
+    from .library_push import schedule_library_push
+
+    schedule_library_push(sid)
     return RedirectResponse(f"/{sid}", status_code=303)
 
 
