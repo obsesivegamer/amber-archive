@@ -215,3 +215,22 @@ A new snapshot prints `201 K7mQp revision=1 change_seq=1`. The same command agai
 Revision 1 is the only revision this command sends. A later slice bumps the revision when the files change. Ingest answers 409, with `detail` and the stored revision, when the number is anything other than the stored revision or one past it. The same id and revision, with the same bytes, is 200.
 
 The two renames that publish an existing id leave a gap where `snaps/<id>` is missing. The journal is written first. Startup moves `ingest-previous/<id>` back if the SQL transaction did not commit. `renameat2(RENAME_EXCHANGE)` would close that gap in one syscall. Recovery is written for the two-step order, so that is the order the code uses.
+
+## Import and pull
+
+`POST /v1/import` on this same port stores HTML a browser already rendered. It uses the journal above, so the reader lists the new row without a restart. The Mac pull copies those rows back. Run pull, then the backfill, from the hourly job:
+
+```bash
+AMBER_DATA_DIR="$HOME/Documents/amber-archive/data" \
+  .venv/bin/python -m app.library_pull \
+  --ingest-url https://dell-plx-reader.tailf9612a.ts.net:8443 \
+  --token-file "$HOME/Library/Application Support/amber/ingest.token"
+AMBER_DATA_DIR="$HOME/Documents/amber-archive/data" \
+  .venv/bin/python -m app.library_push --backfill \
+  --ingest-url https://dell-plx-reader.tailf9612a.ts.net:8443 \
+  --token-file "$HOME/Library/Application Support/amber/ingest.token"
+```
+
+The pull uses the ingest token. An optional second token, `AMBER_IMPORT_TOKEN_FILE`, authorizes only `POST /v1/import`. Leave it unset and the ingest token can import too. The request, the curl, and the Mac fallback are `docs/ops/dell-plx-import.md`. The shape is `docs/architecture/dell-plx-import.md`.
+
+`requirements-ingest.txt` now includes the HTML extractor. Playwright is still not installed on Dell-PLX. After pulling this revision, install that file again and restart `amber-ingest`. Adding the column `library_revisions.content_sha256` happens on startup. The reader does not read that table.

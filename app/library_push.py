@@ -85,6 +85,25 @@ class UrllibTransport:
             raise PushError("ingest returned a body that is not a JSON object")
         return status, payload
 
+    def round_trip_bytes(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None,
+        headers: dict[str, str],
+    ) -> tuple[int, bytes]:
+        request = urllib.request.Request(
+            url,
+            data=body if body else None,
+            method=method,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
 
 def snapshot_push(
     source: Path,

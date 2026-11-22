@@ -21,6 +21,8 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_BLOB_BYTES = 32 * 1024 * 1024
 MAX_REVISION_BYTES = 1 * 1024 * 1024
 MAX_FILES = 512
+# Same cap as the Mac's POST /api/import body.
+MAX_IMPORT_BODY_BYTES = 12 * 1024 * 1024
 
 SNAPSHOT_COLUMNS = (
     "id",
@@ -74,7 +76,8 @@ CREATE TABLE IF NOT EXISTS library_revisions (
     match_key TEXT,
     change_seq INTEGER NOT NULL,
     files_json TEXT NOT NULL,
-    row_json TEXT NOT NULL
+    row_json TEXT NOT NULL,
+    content_sha256 TEXT
 );
 """
 
