@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from app.library_push import (
     PushError,
+    PushRejected,
     PushResult,
+    _push_now,
     await_pending_pushes,
     schedule_library_push,
     schedule_library_push_after,
+    thumbnail_hold_active,
 )
 
 
@@ -147,3 +151,33 @@ def test_capture_completion_is_what_schedules_the_save_push():
     assert marker in source
     tail = source.split(marker, 1)[1]
     assert "schedule_library_push(sid)" in tail.split("async def ", 1)[0]
+
+
+def test_already_stored_push_is_quiet(tmp_path, monkeypatch, caplog):
+    token = _token(tmp_path)
+    monkeypatch.setenv("AMBER_INGEST_URL", "http://127.0.0.1:8082")
+    monkeypatch.setenv("AMBER_INGEST_TOKEN_FILE", str(token))
+
+    def fake(*_args, **_kwargs):
+        raise PushRejected(409, "stored revision does not match this body")
+
+    monkeypatch.setattr("app.library_push.push_snapshot", fake)
+    with caplog.at_level(logging.DEBUG, logger="amber.library_push"):
+        _push_now("K7mQp")
+    assert "already stored" in caplog.text
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_thumbnail_hold_covers_the_render_and_then_clears(tmp_data):
+    from app import api, db
+
+    api._thumbnails_waiting = 1
+    seen: dict[str, bool] = {}
+
+    async def render(sid: str) -> None:
+        seen["held"] = thumbnail_hold_active(db.DATA_DIR, sid)
+
+    asyncio.run(api.run_reserved_thumbnail("K7mQp", render))
+    assert seen["held"] is True
+    assert thumbnail_hold_active(db.DATA_DIR, "K7mQp") is False
+    assert api._thumbnails_waiting == 0

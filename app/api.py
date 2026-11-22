@@ -23,7 +23,11 @@ from .candidates import dismiss_candidate, get_candidates_payload, save_candidat
 from .config import ID_ALPHABET, ID_LENGTH
 from .import_child import TooComplex, blocked_for, importing, ingest_in_child
 from .ingest import screenshot_reader
-from .library_push import schedule_library_push_after
+from .library_push import (
+    clear_thumbnail_hold,
+    mark_thumbnail_hold,
+    schedule_library_push_after,
+)
 from .security import article_match_key, normalize_url, validate_public_http_url
 
 log = logging.getLogger("amber.api")
@@ -655,14 +659,20 @@ def reserve_thumbnail() -> bool:
 
 
 async def run_reserved_thumbnail(sid: str, render) -> None:
-    """Render under the one-Chromium-at-a-time gate; never raises."""
+    """Render under the one-Chromium-at-a-time gate; never raises.
+
+    The hold keeps hourly backfill from publishing revision 1 before
+    ``screenshot.jpg`` is on disk. The hold is cleared even when the shot fails.
+    """
     global _thumbnails_waiting
+    mark_thumbnail_hold(sid)
     try:
         async with _screenshot_gate:
             await render(sid)
-    except Exception:
-        log.exception("reader screenshot failed for imported snapshot %s", sid)
+    except Exception as exc:
+        log.error("reader screenshot failed for %s (%s)", sid, type(exc).__name__)
     finally:
+        clear_thumbnail_hold(sid)
         _thumbnails_waiting -= 1
 
 
@@ -725,6 +735,7 @@ async def import_page(request: Request):
 
     thumbnail_task = None
     if reserve_thumbnail():
+        mark_thumbnail_hold(sid)
         thumbnail_task = asyncio.create_task(run_reserved_thumbnail(sid, screenshot_reader))
         _thumbnail_tasks.add(thumbnail_task)
         thumbnail_task.add_done_callback(_thumbnail_tasks.discard)

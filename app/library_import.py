@@ -108,16 +108,25 @@ def open_library_ro(db_path: Path) -> sqlite3.Connection:
 
 
 def _library_has_id(conn: sqlite3.Connection, sid: str) -> bool:
-    for sql in (
-        "SELECT 1 FROM snapshots WHERE id = ?",
-        "SELECT 1 FROM library_revisions WHERE id = ?",
-    ):
-        try:
-            if conn.execute(sql, (sid,)).fetchone():
-                return True
-        except sqlite3.OperationalError:
-            continue
-    return False
+    """True when the live store already has this id.
+
+    A missing ``snapshots`` table, a locked database, or a file that is not a
+    database raises. Treating that as "id is free" would let a new Z id
+    overwrite a legacy row. A missing ``library_revisions`` table only means
+    ingest has not created it yet; the snapshots query is the legacy-id check.
+    """
+    if conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone():
+        return True
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM library_revisions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    return row is not None
 
 
 def _scratch_has(sid: str) -> bool:
@@ -148,7 +157,9 @@ def allocate_dell_id(
     mint = new_id or (lambda: new_snapshot_id("dell"))
     taken_in_scratch = scratch_has or _scratch_has
     db_path = library_dir / "amber.sqlite3"
-    conn = open_library_ro(db_path) if db_path.is_file() else None
+    if not db_path.is_file():
+        raise RuntimeError("library database is missing")
+    conn = open_library_ro(db_path)
     try:
         with _reserve_lock:
             for _ in range(_ALLOC_TRIES * 4):
@@ -184,10 +195,7 @@ def _matches(address: str, conn: sqlite3.Connection) -> list[dict]:
     ``library_revisions.match_key`` covers a row the LIKE candidate query
     missed; the snapshots table on Dell-PLX has the URL columns either way.
     """
-    try:
-        found = list(_find_matches(address, conn=conn))
-    except sqlite3.OperationalError:
-        found = []
+    found = list(_find_matches(address, conn=conn))
     key = article_match_key(address)
     if not key:
         return found
@@ -201,7 +209,9 @@ def _matches(address: str, conn: sqlite3.Connection) -> list[dict]:
             """,
             (key,),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         return found
     have = {snap["id"] for snap in found}
     for row in rows:
@@ -213,10 +223,15 @@ def _matches(address: str, conn: sqlite3.Connection) -> list[dict]:
 
 
 def archived_copy(library_dir: Path, addresses: list[str]) -> dict | None:
-    """A complete usable snapshot of one of ``addresses`` in the shared library."""
+    """A complete snapshot of one of ``addresses`` in the shared library.
+
+    Usable or not. A short page is still that page: a retry must not mint a
+    second id. The Mac route still requires a usable copy; this worker does
+    not. A missing database raises, so dedup does not silently turn off.
+    """
     db_path = library_dir / "amber.sqlite3"
     if not db_path.is_file():
-        return None
+        raise RuntimeError("library database is missing")
     conn = open_library_ro(db_path)
     try:
         snaps = library_dir / "snaps"
@@ -230,8 +245,8 @@ def archived_copy(library_dir: Path, addresses: list[str]) -> dict | None:
                 ordered.append(snap)
         if not ordered:
             return None
-        found, status, usable = _best_match(ordered, snaps_dir=snaps)
-        if found is not None and status == "complete" and usable:
+        found, status, _usable = _best_match(ordered, snaps_dir=snaps)
+        if found is not None and status == "complete":
             return found
         return None
     finally:
@@ -279,9 +294,14 @@ def _write_ledger(path: Path, rows: list[tuple[float, int]]) -> None:
     os.replace(tmp, path)
 
 
-def charge_budget(state_dir: Path, nbytes: int) -> None:
-    """Same 300 MiB / 24 h cap as the Mac, stored outside the shared library."""
+def charge_budget(state_dir: Path, nbytes: int) -> int:
+    """Same 300 MiB / 24 h cap as the Mac, stored outside the shared library.
+
+    Returns the ledger stamp. A later 503 refunds that stamp. A 422 keeps it:
+    the bytes were still parsed.
+    """
     path = _ledger_path(state_dir)
+    stamp = int(time.time())
     with _budget_lock:
         try:
             rows = _read_ledger(path)
@@ -294,11 +314,24 @@ def charge_budget(state_dir: Path, nbytes: int) -> None:
                 f"Daily import budget used up ({MAX_IMPORT_BYTES_PER_DAY // (1024 * 1024)} MB "
                 "of HTML per 24 hours). Try again later.",
             )
-        rows.append((time.time(), nbytes))
+        rows.append((stamp, nbytes))
         try:
             _write_ledger(path, rows)
         except OSError as exc:
             raise HTTPException(503, "Import budget ledger cannot be read.") from exc
+    return stamp
+
+
+def refund_budget(state_dir: Path, stamp: int, nbytes: int) -> None:
+    """Remove one charge. Used when the client will retry the same bytes."""
+    path = _ledger_path(state_dir)
+    with _budget_lock:
+        rows = _read_ledger(path)
+        for index in range(len(rows) - 1, -1, -1):
+            if rows[index] == (stamp, nbytes):
+                del rows[index]
+                break
+        _write_ledger(path, rows)
 
 
 def _separate(left: Path, right: Path, left_name: str, right_name: str) -> None:
@@ -402,7 +435,7 @@ async def _freeze_and_commit(
         for _attempt in range(_ALLOC_TRIES):
             try:
                 sid = await asyncio.to_thread(allocate_dell_id, library_dir)
-            except RuntimeError:
+            except (RuntimeError, sqlite3.Error):
                 raise HTTPException(503, "Could not allocate a snapshot id.") from None
             cleanup.append(sid)
 
@@ -442,9 +475,11 @@ async def _freeze_and_commit(
                     release_dell_id(sid)
                     cleanup.remove(sid)
                     continue
-                if exc.status == 429 or exc.status >= 500:
+                if exc.status in {408, 429} or exc.status >= 500:
                     raise HTTPException(503, "Library ingest is unavailable.") from None
-                raise HTTPException(502, "Library ingest rejected the snapshot.") from None
+                # 400, 401, 413 and any other 4xx will not succeed on retry.
+                # Gift Links treats 422 as permanent and retries every 5xx.
+                raise HTTPException(422, "Library ingest rejected the snapshot.") from None
             except (PushError, urllib.error.URLError, TimeoutError, OSError):
                 raise HTTPException(503, "Library ingest is unavailable.") from None
             snap = await asyncio.to_thread(db.get_snapshot, sid)
@@ -530,6 +565,8 @@ def create_app(
     _separate(library_dir, scratch_dir, "library", "scratch")
     _separate(library_dir, state_dir, "library", "state")
     _separate(scratch_dir, state_dir, "scratch", "state")
+    if not (library_dir / "amber.sqlite3").is_file():
+        raise SystemExit("amber import: library database is missing")
     state_dir.mkdir(parents=True, exist_ok=True)
     bind_scratch(scratch_dir)
 
@@ -578,45 +615,68 @@ def create_app(
                 {article_match_key(clean), article_match_key(final)} - {""}
             ) or [clean]
             async with request.app.state.locks.hold(keys):
-                if not force:
-                    existing = await asyncio.to_thread(
-                        archived_copy,
-                        request.app.state.library_dir,
-                        list(dict.fromkeys((clean, final))),
-                    )
-                    if existing is not None:
-                        return JSONResponse(
-                            {"detail": "already archived", "id": existing["id"]},
-                            status_code=409,
-                        )
-                await asyncio.to_thread(
-                    charge_budget, request.app.state.state_dir, html_bytes
-                )
+                charged: int | None = None
                 try:
-                    payload = await _freeze_and_commit(
-                        library_dir=request.app.state.library_dir,
-                        scratch=request.app.state.scratch_dir,
-                        ingest_url=request.app.state.ingest_url,
-                        ingest_token=request.app.state.ingest_token,
-                        transport=request.app.state.transport,
-                        hooks=request.app.state.hooks,
-                        thumbnails=request.app.state.thumbnails,
-                        html=html,
-                        clean=clean,
-                        title=title,
-                        final=final,
+                    if not force:
+                        try:
+                            existing = await asyncio.to_thread(
+                                archived_copy,
+                                request.app.state.library_dir,
+                                list(dict.fromkeys((clean, final))),
+                            )
+                        except (RuntimeError, sqlite3.Error) as exc:
+                            log.error("library read failed (%s)", type(exc).__name__)
+                            raise HTTPException(
+                                503, "Could not read the library."
+                            ) from None
+                        if existing is not None:
+                            return JSONResponse(
+                                {"detail": "already archived", "id": existing["id"]},
+                                status_code=409,
+                            )
+                    charged = await asyncio.to_thread(
+                        charge_budget, request.app.state.state_dir, html_bytes
                     )
-                except TooComplex as exc:
-                    raise HTTPException(
-                        422, f"Page too complex to import: {exc}"
-                    ) from None
-                except HTTPException:
+                    try:
+                        payload = await _freeze_and_commit(
+                            library_dir=request.app.state.library_dir,
+                            scratch=request.app.state.scratch_dir,
+                            ingest_url=request.app.state.ingest_url,
+                            ingest_token=request.app.state.ingest_token,
+                            transport=request.app.state.transport,
+                            hooks=request.app.state.hooks,
+                            thumbnails=request.app.state.thumbnails,
+                            html=html,
+                            clean=clean,
+                            title=title,
+                            final=final,
+                        )
+                    except TooComplex as exc:
+                        raise HTTPException(
+                            422, f"Page too complex to import: {exc}"
+                        ) from None
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        log.error("import failed (%s)", type(exc).__name__)
+                        raise HTTPException(
+                            422, "Could not turn that HTML into a snapshot."
+                        ) from None
+                except HTTPException as exc:
+                    if exc.status_code == 503 and charged is not None:
+                        try:
+                            await asyncio.to_thread(
+                                refund_budget,
+                                request.app.state.state_dir,
+                                charged,
+                                html_bytes,
+                            )
+                        except Exception as refund_exc:
+                            log.error(
+                                "budget refund failed (%s)",
+                                type(refund_exc).__name__,
+                            )
                     raise
-                except Exception as exc:
-                    log.error("import failed (%s)", type(exc).__name__)
-                    raise HTTPException(
-                        422, "Could not turn that HTML into a snapshot."
-                    ) from None
             return JSONResponse(payload, status_code=201)
         finally:
             _release(request.app)

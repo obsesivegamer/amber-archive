@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -29,6 +30,12 @@ from .library_contract import ID_RE, TokenFileError, read_token_file, sha256_hex
 from .security import article_match_key
 
 log = logging.getLogger("amber.library_push")
+
+# While this file is younger than the hold, backfill leaves the id alone.
+# Push-on-save is waiting for screenshot.jpg. Publishing revision 1 first
+# would omit it, and this build does not write revision 2.
+_HOLD_DIR = "push-hold"
+_HOLD_S = 90
 
 # In-flight push tasks. Held so the event loop does not drop them, and so
 # tests can wait until a save's push has finished.
@@ -304,6 +311,58 @@ def stored_ids(ingest_url: str, token: str, *, transport: UrllibTransport | None
     return found
 
 
+def _hold_path(source: Path, sid: str) -> Path | None:
+    if not isinstance(sid, str) or not ID_RE.fullmatch(sid):
+        return None
+    return source / _HOLD_DIR / sid
+
+
+def mark_thumbnail_hold(sid: str, source: Path | None = None) -> None:
+    """Tell backfill not to publish this id until the thumbnail attempt ends."""
+    path = _hold_path(source or db.DATA_DIR, sid)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("thumbnail\n", encoding="utf-8")
+    except OSError as exc:
+        log.error("thumbnail hold for %s failed (%s)", sid, type(exc).__name__)
+
+
+def clear_thumbnail_hold(sid: str, source: Path | None = None) -> None:
+    path = _hold_path(source or db.DATA_DIR, sid)
+    if path is None:
+        return
+    try:
+        if path.is_symlink():
+            return
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.error("thumbnail hold clear for %s failed (%s)", sid, type(exc).__name__)
+
+
+def thumbnail_hold_active(source: Path, sid: str, *, now: float | None = None) -> bool:
+    path = _hold_path(source, sid)
+    if path is None or path.is_symlink() or not path.is_file():
+        return False
+    age = (time.time() if now is None else now) - path.stat().st_mtime
+    return age < _HOLD_S
+
+
+def _already_stored(exc: PushRejected) -> bool:
+    """Revision 1 is already on Dell-PLX. A different body is not an error.
+
+    Push-on-save and backfill can both send the same id. The first write
+    wins. The second is success: this build does not replace revision 1.
+    """
+    if exc.status != 409:
+        return False
+    return (
+        "stored revision does not match" in exc.detail
+        or "revision is not stored + 1" in exc.detail
+    )
+
+
 def _push_settings() -> tuple[str, str] | None:
     """Ingest URL and bearer token from the environment, or None.
 
@@ -333,6 +392,16 @@ def _push_now(sid: str) -> None:
     url, token = settings
     try:
         result = push_snapshot(db.DATA_DIR, sid, url, token)
+    except PushRejected as exc:
+        if _already_stored(exc):
+            log.info("snapshot %s is already stored", sid)
+            return
+        log.error(
+            "push of %s failed (%s); hourly backfill will retry",
+            sid,
+            type(exc).__name__,
+        )
+        return
     except Exception as exc:
         log.error(
             "push of %s failed (%s); hourly backfill will retry",
@@ -411,7 +480,12 @@ def backfill(
 
     An id whose URL is already stored under a different id is still pushed.
     ``GET /v1/revisions`` does not return URLs, and refusing would leave that
-    Mac id off the phone forever. Ingest logs the repeated match_key.
+    Mac id off the phone forever. Ingest logs the repeated article and keeps
+    both rows.
+
+    An id with a fresh thumbnail hold is left for the next run. It is not a
+    failure. Push-on-save publishes that id after the thumbnail attempt, and
+    a repeat of an id Dell-PLX already has is success.
     """
     client = transport or UrllibTransport()
     have = stored_ids(ingest_url, token, transport=client)
@@ -419,12 +493,19 @@ def backfill(
     for sid in complete_ids(source):
         if sid in have:
             continue
+        if thumbnail_hold_active(source, sid):
+            log.info("snapshot %s still waiting on its thumbnail", sid)
+            continue
         try:
             folder = source / "snaps" / sid
             if folder.is_symlink() or not folder.is_dir():
                 raise PushError(f"no snapshot directory for {sid}")
             result = push_snapshot(source, sid, ingest_url, token, transport=client)
         except PushRejected as exc:
+            if _already_stored(exc):
+                log.info("snapshot %s is already stored", sid)
+                outcome.append(BackfillItem(sid, True, 200, ""))
+                continue
             outcome.append(BackfillItem(sid, False, exc.status, exc.detail))
             continue
         except (PushError, urllib.error.URLError, TimeoutError, OSError) as exc:

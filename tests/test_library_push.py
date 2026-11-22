@@ -898,3 +898,52 @@ def test_backfill_pushes_a_cosmetic_duplicate(tmp_path, caplog):
     assert SID in caplog.text
     assert "ft.com" not in caplog.text
     assert {row["id"] for row in reader_rows(library)} == {SID, SIBLING}
+
+
+def test_backfill_skips_a_fresh_thumbnail_hold(tmp_path, caplog):
+    import logging
+    import os
+    import time
+
+    from app.library_push import mark_thumbnail_hold
+
+    mac = tmp_path / "mac"
+    write_mac(mac, SID)
+    mark_thumbnail_hold(SID, mac)
+    library, _token, app = boot(tmp_path)
+    transport = _AppTransport(app)
+    with caplog.at_level(logging.INFO, logger="amber.library_push"):
+        waiting = backfill(mac, "http://ingest", TOKEN, transport=transport)
+    assert waiting == []
+    assert "still waiting" in caplog.text
+    assert reader_rows(library) == []
+    hold = mac / "push-hold" / SID
+    stale = time.time() - 120
+    os.utime(hold, (stale, stale))
+    pushed = backfill(mac, "http://ingest", TOKEN, transport=transport)
+    assert [(item.sid, item.ok) for item in pushed] == [(SID, True)]
+    assert {row["id"] for row in reader_rows(library)} == {SID}
+
+
+def test_backfill_treats_an_already_stored_revision_as_success(tmp_path, caplog):
+    import logging
+
+    mac = tmp_path / "mac"
+    write_mac(mac, SID)
+    _library, _token, app = boot(tmp_path)
+    inner = _AppTransport(app)
+
+    class Conflict:
+        def round_trip(self, method, url, body, headers):
+            path = urlparse(url).path
+            if method == "GET" and path == "/v1/revisions":
+                return 200, {"revisions": []}
+            if method == "POST" and path == "/v1/revisions":
+                return 409, {"detail": "stored revision does not match this body"}
+            return inner.round_trip(method, url, body, headers)
+
+    with caplog.at_level(logging.DEBUG, logger="amber.library_push"):
+        items = backfill(mac, "http://ingest", TOKEN, transport=Conflict())
+    assert [(item.sid, item.ok, item.status) for item in items] == [(SID, True, 200)]
+    assert "already stored" in caplog.text
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)

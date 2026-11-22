@@ -23,6 +23,8 @@ Pull the commit in each checkout and restart the app so new ids come from the Ma
 
 Push-on-save reads two variables. Set them on the app's LaunchAgent, not only on the hourly job. The URL is the tailnet ingest port, the same one `--backfill` already uses. `http://127.0.0.1:8082` is the ingest bind on Dell-PLX; it is not reachable from the Mac.
 
+An import's thumbnail can still be rendering when the hourly backfill runs. The app writes `push-hold/<id>` for that wait, and backfill leaves the id for the next run. That skip is not a failure and does not show up in `backfill N ok, 0 failed`. Push-on-save publishes revision 1 after the thumbnail attempt. A second push of an id Dell-PLX already stored is success. It is logged as already stored, not as an error, and it does not replace revision 1.
+
 ```bash
 AMBER_INGEST_URL=https://dell-plx-reader.tailf9612a.ts.net:8443
 AMBER_INGEST_TOKEN_FILE="$HOME/Library/Application Support/amber/ingest.token"
@@ -44,7 +46,7 @@ Run that by hand once the app is on this commit. The line to require is `backfil
 
 ## Dell-PLX
 
-WSL Ubuntu, user `jerem`, systemd user units. The data directory stays on the ext4 disk under `/home/jerem`, not `/mnt/c`. Ingest is already `amber-ingest.service` on `127.0.0.1:8082`. Leave it. This adds a second unit.
+WSL Ubuntu, user `jerem`, systemd user units. The data directory stays on the ext4 disk under `/home/jerem`, not `/mnt/c`. Ingest stays `amber-ingest.service` on `127.0.0.1:8082`. Restart it after the checkout so it loads this commit. This adds a second unit.
 
 Inside the Ubuntu distro, as `jerem`:
 
@@ -53,18 +55,29 @@ cd "$HOME/apps/amber-archive"
 git fetch origin
 git checkout <this-commit>
 .venv/bin/pip install -r requirements-import.txt
+systemctl --user restart amber-ingest
 ```
 
-`requirements-import.txt` uses the same pins as the Mac `requirements.txt` for the freezer and for FastAPI. It installs the Playwright Python package because the import contract lives in `app/api.py`. It does not install Chromium. The unit sets `AMBER_IMPORT_THUMBNAILS=0`, so a missing browser does not delay an import. Turn thumbnails on only after `playwright install chromium`, and only then set `AMBER_IMPORT_THUMBNAILS=1`. A thumbnail is taken before the push or skipped. Nothing adds one after the commit.
+Restart ingest after the checkout. `amber-ingest.service` runs from this same checkout, so the process keeps the previous code until it is restarted. The duplicate warning (`snapshot … repeats an article already stored as …; keeping both`) is in that process.
 
-The ingest token is already at `~/.config/amber/ingest.token`. Do not rotate it for this step. Create a different import token:
+`requirements-import.txt` pins fastapi, uvicorn, beautifulsoup4, lxml, readability-lxml, pillow and playwright to exact versions. It installs the Playwright Python package because the import contract lives in `app/api.py`. It does not install Chromium. The unit sets `AMBER_IMPORT_THUMBNAILS=0`, so a missing browser does not delay an import. Turn thumbnails on only after `playwright install chromium`, and only then set `AMBER_IMPORT_THUMBNAILS=1`. A thumbnail is taken before the push or skipped. Nothing adds one after the commit.
+
+The ingest token is already at `~/.config/amber/ingest.token`. Do not rotate it for this step. Create the import token only when the file is absent. A second run of this step must leave the existing token in place:
 
 ```bash
 umask 077
 mkdir -p "$HOME/.config/amber" "$HOME/.local/share/amber/import-scratch" "$HOME/.local/share/amber/import-state"
-python3 -c 'import secrets, pathlib; pathlib.Path.home().joinpath(".config/amber/import.token").write_text(secrets.token_urlsafe(32) + "\n")'
-chmod 600 "$HOME/.config/amber/import.token" "$HOME/.config/amber/ingest.token"
+import_token="$HOME/.config/amber/import.token"
+if [ -e "$import_token" ]; then
+  echo "import.token already exists; leaving it"
+else
+  python3 -c 'import secrets, pathlib; pathlib.Path.home().joinpath(".config/amber/import.token").write_text(secrets.token_urlsafe(32) + "\n")'
+fi
+chmod 600 "$import_token" "$HOME/.config/amber/ingest.token"
+test -s "$import_token"
 ```
+
+`test -s` fails the step when the file is missing or empty. `chmod` does not replace the bytes.
 
 The scratch directory and the budget file are outside `~/apps/amber-reader/data`. The worker opens `amber.sqlite3` there with `mode=ro` only. A `mode=ro` open may create `-wal` and `-shm` beside the database, same as the reader, so this process runs as `jerem`.
 
@@ -81,12 +94,26 @@ curl -sS http://127.0.0.1:8083/healthz
 Publish the loopback port on the tailnet. This is a third HTTPS port on the reader node. Leave 443 on the reader (`8081`) and 8443 on ingest (`8082`).
 
 ```bash
+set -o pipefail
 tailscale serve --bg --https=8444 http://127.0.0.1:8083
+tailscale serve status | grep -F '8444' | grep -F '127.0.0.1:8083'
+if tailscale funnel status | grep -F '8444'; then
+  echo "8444 is on funnel; run: tailscale funnel --https=8444 off" >&2
+  exit 1
+fi
 ```
 
-That serves `https://dell-plx-reader.tailf9612a.ts.net:8444`. Use `tailscale serve`. `tailscale funnel` would put the import route on the public internet.
+`serve status` has to show `8444` proxying to `127.0.0.1:8083`. If the grep fails, the serve did not apply. Stop. Do not continue to the grant. Use `tailscale serve`. `tailscale funnel` would put the import route on the public internet. The funnel check fails the step when 8444 is listed there.
 
-Then grant that port only to the Grok Bot node. The exact grant belongs in the tailnet policy; the shape is a source of the Grok Bot node, a destination of `dell-plx-reader`, and TCP `8444` only. Do not grant the port to the whole tailnet. The reader session cookie is for the same tailnet name on another port, and cookies are not isolated by port, which is why the worker ignores cookies and why the grant is narrow.
+Then grant that port only to the Grok Bot node. A default allow-all policy, or a rule that already allows `dell-plx-reader:*` or any source to TCP `8444`, does not become narrow because a second grant exists. Read the current policy first. If 8444 is already reachable from more than the Grok Bot node, change that rule before relying on a new one. The shape of the grant, once the wider rule is gone, is a source of the Grok Bot node, a destination of `dell-plx-reader`, and TCP `8444` only.
+
+Verify it. From a tailnet node that is not the Grok Bot, this must fail to connect:
+
+```bash
+nc -vz -w 3 dell-plx-reader.tailf9612a.ts.net 8444
+```
+
+From the Grok Bot node the same command must succeed. If the non-Grok check connects, the port is still exposed and the step is not done. The bearer token still protects the route, and the reader session cookie is for the same tailnet name on another port. Cookies are not isolated by port, which is why the worker ignores cookies and why the grant has to be checked, not assumed.
 
 Copy the import token to the Grok Bot box the same way the ingest token was copied to the Mac, mode `0600`, and do not put the ingest token on that box. To rotate: write a new `import.token` on Dell-PLX, install that file on the Grok Bot box, restart the worker, then delete the old file. Gift Links retries cover the overlap. Restart the worker after the file changes; it reads the token at startup.
 
@@ -98,9 +125,9 @@ Not this step. When it is cut over, and only after the Mac backfill above has re
 
 - Base URL `https://dell-plx-reader.tailf9612a.ts.net:8444`, path `POST /api/import`, bearer import token.
 - Same JSON body as today. Do not send `force` on a retry.
-- Treat `201` and `409 {"detail": "already archived", "id": ...}` as success.
-- `400`, `415`, and `422` are permanent and get reported.
-- Network errors, `5xx`, and `429` retry with backoff. Client timeout at least 90 s.
+- Treat `201` and `409 {"detail": "already archived", "id": ...}` as success. That `409` is any complete snapshot of the URL, including a page that is not usable (under 120 words, or a title that is only the site name). A retry does not get a second id. The Mac `POST /api/import` still requires a usable snapshot; this worker does not.
+- `400`, `415`, and `422` are permanent and get reported. `422` with `Library ingest rejected the snapshot.` means ingest refused the body (its 400, 401, 413, or another 4xx). Retrying it will not succeed.
+- `503` (`Library ingest is unavailable.`, `Could not allocate a snapshot id.`, `Could not read the library.`) and `429` retry with backoff. Those `503`s do not keep the import budget charge. Client timeout at least 90 s. Network errors retry the same way.
 - Keep the HTML until Phase 2 is live, or 14 days, whichever is longer. No fallback to the Mac.
 - Alert after 6 hours of failed retries.
 

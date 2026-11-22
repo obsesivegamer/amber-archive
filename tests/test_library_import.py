@@ -659,3 +659,99 @@ def test_worker_refuses_the_reader_and_ingest_ports(monkeypatch):
     monkeypatch.setenv("AMBER_IMPORT_PORT", "8081")
     with pytest.raises(SystemExit, match="8081"):
         library_import.main()
+
+
+def test_worker_refuses_to_start_without_the_library_database(tmp_path):
+    library = tmp_path / "library"
+    library.mkdir()
+    with pytest.raises(SystemExit, match="missing"):
+        create_app(
+            library_dir=library,
+            scratch_dir=tmp_path / "scratch",
+            state_dir=tmp_path / "state",
+            import_token=IMPORT_TOKEN,
+            ingest_token=TOKEN,
+        )
+
+
+def _short_html() -> str:
+    words = " ".join(["note"] * 80)
+    return (
+        "<!doctype html><html><head><title>A short note</title></head>"
+        f"<body><article><h1>A short note</h1><p>{words}</p></article></body></html>"
+    )
+
+
+def test_short_page_retry_keeps_one_id(worker):
+    app, library, _transport = worker
+    html = _short_html()
+    with TestClient(app) as client:
+        first = _post(client, html=html)
+        second = _post(client, html=html)
+    assert first.status_code == 201, first.text
+    assert first.json()["usable"] is False
+    assert second.status_code == 409
+    assert second.json() == {"detail": "already archived", "id": first.json()["id"]}
+    assert _ids(library) == [first.json()["id"]]
+
+
+def test_library_read_error_is_retryable_and_stores_nothing(worker, monkeypatch):
+    def boom(_path):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("app.library_import.open_library_ro", boom)
+    app, library, _transport = worker
+    with TestClient(app) as client:
+        response = _post(client)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Could not read the library."
+    assert _ids(library) == []
+    assert not (app.state.state_dir / "budget.json").exists()
+
+
+def test_allocate_database_error_is_503_and_refunds_the_budget(worker, monkeypatch):
+    def boom(_library_dir, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr("app.library_import.allocate_dell_id", boom)
+    app, library, _transport = worker
+    with TestClient(app) as client:
+        response = _post(client)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Could not allocate a snapshot id."
+    assert _ids(library) == []
+    ledger = json.loads((app.state.state_dir / "budget.json").read_text(encoding="utf-8"))
+    assert ledger == []
+
+
+def test_ingest_outage_refunds_the_budget(worker):
+    app, library, transport = worker
+
+    def round_trip(_method, _url, _body, _headers):
+        raise ConnectionError("ingest down")
+
+    transport.round_trip = round_trip
+    with TestClient(app) as client:
+        response = _post(client)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Library ingest is unavailable."
+    ledger = json.loads((app.state.state_dir / "budget.json").read_text(encoding="utf-8"))
+    assert ledger == []
+    assert _ids(library) == []
+
+
+def test_ingest_400_is_a_permanent_422(worker):
+    app, library, transport = worker
+    original = transport.round_trip
+
+    def round_trip(method, url, body, headers):
+        if method == "POST" and urlparse(url).path == "/v1/revisions":
+            return 400, {"detail": "unknown field"}
+        return original(method, url, body, headers)
+
+    transport.round_trip = round_trip
+    with TestClient(app) as client:
+        response = _post(client)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Library ingest rejected the snapshot."
+    assert _ids(library) == []

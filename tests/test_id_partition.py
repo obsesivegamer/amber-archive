@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
+
 from app.config import DELL_ID_PREFIX, ID_ALPHABET, ID_LENGTH
 from app.db import allocate_id, new_snapshot_id
 from app.library_contract import ID_RE, SNAPSHOTS_DDL
@@ -92,3 +94,26 @@ def test_dell_allocator_skips_an_id_already_in_the_live_store(tmp_path):
     finally:
         if sid:
             release_dell_id(sid)
+
+
+def test_dell_allocator_refuses_a_missing_library_database(tmp_path):
+    library = tmp_path / "library"
+    library.mkdir()
+    with pytest.raises(RuntimeError, match="missing"):
+        allocate_dell_id(
+            library,
+            new_id=lambda: "ZAAAA",
+            scratch_has=lambda _sid: False,
+        )
+
+
+def test_dell_allocator_refuses_when_the_store_cannot_be_queried(tmp_path):
+    library = tmp_path / "library"
+    library.mkdir()
+    sqlite3.connect(library / "amber.sqlite3").close()
+    with pytest.raises(sqlite3.OperationalError):
+        allocate_dell_id(
+            library,
+            new_id=lambda: "ZAAAA",
+            scratch_has=lambda _sid: False,
+        )
