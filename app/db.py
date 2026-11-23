@@ -6,8 +6,10 @@ import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import quote
 
+from . import config
 from .config import DATA_DIR, DB_PATH, DELL_ID_PREFIX, ID_ALPHABET, ID_LENGTH, SNAPS_DIR
 from .extract import PAYWALL_WORD_LIMIT, article_is_paywalled
 
@@ -53,17 +55,58 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+def readonly_library() -> bool:
+    """The open database is the shared library and this process must not write it."""
+    if not config.ingest_library():
+        return False
+    try:
+        return Path(DB_PATH).resolve() == config.configured_library_db()
+    except OSError:
+        return False
+
+
+def paywalled_bool(flag: object, word_count: object) -> bool:
+    """The boolean ingest requires. A missing flag uses the word-count rule."""
+    if flag is None:
+        if isinstance(word_count, bool) or not isinstance(word_count, int):
+            count = None
+        else:
+            count = word_count
+        return article_is_paywalled(count)
+    return bool(flag)
+
+
 def connect() -> sqlite3.Connection:
     """Open the archive database.
 
     Unlike a plain ``sqlite3.Connection``, ``with connect() as db:`` commits
     or rolls back and then *closes* the connection when the block ends. Do
     not reuse ``db`` after the block, and copy rows out before leaving it.
+    A read opens a new connection; this process does not keep one.
     """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=_ClosingConnection)
+    if readonly_library():
+        return _connect_library_ro()
+    return _connect_readwrite(DB_PATH)
+
+
+def _connect_readwrite(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False, factory=_ClosingConnection)
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _connect_library_ro() -> sqlite3.Connection:
+    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_ClosingConnection)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA foreign_keys=ON")
     except BaseException:
         conn.close()
@@ -329,6 +372,9 @@ def _ensure_candidates_match_index(db: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
+    if readonly_library():
+        _init_app_state()
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SNAPS_DIR.mkdir(parents=True, exist_ok=True)
     with connect() as db:
@@ -339,20 +385,266 @@ def init_db() -> None:
         db.commit()
 
 
+_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    url_normalized TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    title TEXT,
+    final_url TEXT,
+    snapshot_id TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+_JOB_FIELDS = {"status", "error", "title", "final_url", "snapshot_id"}
+
+
+def _outside_library(path: Path) -> None:
+    library = Path(DATA_DIR).resolve()
+    if path == library or path == library / "amber.sqlite3" or library in path.parents:
+        raise RuntimeError(f"{path} must be outside the library directory")
+
+
+def _state_file() -> Path:
+    path = config.app_state_path()
+    _outside_library(path)
+    return path
+
+
+def scratch_dir() -> Path:
+    path = config.scratch_path()
+    library = Path(DATA_DIR).resolve()
+    if path == library or library in path.parents or path in library.parents:
+        raise RuntimeError("scratch directory must be separate from the library")
+    state = _state_file()
+    if state == path or path in state.parents or state.is_relative_to(path):
+        raise RuntimeError("AMBER_APP_STATE must not live inside the scratch directory")
+    return path
+
+
+def _init_app_state() -> None:
+    path = _state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_JOBS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _state_conn() -> sqlite3.Connection:
+    return sqlite3.connect(_state_file(), check_same_thread=False, factory=_ClosingConnection)
+
+
+def prepare_scratch() -> None:
+    root = scratch_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "snaps").mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(root / "amber.sqlite3")
+    try:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sweep_scratch() -> None:
+    """Drop unpublished scratch snapshots. The library is not in this directory."""
+    from .library_import import wipe_scratch_tree
+
+    root = scratch_dir()
+    if root.exists():
+        wipe_scratch_tree(root)
+
+
+def _scratch_conn() -> sqlite3.Connection:
+    prepare_scratch()
+    return _connect_readwrite(scratch_dir() / "amber.sqlite3")
+
+
+def scratch_contains(sid: str) -> bool:
+    root = scratch_dir()
+    if (root / "snaps" / sid).exists():
+        return True
+    db_path = root / "amber.sqlite3"
+    if not db_path.is_file():
+        return False
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+    finally:
+        conn.close()
+
+
+def begin_capture(sid: str, url: str, url_normalized: str) -> None:
+    if not readonly_library():
+        insert_snapshot(sid, url, url_normalized)
+        return
+    prepare_scratch()
+    with _state_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, title, final_url,
+                snapshot_id, created_at
+            ) VALUES (?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)
+            """,
+            (sid, url, url_normalized, sid, now_iso()),
+        )
+        conn.commit()
+    with _scratch_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO snapshots (id, url, url_normalized, created_at, status)
+            VALUES (?, ?, ?, ?, 'pending')
+            """,
+            (sid, url, url_normalized, now_iso()),
+        )
+        conn.commit()
+
+
+def mark_capture(sid: str, **fields: Any) -> None:
+    if not readonly_library():
+        update_snapshot(sid, **fields)
+        return
+    if fields:
+        cols = ", ".join(f"{name} = ?" for name in fields)
+        with _scratch_conn() as conn:
+            conn.execute(
+                f"UPDATE snapshots SET {cols} WHERE id = ?",
+                [*fields.values(), sid],
+            )
+            conn.commit()
+    job_fields = {name: value for name, value in fields.items() if name in _JOB_FIELDS}
+    if job_fields.get("status") == "complete":
+        job_fields.pop("status")
+    if job_fields:
+        update_job(sid, **job_fields)
+
+
+def update_job(sid: str, **fields: Any) -> None:
+    fields = {name: value for name, value in fields.items() if name in _JOB_FIELDS}
+    if not fields:
+        return
+    cols = ", ".join(f"{name} = ?" for name in fields)
+    with _state_conn() as conn:
+        conn.execute(
+            f"UPDATE jobs SET {cols} WHERE id = ?",
+            [*fields.values(), sid],
+        )
+        conn.commit()
+
+
+def finish_job(job_id: str, snapshot_id: str) -> None:
+    update_job(job_id, status="complete", snapshot_id=snapshot_id)
+
+
+def capture_folder(sid: str) -> Path:
+    if readonly_library():
+        return scratch_dir() / "snaps" / sid
+    return snap_dir(sid)
+
+
+def discard_scratch(sid: str) -> None:
+    from .library_contract import ID_RE
+
+    if not isinstance(sid, str) or not ID_RE.fullmatch(sid):
+        return
+    root = scratch_dir().resolve()
+    folder = (root / "snaps" / sid).resolve()
+    if folder.parent != (root / "snaps").resolve():
+        return
+    if folder.is_symlink():
+        folder.unlink()
+    elif folder.exists():
+        shutil.rmtree(folder)
+    db_path = root / "amber.sqlite3"
+    if not db_path.is_file():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM snapshots WHERE id = ?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fail_capture(job_id: str, sid: str, error: str) -> None:
+    if not readonly_library():
+        update_snapshot(sid, status="failed", error=error)
+        return
+    for gone in {job_id, sid}:
+        discard_scratch(gone)
+    update_job(job_id, status="failed", error=error)
+
+
+def fill_scratch_paywalled(scratch: Path, sid: str) -> None:
+    conn = sqlite3.connect(scratch / "amber.sqlite3")
+    try:
+        row = conn.execute(
+            "SELECT paywalled, word_count FROM snapshots WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None or row[0] is not None:
+            return
+        flag = 1 if article_is_paywalled(row[1]) else 0
+        conn.execute(
+            "UPDATE snapshots SET paywalled = ? WHERE id = ? AND paywalled IS NULL",
+            (flag, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def publish_capture(sid: str, on_id: Callable[[str], None] | None = None) -> str:
+    from .library_import import commit_captured_snapshot
+    from .library_push import _push_settings
+
+    settings = _push_settings()
+    if settings is None:
+        raise RuntimeError("AMBER_INGEST_URL and AMBER_INGEST_TOKEN_FILE are required")
+    url, token = settings
+    return commit_captured_snapshot(
+        DATA_DIR,
+        scratch_dir(),
+        sid,
+        url,
+        token,
+        on_id=on_id,
+    )
+
+
 _instance_lock = None
 
 
+def lock_path() -> Path:
+    if readonly_library():
+        return _state_file()
+    return DATA_DIR / "amber.lock"
+
+
 def hold_instance_lock() -> bool:
-    """Take an exclusive lock on DATA_DIR/amber.lock for this process's life.
+    """Take an exclusive lock for this process's life.
 
     False means another Amber process already owns this data directory, so
-    its in-flight jobs are not ours to touch.
+    its in-flight jobs are not ours to touch. In ingest mode the lock is the
+    app-state database, not a file in the library directory.
     """
     global _instance_lock
     if _instance_lock is not None:
         return True
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(DATA_DIR / "amber.lock", "a+")
+    path = lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
     try:
         try:
             import fcntl
@@ -371,6 +663,17 @@ def hold_instance_lock() -> bool:
 
 def fail_interrupted() -> int:
     """Mark rows left pending/capturing by a previous process as failed."""
+    if readonly_library():
+        with _state_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', error = 'Interrupted before it finished.'
+                WHERE status IN ('pending', 'capturing', 'queued')
+                """
+            )
+            conn.commit()
+            return cur.rowcount
     with connect() as db:
         cur = db.execute(
             """
@@ -460,9 +763,61 @@ def update_snapshot(sid: str, **fields: Any) -> None:
 
 
 def get_snapshot(sid: str) -> dict | None:
-    with connect() as db:
-        row = db.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
-        return _as_snap(row) if row else None
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
+        if row is not None:
+            return _as_snap(row)
+    if readonly_library():
+        return _job_snapshot(sid)
+    return None
+
+
+def _job_snapshot(sid: str) -> dict | None:
+    path = _state_file()
+    if not path.is_file():
+        return None
+    conn = sqlite3.connect(f"file:{quote(str(path), safe='/:')}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "url": row["url"],
+        "url_normalized": row["url_normalized"],
+        "final_url": row["final_url"],
+        "title": row["title"],
+        "site_name": None,
+        "author": None,
+        "published_at": None,
+        "description": None,
+        "created_at": row["created_at"],
+        "http_status": None,
+        "word_count": None,
+        "paywalled": False,
+        "status": row["status"],
+        "error": row["error"],
+    }
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _has_table(conn, table):
+        return False
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
 # Stay well under SQLite's bound-variable limit (999 on older builds).
@@ -594,6 +949,8 @@ def complete_snapshots() -> list[dict]:
 def recapture_snapshots() -> list[dict]:
     """Snaps waiting on a recapture, paused, or stopped."""
     with connect() as db:
+        if readonly_library() and not _has_column(db, "snapshots", "recapture_state"):
+            return []
         rows = db.execute(
             """
             SELECT * FROM snapshots
@@ -791,6 +1148,8 @@ def get_gift_candidate(cid: str) -> dict | None:
 
 
 def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
+    if readonly_library() and not _has_table(conn, "candidates"):
+        return []
     rows = conn.execute(
         "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
     ).fetchall()

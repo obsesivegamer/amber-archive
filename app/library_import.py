@@ -429,18 +429,33 @@ def _separate(left: Path, right: Path, left_name: str, right_name: str) -> None:
         )
 
 
-def _wipe_scratch() -> None:
-    """Drop unpublished scratch snapshots left by a crash. The library is not here."""
-    snaps = db.SNAPS_DIR
+def wipe_scratch_tree(root: Path) -> None:
+    """Drop unpublished scratch snapshots. ``root`` is not the library."""
+    snaps = root / "snaps"
     if snaps.exists():
         for child in list(snaps.iterdir()):
             if child.is_symlink() or child.is_file():
                 child.unlink()
             else:
                 shutil.rmtree(child)
-    with db.connect() as conn:
-        conn.execute("DELETE FROM snapshots")
-        conn.commit()
+    db_path = root / "amber.sqlite3"
+    if not db_path.is_file():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            conn.execute("DELETE FROM snapshots")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+    finally:
+        conn.close()
+
+
+def _wipe_scratch() -> None:
+    """Drop unpublished scratch snapshots left by a crash. The library is not here."""
+    wipe_scratch_tree(db.DATA_DIR)
 
 
 def bind_scratch(scratch: Path) -> None:
@@ -464,6 +479,144 @@ def _delete_scratch(sid: str, scratch: Path) -> None:
     if not ID_RE.fullmatch(sid):
         raise RuntimeError("refusing to delete an id outside the archive alphabet")
     db.delete_snapshot(sid)
+
+
+def _scratch_contains(scratch: Path) -> Callable[[str], bool]:
+    root = scratch.resolve()
+
+    def taken(sid: str) -> bool:
+        if (root / "snaps" / sid).exists():
+            return True
+        db_path = root / "amber.sqlite3"
+        if not db_path.is_file():
+            return False
+        conn = sqlite3.connect(db_path)
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM snapshots WHERE id = ?",
+                    (sid,),
+                ).fetchone()
+            except sqlite3.Error:
+                return False
+            return row is not None
+        finally:
+            conn.close()
+
+    return taken
+
+
+def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
+    url_old = f"/{old}/r/"
+    url_new = f"/{new}/r/"
+    for path in folder.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".woff",
+            ".woff2",
+            ".ttf",
+            ".otf",
+        }:
+            continue
+        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        updated = text.replace(url_old, url_new)
+        updated = updated.replace(
+            f'name="amber-snapshot" content="{old}"',
+            f'name="amber-snapshot" content="{new}"',
+        )
+        updated = updated.replace(
+            f"name='amber-snapshot' content='{old}'",
+            f"name='amber-snapshot' content='{new}'",
+        )
+        updated = updated.replace(
+            f'content="{old}" name="amber-snapshot"',
+            f'content="{new}" name="amber-snapshot"',
+        )
+        if path.name == "meta.json":
+            try:
+                meta = json.loads(updated)
+            except json.JSONDecodeError:
+                meta = None
+            if isinstance(meta, dict) and meta.get("id") == old:
+                meta["id"] = new
+                updated = json.dumps(meta, indent=2, ensure_ascii=False)
+        if updated != text:
+            path.write_text(updated, encoding="utf-8", errors="surrogateescape")
+
+
+def _retarget_scratch(scratch: Path, old: str, new: str) -> None:
+    if not ID_RE.fullmatch(old) or not ID_RE.fullmatch(new):
+        raise RuntimeError("refusing to retarget an id outside the archive alphabet")
+    src = scratch / "snaps" / old
+    dest = scratch / "snaps" / new
+    if src.is_symlink() or not src.is_dir():
+        raise RuntimeError("scratch snapshot is missing")
+    if dest.exists() or dest.is_symlink():
+        raise RuntimeError("scratch snapshot already exists")
+    src.rename(dest)
+    _rewrite_snapshot_id(dest, old, new)
+    conn = sqlite3.connect(scratch / "amber.sqlite3")
+    try:
+        conn.execute("UPDATE snapshots SET id = ? WHERE id = ?", (new, old))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def commit_captured_snapshot(
+    library_dir: Path,
+    scratch: Path,
+    sid: str,
+    ingest_url: str,
+    token: str,
+    *,
+    transport=None,
+    on_id: Callable[[str], None] | None = None,
+) -> str:
+    """Push one captured snapshot. A 409 id collision allocates again and retries.
+
+    Returns the id ingest stored. The caller deletes the scratch snapshot.
+    """
+    current = sid
+    reserved = sid
+    try:
+        for _attempt in range(_ALLOC_TRIES):
+            if on_id is not None:
+                on_id(current)
+            db.fill_scratch_paywalled(scratch, current)
+            try:
+                push_snapshot(
+                    scratch,
+                    current,
+                    ingest_url,
+                    token,
+                    transport=transport,
+                )
+                return current
+            except PushRejected as exc:
+                if not _id_collision(exc) or _attempt + 1 == _ALLOC_TRIES:
+                    raise
+                release_dell_id(current)
+                reserved = ""
+                fresh = allocate_dell_id(
+                    library_dir,
+                    scratch_has=_scratch_contains(scratch),
+                )
+                reserved = fresh
+                _retarget_scratch(scratch, current, fresh)
+                current = fresh
+                if on_id is not None:
+                    on_id(current)
+        raise PushError("could not allocate a snapshot id")
+    finally:
+        if reserved:
+            release_dell_id(reserved)
 
 
 def _id_collision(exc: PushRejected) -> bool:

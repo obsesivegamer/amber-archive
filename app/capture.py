@@ -37,7 +37,7 @@ from .config import (
     VIEWPORT,
 )
 from . import db
-from .extract import extract_article
+from .extract import article_is_paywalled, extract_article
 from .freeze import freeze_html, rewrite_css
 from .ingest import render_reader_jpeg
 from .reader import build_reader_html
@@ -930,8 +930,13 @@ def enqueue_capture(
         return existing["id"]
     if job_queue.qsize() >= MAX_QUEUED_JOBS:
         raise QueueFull
-    sid = db.allocate_id()
-    db.insert_snapshot(sid, url, url_normalized)
+    if db.readonly_library():
+        from .library_import import allocate_dell_id
+
+        sid = allocate_dell_id(db.DATA_DIR, scratch_has=db.scratch_contains)
+    else:
+        sid = db.allocate_id()
+    db.begin_capture(sid, url, url_normalized)
     job = {
         "id": sid,
         "snapshot_id": sid,
@@ -973,7 +978,11 @@ async def worker() -> None:
                     stats["duration_ms"] = _elapsed_ms(started)
                 job["status"] = "failed"
                 job["error"] = str(exc)
-                db.update_snapshot(job["snapshot_id"], status="failed", error=str(exc)[:500])
+                db.fail_capture(
+                    job["id"],
+                    job.get("snapshot_id") or job["id"],
+                    str(exc)[:500],
+                )
         finally:
             job_queue.task_done()
 
@@ -986,9 +995,9 @@ async def run_job(job_id: str) -> None:
     job["_capture_started"] = started
     job["capture_stats"] = empty_capture_stats()
     job["status"] = "capturing"
-    db.update_snapshot(sid, status="capturing")
+    db.mark_capture(sid, status="capturing")
 
-    folder = db.snap_dir(sid)
+    folder = db.capture_folder(sid)
     res_dir = folder / "res"
     folder.mkdir(parents=True, exist_ok=True)
     res_dir.mkdir(parents=True, exist_ok=True)
@@ -1117,7 +1126,10 @@ async def run_job(job_id: str) -> None:
         "created_at": db.now_iso(),
     }
     db.write_json(folder / "meta.json", meta)
-    db.update_snapshot(
+    explicit = meta.get("paywalled")
+    if not isinstance(explicit, bool):
+        explicit = article_is_paywalled(meta.get("word_count"))
+    db.mark_capture(
         sid,
         final_url=final_url,
         title=meta["title"],
@@ -1127,18 +1139,30 @@ async def run_job(job_id: str) -> None:
         description=meta["description"],
         http_status=http_status,
         word_count=meta["word_count"],
-        paywalled=1 if meta.get("paywalled") else 0,
+        paywalled=1 if explicit else 0,
         status="complete",
         error=None,
     )
+    if db.readonly_library():
+
+        def _track(active: str, bound=job) -> None:
+            bound["snapshot_id"] = active
+
+        final = db.publish_capture(sid, on_id=_track)
+        job["snapshot_id"] = final
+        db.finish_job(job["id"], final)
+        db.discard_scratch(sid)
+        if final != sid:
+            db.discard_scratch(final)
     job["status"] = "complete"
     job["title"] = meta["title"]
     job.pop("_capture_started", None)
-    # The screenshot is already in snaps/<id>/. Push now; hourly backfill
-    # catches a Dell-PLX that was down. No-op until AMBER_INGEST_URL is set.
-    from .library_push import schedule_library_push
+    if not db.readonly_library():
+        # The screenshot is already in snaps/<id>/. Push now; hourly backfill
+        # catches a Dell-PLX that was down. No-op until AMBER_INGEST_URL is set.
+        from .library_push import schedule_library_push
 
-    schedule_library_push(sid)
+        schedule_library_push(sid)
 
 
 async def fetch_document(url: str, *, skip_referrer_bounce: bool = False) -> dict:

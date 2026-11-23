@@ -125,3 +125,29 @@ ID_LENGTH = 5
 # emit it. Legacy Mac ids may already start with it, so Dell still checks the
 # live store before using one.
 DELL_ID_PREFIX = "Z"
+
+
+def ingest_library() -> bool:
+    """True when this process must not write the shared library."""
+    return os.environ.get("AMBER_LIBRARY_MODE", "").strip().lower() == "ingest"
+
+
+def configured_library_db() -> Path:
+    """The library file named by ``AMBER_DATA_DIR``, ignoring later path overrides."""
+    raw = os.environ.get("AMBER_DATA_DIR", "").strip()
+    root = Path(raw).resolve() if raw else (ROOT / "data").resolve()
+    return root / "amber.sqlite3"
+
+
+def app_state_path() -> Path:
+    raw = os.environ.get("AMBER_APP_STATE", "").strip()
+    if not raw:
+        raise RuntimeError("AMBER_APP_STATE is required when AMBER_LIBRARY_MODE=ingest")
+    return Path(raw).resolve()
+
+
+def scratch_path() -> Path:
+    raw = os.environ.get("AMBER_SCRATCH_DIR", "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return app_state_path().parent / "scratch"

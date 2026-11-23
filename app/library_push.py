@@ -244,6 +244,7 @@ def _read_row(db_path: Path, sid: str) -> dict:
         return value
 
     error = optional("error") if "error" in keys else None
+    word_count = optional_int("word_count")
     return {
         "url": row["url"],
         "url_normalized": row["url_normalized"],
@@ -255,8 +256,11 @@ def _read_row(db_path: Path, sid: str) -> dict:
         "description": optional("description"),
         "created_at": row["created_at"],
         "http_status": optional_int("http_status"),
-        "word_count": optional_int("word_count"),
-        "paywalled": bool(row["paywalled"]) if "paywalled" in keys and row["paywalled"] is not None else False,
+        "word_count": word_count,
+        "paywalled": db.paywalled_bool(
+            row["paywalled"] if "paywalled" in keys else None,
+            word_count,
+        ),
         "status": "complete",
         "error": error,
     }

@@ -158,14 +158,18 @@ def _allowed_extension_ids() -> set[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    if db.readonly_library():
+        db.prepare_scratch()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
     if db.hold_instance_lock():
+        if db.readonly_library():
+            db.sweep_scratch()
         db.fail_interrupted()
     else:
         log.warning(
             "Another Amber process holds %s; leaving its in-flight captures alone.",
-            db.DATA_DIR / "amber.lock",
+            db.lock_path(),
         )
     if not _allowed_extension_ids():
         log.warning(
