@@ -160,7 +160,7 @@ Chrome sends `Origin: chrome-extension://<id>` for an extension's requests, and 
 
 Amber can serve the new-tab's Latest, Library and Reader views as a web app, so they open in a phone browser on your own tailnet. Everything below is same-origin only: Amber still sends no CORS headers, and the Host allow-list and cross-site rules above run first.
 
-**Expose it to your own devices only.** Keep Amber listening on `127.0.0.1` and let Tailscale reverse-proxy to it. Do not use `tailscale funnel` (that is the public internet), and do not bind Amber to `0.0.0.0`. Everything Amber does (`/save`, `/api/import`, delete, the stores below) becomes reachable by every device on the tailnet, so use Tailscale ACLs if the tailnet is shared. Amber has no login of its own.
+**Expose it to your own devices only.** Keep Amber listening on `127.0.0.1` and let Tailscale reverse-proxy to it. Do not use `tailscale funnel` (that is the public internet), and do not bind Amber to `0.0.0.0`. Everything Amber does (`/save`, `/api/import`, delete, the stores below) becomes reachable by every device on the tailnet, so use Tailscale ACLs if the tailnet is shared. Set `AMBER_READER_PASSWORD_FILE` (or `AMBER_READER_PASSWORD`) and every route except `/login`, `/healthz`, `/favicon.ico` and `/static` asks for the amber-reader session cookie or HTTP Basic. Leave both unset and local Amber stays open, as before. Ingest mode requires the password and listens on `127.0.0.1`. A request from `127.0.0.1` is not trusted, including one that sends `X-Forwarded-*` or `Tailscale-User-*`.
 
 In ingest mode (`AMBER_LIBRARY_MODE=ingest`) amber-web opens the library with `mode=ro`. That open may create `amber.sqlite3-wal` and `amber.sqlite3-shm`. amber-web must run as the library owner, or share a group with a group-writable umask, because those files are created with the database's mode and the next ingest write fails with `SQLITE_READONLY` if it cannot write them.
 
@@ -172,7 +172,9 @@ The Host header is then your machine's tailnet name, for example `macbook.tail12
 
 | Variable | Meaning |
 |---|---|
-| `AMBER_ALLOWED_HOSTS` | Comma-separated bare hostnames (case-insensitive) added to the Host allow-list, e.g. `macbook.tail1234.ts.net`. No scheme, port, path, `*` wildcard or single-label name (use the full `*.ts.net` name): such entries are ignored with a warning, because the allow-list is what blocks DNS rebinding. Unset, Amber behaves exactly as before. Startup logs one line listing the extra hosts. |
+| `AMBER_ALLOWED_HOSTS` | Comma-separated hostnames added to the Host allow-list, e.g. `dell-plx-reader.tailf9612a.ts.net,127.0.0.1:8084`. A `:port` is accepted and the hostname is what is matched. No scheme, path, `*` wildcard or single-label name. Unset, Amber behaves exactly as before. |
+| `AMBER_READER_PASSWORD_FILE` | Password file, mode `0600`. When set, every route except `/login`, `/healthz`, `/favicon.ico` and `/static` requires the amber-reader session cookie or HTTP Basic (`amber` plus the password). The signing key is the same as amber-reader, so an existing phone cookie still works. `AMBER_READER_PASSWORD` is the same secret when no file is set. Ingest mode requires one of them and listens on `127.0.0.1`. |
+| `AMBER_APP_STATE` | In ingest mode, the directory that holds `app.sqlite3` (jobs, candidates, `recapture_queue`), `sources.json`, `homepage.json` and `rebuild-request.json`. |
 | `AMBER_WEBAPP_DIR` | Path to a built web app folder (a Vite `dist`), served at `/app/`. Unset, `/app/` answers `404` with a one-line hint. |
 
 With launchd, add both to the job's plist and restart it (`launchctl kickstart -k gui/$(id -u)/<your job label>`):

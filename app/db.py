@@ -293,9 +293,10 @@ def _index_sql(db: sqlite3.Connection, name: str) -> str:
         "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
         (name,),
     ).fetchone()
-    if row is None or not row["sql"]:
+    if row is None:
         return ""
-    return row["sql"]
+    sql = row["sql"] if isinstance(row, sqlite3.Row) else row[0]
+    return sql or ""
 
 
 def _blank(value: object) -> bool:
@@ -498,15 +499,42 @@ def scratch_dir() -> Path:
     return path
 
 
+_RECAPTURE_QUEUE_DDL = """
+CREATE TABLE IF NOT EXISTS recapture_queue (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    next_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
 def _init_app_state() -> None:
     path = _state_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
         conn.executescript(_JOBS_DDL)
+        conn.executescript(_RECAPTURE_QUEUE_DDL)
+        _ensure_candidates_table(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def candidates_connect() -> sqlite3.Connection:
+    """The database that owns the candidates table.
+
+    Ingest mode keeps it in app-state. The shared library stays read-only.
+    """
+    if readonly_library():
+        _init_app_state()
+        conn = _state_conn()
+        _ensure_candidates_table(conn)
+        return conn
+    return connect()
 
 
 def _state_conn() -> sqlite3.Connection:
@@ -1168,7 +1196,7 @@ def complete_snapshots() -> list[dict]:
 def recapture_snapshots() -> list[dict]:
     """Snaps waiting on a recapture, paused, or stopped."""
     if readonly_library():
-        return []
+        return _recapture_attached()
     with connect() as db:
         rows = db.execute(
             """
@@ -1302,6 +1330,33 @@ def insert_gift_candidate_in(
     raise RuntimeError("Could not allocate a candidate id.")
 
 
+def _recapture_attached() -> list[dict]:
+    """Queue rows in app-state joined to the library through a read-only ATTACH."""
+    _init_app_state()
+    library = Path(DB_PATH)
+    conn = sqlite3.connect(_state_file())
+    conn.row_factory = sqlite3.Row
+    try:
+        uri = "file:{}?mode=ro".format(quote(str(library), safe="/:"))
+        conn.execute("ATTACH DATABASE ? AS library", (uri,))
+        rows = conn.execute(
+            """
+            SELECT s.*, q.state AS recapture_state, q.next_at AS recapture_next_at,
+                   q.attempts AS recapture_attempts, q.last_error AS recapture_last_error
+            FROM recapture_queue q
+            JOIN library.snapshots s ON s.id = q.id
+            WHERE q.state IN (
+                'pending', 'running', 'gave_up',
+                'needs_browser_capture', 'needs_fresh_gift'
+            )
+            ORDER BY s.created_at ASC, s.rowid ASC
+            """
+        ).fetchall()
+        return [_as_snap(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def insert_gift_candidate(
     *,
     unlock_url: str,
@@ -1315,7 +1370,7 @@ def insert_gift_candidate(
     expires_at: str,
     expires_estimated: bool,
 ) -> dict:
-    with connect() as conn:
+    with candidates_connect() as conn:
         stored = insert_gift_candidate_in(
             conn,
             unlock_url=unlock_url,
@@ -1355,22 +1410,18 @@ def update_gift_candidate_in(conn: sqlite3.Connection, cid: str, **fields: Any) 
 
 
 def update_gift_candidate(cid: str, **fields: Any) -> None:
-    with connect() as conn:
+    with candidates_connect() as conn:
         update_gift_candidate_in(conn, cid, **fields)
         conn.commit()
 
 
 def get_gift_candidate(cid: str) -> dict | None:
-    if readonly_library():
-        return None
-    with connect() as conn:
+    with candidates_connect() as conn:
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
         return _as_candidate(row) if row else None
 
 
 def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
-    if readonly_library():
-        return []
     rows = conn.execute(
         "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
     ).fetchall()
@@ -1378,13 +1429,13 @@ def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
 
 
 def list_gift_candidates() -> list[dict]:
-    with connect() as conn:
+    with candidates_connect() as conn:
         return load_gift_candidates(conn)
 
 
 def purge_gift_candidates(expired_before: str) -> int:
     """Delete candidates whose expires_at is strictly older than ``expired_before``."""
-    with connect() as conn:
+    with candidates_connect() as conn:
         cur = conn.execute(
             "DELETE FROM candidates WHERE expires_at < ?",
             (expired_before,),

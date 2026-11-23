@@ -17,11 +17,12 @@ _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*
 
 
 def parse_allowed_hosts(raw: str) -> tuple[frozenset[str], list[str]]:
-    """Split AMBER_ALLOWED_HOSTS into (bare lower-case hostnames, rejected entries).
+    """Split AMBER_ALLOWED_HOSTS into (lower-case hostnames, rejected entries).
 
-    Only plain dotted names are accepted: no scheme, port, path, wildcard or
-    single label (a local resolver could answer one), because
-    the Host allow-list is what stops DNS rebinding.
+    A dotted name or an IPv4 address is accepted, with an optional ``:port``.
+    The port is not a separate allow-list key: Starlette compares the hostname.
+    No scheme, path, wildcard or single-label name, because the Host allow-list
+    is what stops DNS rebinding.
     """
     hosts: set[str] = set()
     rejected: list[str] = []
@@ -29,7 +30,10 @@ def parse_allowed_hosts(raw: str) -> tuple[frozenset[str], list[str]]:
         name = part.strip().lower()
         if not name:
             continue
-        if "." in name and _HOSTNAME_RE.fullmatch(name):
+        host, sep, port = name.rpartition(":")
+        if sep and port.isdigit():
+            name = host
+        if name == "127.0.0.1" or ("." in name and _HOSTNAME_RE.fullmatch(name)):
             hosts.add(name)
         else:
             rejected.append(part.strip())
@@ -139,15 +143,20 @@ def configured_library_db() -> Path:
     return root / "amber.sqlite3"
 
 
-def app_state_path() -> Path:
+def app_state_dir() -> Path:
+    """Directory for app-state. ``AMBER_APP_STATE`` names the directory."""
     raw = os.environ.get("AMBER_APP_STATE", "").strip()
     if not raw:
         raise RuntimeError("AMBER_APP_STATE is required when AMBER_LIBRARY_MODE=ingest")
     return Path(raw).resolve()
 
 
+def app_state_path() -> Path:
+    return app_state_dir() / "app.sqlite3"
+
+
 def scratch_path() -> Path:
     raw = os.environ.get("AMBER_SCRATCH_DIR", "").strip()
     if raw:
         return Path(raw).resolve()
-    return app_state_path().parent / "scratch"
+    return app_state_dir() / "scratch"

@@ -162,9 +162,13 @@ def _point_at_library(monkeypatch, library: Path, db_path: Path) -> None:
 def ingest_paths(tmp_path, monkeypatch):
     library = tmp_path / "library"
     db_path = _write_library(library)
-    state = tmp_path / "state" / "app.sqlite3"
+    state_dir = tmp_path / "state"
+    state = state_dir / "app.sqlite3"
     scratch = tmp_path / "scratch"
-    monkeypatch.setenv("AMBER_APP_STATE", str(state))
+    monkeypatch.setenv("AMBER_APP_STATE", str(state_dir))
+    monkeypatch.setenv("AMBER_READER_PASSWORD", "test-password")
+    monkeypatch.setattr("app.auth.session_ok", lambda _cookie: True)
+    monkeypatch.setattr("app.auth.basic_ok", lambda _header: True)
     monkeypatch.setenv("AMBER_SCRATCH_DIR", str(scratch))
     token = tmp_path / "ingest.token"
     token.write_text(TOKEN + "\n", encoding="utf-8")

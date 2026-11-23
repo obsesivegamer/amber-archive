@@ -425,7 +425,7 @@ def _claim(incoming: dict) -> str:
     row the first add stored.
     """
     keys = _keys(incoming["canonical_url"], incoming["unlock_url"])
-    conn = db.connect()
+    conn = db.candidates_connect()
     try:
         for attempt in (1, 2):
             conn.execute("BEGIN IMMEDIATE")
@@ -558,16 +558,16 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
     db.init_db()
     moment = now or datetime.now(timezone.utc)
     today = moment.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    if db.readonly_library():
-        return {"candidates": [], "updated_at": format_time(moment)}
-    with db.connect() as conn:
-        rows = db.load_gift_candidates(conn)
+    state = db.candidates_connect()
+    library = db.connect() if db.readonly_library() else state
+    try:
+        rows = db.load_gift_candidates(state)
         snapshots = db.load_snapshots(
-            conn, [row.get("snapshot_id") or "" for row in rows]
+            library, [row.get("snapshot_id") or "" for row in rows]
         )
 
         def matches(url: str) -> list[dict]:
-            return _find_matches(url, conn)
+            return _find_matches(url, library)
 
         listed = []
         for row in rows:
@@ -596,7 +596,11 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
                     "archived": _archived(row, _best_match, matches),
                 }
             )
-    return {"candidates": listed, "updated_at": format_time(moment)}
+        return {"candidates": listed, "updated_at": format_time(moment)}
+    finally:
+        state.close()
+        if library is not state:
+            library.close()
 
 
 def events_since(since: datetime) -> dict:
@@ -784,6 +788,71 @@ def _cmd_purge() -> int:
     return 0
 
 
+_EXACT_FIELDS = (
+    "id",
+    "unlock_url",
+    "canonical_url",
+    "match_key",
+    "publisher",
+    "title",
+    "source_url",
+    "source_author",
+    "found_at",
+    "expires_at",
+    "expires_estimated",
+    "dismissed_at",
+    "clicked_at",
+    "snapshot_id",
+    "created_at",
+)
+
+
+def export_exact() -> str:
+    db.init_db()
+    rows = []
+    for row in sorted(db.list_gift_candidates(), key=lambda item: item["id"]):
+        rows.append({name: row.get(name) for name in _EXACT_FIELDS})
+    return json.dumps({"candidates": rows}, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def import_exact(raw: str) -> int:
+    try:
+        payload = json.loads(raw)
+    except (ValueError, RecursionError):
+        print("rejected: could not parse JSON", file=sys.stderr)
+        return 1
+    rows = payload.get("candidates") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        print('rejected: expected {"candidates": [...]}', file=sys.stderr)
+        return 1
+    db.init_db()
+    if db.list_gift_candidates():
+        print("rejected: the candidate store is not empty", file=sys.stderr)
+        return 1
+    conn = db.candidates_connect()
+    try:
+        for row in rows:
+            if not isinstance(row, dict):
+                print("rejected: each candidate must be an object", file=sys.stderr)
+                return 1
+            values = [row.get(name) for name in _EXACT_FIELDS]
+            if row.get("expires_estimated") is True:
+                values[_EXACT_FIELDS.index("expires_estimated")] = 1
+            elif row.get("expires_estimated") is False:
+                values[_EXACT_FIELDS.index("expires_estimated")] = 0
+            conn.execute(
+                f"""
+                INSERT INTO candidates ({", ".join(_EXACT_FIELDS)})
+                VALUES ({", ".join("?" for _ in _EXACT_FIELDS)})
+                """,
+                values,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.candidates")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -793,6 +862,10 @@ def main(argv: list[str] | None = None) -> int:
     listing.add_argument("--events", action="store_true", help="print click and dismiss events as JSON")
     listing.add_argument("--since", help="ISO timestamp; required with --events")
     sub.add_parser("purge", help="delete candidates that expired more than 30 days ago")
+    exporting = sub.add_parser("export")
+    exporting.add_argument("--exact", action="store_true", required=True)
+    importing = sub.add_parser("import")
+    importing.add_argument("--exact", action="store_true", required=True)
     args = parser.parse_args(argv)
     db.init_db()
     if args.command == "add":
@@ -801,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_list(args)
     if args.command == "purge":
         return _cmd_purge()
+    if args.command == "export":
+        sys.stdout.write(export_exact())
+        return 0
+    if args.command == "import":
+        return import_exact(sys.stdin.read())
     return 2
 
 
