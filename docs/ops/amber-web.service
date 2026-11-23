@@ -6,9 +6,10 @@ Description=Amber web in ingest mode
 
 [Service]
 WorkingDirectory=%h/apps/amber-archive
-# Password only. systemd applies EnvironmentFile= over Environment= no
-# matter the order, so this file must not set mode, hosts, or paths.
-EnvironmentFile=%h/.config/amber/amber-web.env
+# The password file holds only the password, mode 0600. The reader uses
+# the same file. There is no EnvironmentFile, so nothing in a dotenv can
+# replace the settings below.
+Environment=AMBER_READER_PASSWORD_FILE=%h/.config/amber/reader.password
 Environment=PYTHONUNBUFFERED=1
 Environment=AMBER_LIBRARY_MODE=ingest
 Environment=AMBER_DATA_DIR=%h/apps/amber-reader/data

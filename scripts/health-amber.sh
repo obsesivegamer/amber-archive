@@ -49,12 +49,17 @@ check "$INGEST"
 check "$IMPORT"
 check "$WEB" yes
 
+# User jerem must be able to run this without root. A permission failure
+# here fails the check every time.
 err="$(mktemp)"
+pyerr="$(mktemp)"
 if ! status="$("$FUNNEL_CMD" serve status --json 2>"$err")"; then
-  rm -f "$err"
-  die "tailscale serve status failed"
+  detail="$(tr '\n' ' ' <"$err" | sed 's/[[:space:]]*$//')"
+  rm -f "$err" "$pyerr"
+  die "tailscale serve status failed${detail:+: $detail}"
 fi
 rm -f "$err"
+set +e
 python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
@@ -64,7 +69,6 @@ try:
     data = json.loads(raw)
 except json.JSONDecodeError:
     sys.exit(2)
-
 def funnel_on(node):
     if isinstance(node, dict):
         allow = node.get("AllowFunnel")
@@ -74,16 +78,18 @@ def funnel_on(node):
     if isinstance(node, list):
         return any(funnel_on(value) for value in node)
     return False
-
 if funnel_on(data):
     sys.exit(1)
-' <<<"$status" || {
-  code=$?
-  if [[ "$code" -eq 1 ]]; then
-    die "tailscale funnel is on"
-  fi
-  die "tailscale serve status is not JSON"
-}
+' <<<"$status" 2>"$pyerr"
+code=$?
+set -e
+detail="$(tr '\n' ' ' <"$pyerr" | sed 's/[[:space:]]*$//')"
+rm -f "$pyerr"
+if [[ "$code" -eq 1 ]]; then
+  die "tailscale funnel is on"
+elif [[ "$code" -ne 0 ]]; then
+  die "tailscale serve status is not JSON${detail:+: $detail}"
+fi
 log "tailscale funnel is off"
 
 if [[ ! -f "$STAMP" ]]; then

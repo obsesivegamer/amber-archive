@@ -41,6 +41,8 @@ curl -fsS https://dell-plx-reader.tailf9612a.ts.net:8443/healthz
 
 The first URL is the reader on 8081. The second is ingest on 8082. Paste both bodies and both timestamps into the record.
 
+`/healthz` does not require a password. On the phone, open both URLs in the browser and screenshot each page with the phone's clock visible. Add those screenshots to the record next to the Mac curls.
+
 amber-web is still only on loopback. From the same SSH session on Dell-PLX:
 
 ```bash

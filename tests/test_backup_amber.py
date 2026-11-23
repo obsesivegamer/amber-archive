@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,7 +50,7 @@ def _library_db(path: Path, rows: int = 1) -> None:
                 f"https://example.com/{index}",
                 "A real headline" if usable else "t",
                 "Example",
-                "2026-06-01T00:00:00Z",
+                (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 200 if usable else 2,
             ),
         )
@@ -182,11 +183,13 @@ def test_backup_copy_keeps_nested_state_and_drops_staging(tmp_path: Path):
     assert (day / "snaps" / "Z2345" / "article.txt").read_text() == "same bytes\n"
     assert (day / ".complete").is_file()
     manifest = json.loads((day / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["snapshots"] == 2
-    assert manifest["total_usable"] == 1
+    assert manifest["library_tables"]["snapshots"] == 2
+    assert manifest["app_tables"]["candidates"] == 1
     assert manifest["candidates"] == 1
     assert manifest["sources"] == 1
+    assert manifest["snaps_files"] == 3
     assert len(manifest["articles"]) >= 1
+    assert "total_usable" not in manifest
     assert not (paths["stage"] / "amber-backup-stage" / "current").exists()
     assert (paths["stage"] / "keep-me").read_text() == "stay"
 
@@ -455,10 +458,19 @@ exit 0
     assert unknown.returncode != 0
     assert "not JSON" in unknown.stderr
 
-    tailscale("{}", 1)
+    script = bin_dir / "tailscale"
+    script.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" != serve ] || [ "$2" != status ] || [ "$3" != --json ]; then exit 2; fi\n'
+        "echo 'permission denied' >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    env["AMBER_TAILSCALE"] = str(script)
     failed = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert failed.returncode != 0
     assert "serve status failed" in failed.stderr
+    assert "permission denied" in failed.stderr
 
     tailscale("null", 0)
     stamp.unlink()
@@ -476,7 +488,7 @@ def test_restore_drill_uses_manifest_and_reader(tmp_path: Path):
         INSERT INTO snapshots
         (id, url, url_normalized, final_url, title, site_name, created_at, word_count, status)
         VALUES ('id9', 'https://example.com/9', 'https://example.com/9', 'https://example.com/9',
-                'later', 'Example', '2026-06-01T00:00:00Z', 2, 'complete')
+                'later', 'Example', '2026-11-01T00:00:00Z', 2, 'complete')
         """
     )
     conn.commit()
@@ -484,37 +496,17 @@ def test_restore_drill_uses_manifest_and_reader(tmp_path: Path):
     server = tmp_path / "reader.py"
     server.write_text(
         """
-import json, os, sys
-from datetime import datetime, timedelta, timezone
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import sqlite3
 data = Path(os.environ["AMBER_DATA_DIR"])
 print("reader-data=" + str(data), flush=True)
 print("blobs=" + str(int((data / "blobs").exists())), flush=True)
-
-def usable_count():
-    db = sqlite3.connect(data / "amber.sqlite3")
-    db.row_factory = sqlite3.Row
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = db.execute(
-        "SELECT * FROM snapshots WHERE status = 'complete' AND created_at >= ? AND word_count >= 120",
-        (cutoff,),
-    ).fetchall()
-    count = 0
-    for row in rows:
-        text = (data / "snaps" / row["id"] / "article.txt").read_text(encoding="utf-8")
-        if len(text.split()) >= 120:
-            count += 1
-    return count
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/healthz"):
             return self._send(200, b"ok")
-        if self.path.startswith("/api/snapshots"):
-            body = json.dumps({"total_usable": usable_count(), "snapshots": []}).encode()
-            return self._send(200, body, "application/json")
         if self.path.endswith("/article.txt"):
             sid = self.path.strip("/").split("/")[0]
             path = data / "snaps" / sid / "article.txt"
@@ -531,7 +523,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve_forever()
-""".replace("__ROOT__", repr(str(ROOT))),
+""",
         encoding="utf-8",
     )
     env = _env(paths)
@@ -540,9 +532,9 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve
     env["AMBER_READER_PASSWORD"] = "secret"
     result = subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "manifest ok snapshots=2 total_usable=1" in result.stdout
-    assert "reader total_usable 1" in result.stdout
+    assert "manifest ok library_snapshots=2 candidates=1 snaps_files=3 articles=2" in result.stdout
     assert "served 2 articles" in result.stdout
+    assert "total_usable" not in result.stdout
     assert "live snapshot count (not checked): 3" in result.stderr
     assert "secret" not in result.stdout
     assert "secret" not in result.stderr
@@ -684,12 +676,12 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve
         env["AMBER_RESTORE_PORT"] = port
         return subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
 
-    wrong = serve(json.dumps({"total_usable": 99, "snapshots": []}), "18762")
+    wrong = serve("not the snapshot", "18762")
     assert wrong.returncode != 0
-    assert "total_usable 99" in wrong.stderr
-    absent = serve(json.dumps({"snapshots": ["x"] * 200}), "18763")
-    assert absent.returncode != 0
-    assert "did not report total_usable" in absent.stderr
+    assert "did not contain its snapshot text" in wrong.stderr
+    empty = serve("", "18763")
+    assert empty.returncode != 0
+    assert "was empty" in empty.stderr
 
 
 def test_unit_env_loads_into_app_settings(tmp_path: Path):
@@ -700,8 +692,15 @@ def test_unit_env_loads_into_app_settings(tmp_path: Path):
             continue
         key, value = line[len("Environment=") :].split("=", 1)
         env[key] = value.replace("%h", str(home))
-    env["AMBER_READER_PASSWORD"] = "unit-secret"
-    env.pop("AMBER_READER_PASSWORD_FILE", None)
+    env.pop("AMBER_READER_PASSWORD", None)
+    password_file = Path(env["AMBER_READER_PASSWORD_FILE"])
+    password_file.parent.mkdir(parents=True, exist_ok=True)
+    password_file.write_text("unit-secret\n", encoding="utf-8")
+    password_file.chmod(0o600)
+    token_file = Path(env["AMBER_INGEST_TOKEN_FILE"])
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text("ingest-token\n", encoding="utf-8")
+    token_file.chmod(0o600)
     (home / "apps" / "amber-reader" / "data").mkdir(parents=True)
     script = tmp_path / "check_unit_env.py"
     script.write_text(
@@ -710,11 +709,21 @@ import app.auth as auth
 import app.config as config
 from app.main import ALLOWED_HOSTS
 
+import os
+from pathlib import Path
+
+from app.library_push import _push_settings
+
 assert config.ingest_library()
 assert config.HOST == "127.0.0.1"
 assert config.PORT == 8084
 assert "dell-plx-reader.tailf9612a.ts.net" in config.EXTRA_HOSTS
 assert "127.0.0.1" in config.EXTRA_HOSTS
+assert config.app_state_dir() == Path(os.environ["AMBER_APP_STATE"]).resolve()
+assert config.scratch_path() == Path(os.environ["AMBER_SCRATCH_DIR"]).resolve()
+assert os.environ["AMBER_INGEST_URL"] == "http://127.0.0.1:8082"
+assert os.environ["AMBER_INGEST_TOKEN_FILE"].endswith("/.config/amber/ingest.token")
+assert _push_settings() == ("http://127.0.0.1:8082", "ingest-token")
 assert auth.USERNAME == "amber"
 assert auth.required_password() == "unit-secret"
 assert auth.CHALLENGE == 'Basic realm="amber-reader", charset="UTF-8"'
@@ -738,11 +747,12 @@ assert "127.0.0.1" in ALLOWED_HOSTS
 def test_units_and_docs_keep_bind_and_cold_boot_order():
     unit = (ROOT / "docs" / "ops" / "amber-web.service").read_text(encoding="utf-8")
     assert "amber-reader.env" not in unit
-    assert "amber-web.env" in unit
-    assert "only" in (ROOT / "docs" / "ops" / "amber-web.env.example").read_text(encoding="utf-8")
+    assert "EnvironmentFile=" not in unit
+    assert "AMBER_READER_PASSWORD_FILE=%h/.config/amber/reader.password" in unit
     example = (ROOT / "docs" / "ops" / "amber-web.env.example").read_text(encoding="utf-8")
-    assignments = [line for line in example.splitlines() if line and not line.startswith("#")]
-    assert assignments == ["AMBER_READER_PASSWORD=replace-me"]
+    assert "reader.password" in example
+    assert "only the password" in example
+    assert not [line for line in example.splitlines() if line and not line.startswith("#")]
     assert "AMBER_ALLOWED_HOSTS=dell-plx-reader.tailf9612a.ts.net,127.0.0.1:8084" in unit
     assert "AMBER_HOST=127.0.0.1" in unit
     assert "--host 127.0.0.1 --port 8084" in unit
@@ -767,6 +777,8 @@ def test_units_and_docs_keep_bind_and_cold_boot_order():
     assert "dell-plx-reader" in cold
     assert "Do not sign in at the desktop" in cold
     assert "Mac" in cold
+    assert "screenshot" in cold
+    assert "phone" in cold
     assert "S4U" in cold
     assert "127.0.0.1:8084/healthz" in cold
     backup_doc = (ROOT / "docs" / "ops" / "dell-plx-backup.md").read_text(encoding="utf-8")

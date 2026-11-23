@@ -121,124 +121,63 @@ done < <(find "$STATE" -mindepth 1 -type f -print0)
   || die "staged app-state is missing sources.json or homepage.json"
 
 python3 - "$stage" "$LIBRARY" <<'PY' || die "could not write manifest"
-import hashlib, json, re, sqlite3, sys
-from datetime import datetime, timedelta, timezone
+import hashlib, json, sqlite3, sys
 from pathlib import Path
-from urllib.parse import urlparse
-
-# Same figure as GET /api/snapshots total_usable in app/api.py:
-# complete rows in the last 365 days, one per url_normalized, word_count and
-# article text at least 120 words, title not just the site, not a short stub.
-# limit only slices the snapshots array and is not part of this count.
-MAX_SINCE_DAYS = 365
-MIN_USABLE_WORDS = 120
-STUB_MAX_WORDS = 400
-STUB_RE = re.compile(r"subscribe to (?:unlock|read)|already a subscriber", re.IGNORECASE)
 
 stage, library = Path(sys.argv[1]), Path(sys.argv[2])
 
-def bare(host):
-    host = (host or "").strip().lower()
-    return host[4:] if host.startswith("www.") else host
+def table_counts(path):
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    names = [
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    ]
+    counts = {}
+    for name in names:
+        if not name.replace("_", "").isalnum():
+            raise SystemExit(f"unexpected table name: {name}")
+        counts[name] = db.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+    db.close()
+    return counts
 
-def host_of(url):
-    return bare(urlparse(url or "").hostname or "")
-
-def site_name(snap):
-    name = (snap.get("site_name") or "").strip()
-    if name and "." not in name:
-        return name
-    host = bare(name) or host_of(snap.get("final_url")) or host_of(snap.get("url"))
-    return host
-
-def title_is_just_a_name(snap, site):
-    title = bare(snap.get("title") or "")
-    if not title:
-        return True
-    names = {
-        bare(snap.get("site_name") or ""),
-        site.lower(),
-        host_of(snap.get("final_url")),
-        host_of(snap.get("url")),
-    }
-    return title in names
-
-def article_words(sid):
-    path = library / "snaps" / sid / "article.txt"
-    if not path.is_file():
-        return []
-    return path.read_text(encoding="utf-8").split()
-
-def is_usable(snap, site):
-    if snap["status"] != "complete":
-        return False
-    if int(snap.get("word_count") or 0) < MIN_USABLE_WORDS:
-        return False
-    if title_is_just_a_name(snap, site):
-        return False
-    words = article_words(snap["id"])
-    if len(words) < MIN_USABLE_WORDS:
-        return False
-    text = " ".join(words)
-    return not (len(words) < STUB_MAX_WORDS and STUB_RE.search(text[:300]))
-
-db = sqlite3.connect(stage / "amber.sqlite3")
-db.row_factory = sqlite3.Row
-count = db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-ids = [
-    row[0]
-    for row in db.execute(
-        "SELECT id FROM snapshots WHERE status = 'complete' ORDER BY id LIMIT 5"
-    )
-]
+library_tables = table_counts(stage / "amber.sqlite3")
+app_tables = table_counts(stage / "state" / "app.sqlite3")
+db = sqlite3.connect(f"file:{stage / 'amber.sqlite3'}?mode=ro", uri=True)
+ids = []
+if "snapshots" in library_tables:
+    ids = [row[0] for row in db.execute("SELECT id FROM snapshots ORDER BY id LIMIT 5")]
+db.close()
 articles = []
 for sid in ids:
     path = library / "snaps" / sid / "article.txt"
     if not path.is_file():
         continue
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    articles.append({"id": sid, "sha256": digest})
+    raw = path.read_bytes()
+    sample = raw.decode("utf-8", errors="replace").strip()[:40]
+    if not sample:
+        continue
+    articles.append({"id": sid, "sha256": hashlib.sha256(raw).hexdigest(), "sample": sample})
 if not articles:
     raise SystemExit("no article.txt files to record")
-cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
-needed = {"id", "status", "word_count", "title", "url", "url_normalized", "created_at"}
-if not needed <= cols:
-    raise SystemExit("staged library is missing columns needed for total_usable")
-cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_SINCE_DAYS)).strftime(
-    "%Y-%m-%dT%H:%M:%SZ"
-)
-rows = db.execute(
-    """
-    SELECT * FROM snapshots
-    WHERE status = 'complete' AND created_at >= ?
-    ORDER BY created_at DESC
-    """,
-    (cutoff,),
-).fetchall()
-seen = set()
-usable = 0
 snaps = library / "snaps"
-for row in rows:
-    snap = dict(row)
-    key = snap.get("url_normalized")
-    if key in seen:
-        continue
-    site = site_name(snap)
-    if is_usable(snap, site):
-        seen.add(key)
-        usable += 1
-state = sqlite3.connect(stage / "state" / "app.sqlite3")
-candidates = state.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-sources = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-8"))
+snaps_files = sum(1 for path in snaps.rglob("*") if path.is_file()) if snaps.is_dir() else 0
+sources_doc = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-8"))
+sources = sources_doc.get("sources")
+if not isinstance(sources, list):
+    raise SystemExit("sources.json has no sources list")
+if "candidates" not in app_tables:
+    raise SystemExit("app-state has no candidates table")
 (stage / "manifest.json").write_text(
     json.dumps(
         {
-            "snapshots": count,
-            "total_usable": usable,
-            "since_days": MAX_SINCE_DAYS,
+            "library_tables": library_tables,
+            "app_tables": app_tables,
             "articles": articles,
-            "candidates": candidates,
-            "sources": len(sources.get("sources", [])),
+            "snaps_files": snaps_files,
+            "sources": len(sources),
+            "candidates": app_tables["candidates"],
         },
         indent=2,
     )

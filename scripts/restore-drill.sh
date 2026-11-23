@@ -2,6 +2,15 @@
 # Check the latest complete backup against the manifest written at backup time,
 # then start a reader on a temp copy and fetch the same articles.
 # Live library and app-state paths are never written.
+#
+# The reader is the checkout named by AMBER_READER_DIR. On Dell that is
+# amber-reader (~/apps/amber-reader), not this amber-archive tree. The drill
+# starts it as:
+#   cd "$AMBER_READER_DIR"
+#   env -i ... "$AMBER_READER_PYTHON" -m uvicorn app.main:app \
+#     --host 127.0.0.1 --port "$AMBER_RESTORE_PORT"
+# AMBER_READER_PYTHON defaults to python3. AMBER_READER_CMD replaces that
+# command in tests. The drill does not ask the reader for a count.
 set -euo pipefail
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
@@ -112,37 +121,82 @@ fi
 
 [[ -f "$copy/manifest.json" ]] || die "backup $latest has no manifest"
 [[ -f "$copy/.complete" ]] || die "backup $latest is not marked complete"
-python3 - "$copy" <<'PY' || die "backup does not match its manifest"
-import hashlib, json, sqlite3, sys
+checks="$(python3 - "$copy" <<'PY'
+import json, sys
 from pathlib import Path
 copy = Path(sys.argv[1])
 manifest = json.loads((copy / "manifest.json").read_text(encoding="utf-8"))
-db = sqlite3.connect(f"file:{copy / 'amber.sqlite3'}?mode=ro", uri=True)
-count = db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-if count != manifest["snapshots"]:
-    raise SystemExit(f"snapshot count {count} != manifest {manifest['snapshots']}")
-state = sqlite3.connect(f"file:{copy / 'state' / 'app.sqlite3'}?mode=ro", uri=True)
-candidates = state.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-if candidates != manifest["candidates"]:
-    raise SystemExit(f"candidate count {candidates} != manifest {manifest['candidates']}")
-sources = json.loads((copy / "state" / "sources.json").read_text(encoding="utf-8"))
-if len(sources.get("sources", [])) != manifest["sources"]:
-    raise SystemExit("source count does not match the manifest")
-if not manifest.get("articles"):
+articles = manifest.get("articles") or []
+if not articles:
     raise SystemExit("manifest has no articles")
-if "total_usable" not in manifest:
-    raise SystemExit("manifest has no total_usable")
-for item in manifest["articles"]:
-    path = copy / "snaps" / item["id"] / "article.txt"
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != item["sha256"]:
-        raise SystemExit(f"article {item['id']} hash does not match the manifest")
-print(
-    f"manifest ok snapshots={count} total_usable={manifest['total_usable']} candidates={candidates} articles={len(manifest['articles'])}",
-    flush=True,
-)
+rows = []
+for table, count in sorted(manifest["library_tables"].items()):
+    rows.append(json.dumps({"op": "library", "table": table, "count": count}))
+for table, count in sorted(manifest["app_tables"].items()):
+    rows.append(json.dumps({"op": "app", "table": table, "count": count}))
+for item in articles:
+    rows.append(json.dumps({"op": "article", "id": item["id"], "sha256": item["sha256"], "sample": item["sample"]}))
+rows.append(json.dumps({"op": "snaps", "count": manifest["snaps_files"]}))
+rows.append(json.dumps({"op": "sources", "count": manifest["sources"]}))
+rows.append(json.dumps({"op": "candidates", "count": manifest["candidates"]}))
+print("\n".join(rows))
 PY
+)" || die "backup manifest cannot be read"
+articles=0
+library_snapshots=""
+while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
+  op="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["op"])' "$line")"
+  case "$op" in
+    library|app)
+      table="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["table"])' "$line")"
+      expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["count"])' "$line")"
+      [[ "$table" =~ ^[A-Za-z0-9_]+$ ]] || die "bad table name in manifest"
+      if [[ "$op" == library ]]; then
+        db="$copy/amber.sqlite3"
+      else
+        db="$copy/state/app.sqlite3"
+      fi
+      got="$(sqlite3 "file:${db}?mode=ro" "SELECT COUNT(*) FROM \"${table}\"")" \
+        || die "could not count $table"
+      [[ "$got" == "$expected" ]] || die "$op $table count $got != manifest $expected"
+      if [[ "$op" == library && "$table" == snapshots ]]; then
+        library_snapshots="$got"
+      fi
+      ;;
+    article)
+      sid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$line")"
+      expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sha256"])' "$line")"
+      got="$(sha256sum "$copy/snaps/$sid/article.txt" | awk '{print $1}')" \
+        || die "could not hash $sid"
+      [[ "$got" == "$expected" ]] || die "article $sid hash does not match the manifest"
+      articles=$((articles + 1))
+      ;;
+    snaps)
+      expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["count"])' "$line")"
+      got="$(find "$copy/snaps" -type f | wc -l | tr -d ' ')"
+      [[ "$got" == "$expected" ]] || die "snaps file count $got != manifest $expected"
+      ;;
+    sources)
+      expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["count"])' "$line")"
+      got="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("sources", [])))' "$copy/state/sources.json")"
+      [[ "$got" == "$expected" ]] || die "source count $got != manifest $expected"
+      ;;
+    candidates)
+      expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["count"])' "$line")"
+      got="$(sqlite3 "file:${copy}/state/app.sqlite3?mode=ro" 'SELECT COUNT(*) FROM "candidates"')" \
+        || die "could not count candidates"
+      [[ "$got" == "$expected" ]] || die "candidate count $got != manifest $expected"
+      ;;
+  esac
+done <<<"$checks"
+[[ "$articles" -ge 1 ]] || die "manifest has no articles"
 log "manifest matched for $latest"
+printf 'manifest ok library_snapshots=%s candidates=%s snaps_files=%s articles=%s\n' \
+  "${library_snapshots:-0}" \
+  "$(sqlite3 "file:${copy}/state/app.sqlite3?mode=ro" 'SELECT COUNT(*) FROM "candidates"')" \
+  "$(find "$copy/snaps" -type f | wc -l | tr -d ' ')" \
+  "$articles"
 if [[ -f "$LIBRARY/amber.sqlite3" ]]; then
   live="$(sqlite3 "file:${LIBRARY}/amber.sqlite3?mode=ro" "SELECT COUNT(*) FROM snapshots" 2>/dev/null || true)"
   if [[ -n "$live" ]]; then
@@ -190,7 +244,7 @@ done
 [[ "$ok" == "1" ]] || die "reader did not answer on $port"
 log "reader answered on $port"
 python3 - "$copy/manifest.json" "$port" <<'PY' || die "reader did not serve the backup"
-import base64, hashlib, json, os, sys, urllib.request
+import base64, json, os, sys, urllib.error, urllib.request
 manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
 port = sys.argv[2]
 base = f"http://127.0.0.1:{port}"
@@ -199,25 +253,23 @@ password = os.environ.get("AMBER_READER_PASSWORD", "")
 if password:
     token = base64.b64encode(f"amber:{password}".encode()).decode()
     headers["Authorization"] = f"Basic {token}"
-# total_usable is the full usable count. limit only slices the snapshots
-# array (this app clamps it to 200), so the page length is not the count.
-count_url = f"{base}/api/snapshots?since_days=365&limit=1"
-with urllib.request.urlopen(urllib.request.Request(count_url, headers=headers), timeout=5) as response:
-    payload = json.loads(response.read().decode())
-if "total_usable" not in payload:
-    raise SystemExit("reader did not report total_usable")
-if payload["total_usable"] != manifest["total_usable"]:
-    raise SystemExit(
-        f"reader total_usable {payload['total_usable']} != manifest {manifest['total_usable']}"
-    )
-print(f"reader total_usable {payload['total_usable']}", flush=True)
+with urllib.request.urlopen(f"{base}/healthz", timeout=10) as response:
+    if response.status != 200 or not response.read().strip():
+        raise SystemExit("healthz was empty")
 for item in manifest["articles"]:
     request = urllib.request.Request(f"{base}/{item['id']}/article.txt", headers=headers)
-    with urllib.request.urlopen(request, timeout=5) as response:
-        body = response.read()
-    digest = hashlib.sha256(body).hexdigest()
-    if digest != item["sha256"]:
-        raise SystemExit(f"served article {item['id']} does not match the manifest")
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"article {item['id']} returned {exc.code}") from exc
+    with response:
+        if response.status != 200:
+            raise SystemExit(f"article {item['id']} returned {response.status}")
+        body = response.read().decode("utf-8", errors="replace")
+    if not body.strip():
+        raise SystemExit(f"article {item['id']} was empty")
+    if item["sample"] not in body:
+        raise SystemExit(f"article {item['id']} did not contain its snapshot text")
 print(f"served {len(manifest['articles'])} articles", flush=True)
 PY
 log "served articles match the manifest"

@@ -16,7 +16,7 @@ tailscale serve --bg --https=8444 http://127.0.0.1:8083
 
 ## 1. Enable amber-web on loopback
 
-Copy `docs/ops/amber-web.env.example` to `~/.config/amber/amber-web.env`, mode `0600`, with only `AMBER_READER_PASSWORD`. Do not use `amber-reader.env` here. That file can set data paths and ports, and those would override this unit.
+Create `~/.config/amber/reader.password`, mode `0600`, containing only the password. Point amber-reader at the same file (`AMBER_READER_PASSWORD_FILE`). Do not use `amber-reader.env` as an `EnvironmentFile` for this unit.
 
 ```bash
 systemctl --user enable --now amber-web.service
