@@ -5,7 +5,8 @@ Description=Amber web in ingest mode
 # See docs/ops/dell-plx-cutover.md.
 
 [Service]
-WorkingDirectory=%h/apps/amber-archive
+# Deploy checkout. ~/apps/amber-archive stays the ingest and import tree.
+WorkingDirectory=%h/apps/amber-web
 # The password file holds only the password, mode 0600. The reader uses
 # the same file. There is no EnvironmentFile, so nothing in a dotenv can
 # replace the settings below.
@@ -20,7 +21,7 @@ Environment=AMBER_INGEST_TOKEN_FILE=%h/.config/amber/ingest.token
 Environment=AMBER_ALLOWED_HOSTS=dell-plx-reader.tailf9612a.ts.net,127.0.0.1:8084
 Environment=AMBER_HOST=127.0.0.1
 Environment=AMBER_PORT=8084
-ExecStart=%h/apps/amber-archive/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8084
+ExecStart=%h/apps/amber-web/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8084
 Restart=on-failure
 
 [Install]

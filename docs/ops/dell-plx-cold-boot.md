@@ -4,6 +4,8 @@ This checklist needs Jeremy's yes before anyone reboots Dell-PLX. The change tha
 
 The existing S4U scheduled task is what starts the session at boot. This checklist does not replace that task. amber-web.service must already be enabled, so port 8084 is up after the reboot without a console sign-in. `tailscale serve` for port 443 still points at the reader on 8081 during this check.
 
+The amber-web deploy checkout is `~/apps/amber-web`. `amber-web.service` and `amber-backup.service` use that tree. `~/apps/amber-archive` stays the ingest and import checkout. If the deploy tree is somewhere else, change `WorkingDirectory` and `ExecStart` in both units before enabling them. The backup unit runs `rsync` from `PATH`. Set `AMBER_RSYNC=%h/bin/rsync` in the unit when Dell should use the user-space binary instead.
+
 Record the evidence in `~/apps/amber-reader/cold-boot-YYYY-MM-DD.txt` on Dell-PLX. Each check gets a UTC timestamp. Every check below has to finish within 5 minutes of `LastBootUpTime`.
 
 ## Before the reboot

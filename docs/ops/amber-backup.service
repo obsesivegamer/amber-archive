@@ -4,17 +4,19 @@ OnFailure=amber-backup-failed.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/apps/amber-archive
+# Deploy checkout, not ~/apps/amber-archive (that tree is the live ingest
+# and import code). If the checkout moves, change this path and ExecStart.
+WorkingDirectory=%h/apps/amber-web
 Environment=AMBER_LIBRARY_DIR=%h/apps/amber-reader/data
 Environment=AMBER_APP_STATE=%h/.local/share/amber/web-state
 Environment=AMBER_BACKUP_STAGING=%h/.local/share/amber/backup-staging
 Environment=AMBER_BACKUP_DEST=boxj:amber-backups
 Environment=AMBER_BACKUP_KEEP=30
-# Local user-space rsync on Dell.
-Environment=AMBER_RSYNC=%h/bin/rsync
+# Local rsync is whatever is on PATH. Set AMBER_RSYNC=%h/bin/rsync when
+# Dell should use the user-space binary instead of the system one.
 # boxj's shell runs this path. sync-boxj.sh is not in this repo.
 # amber-reader scripts/sync-from-mac.sh does not pass --rsync-path.
 # Confirm $HOME/bin/rsync on boxj before enabling the timer, and set this
 # to sync-boxj.sh's remote path if that script names a different one.
 Environment=AMBER_RSYNC_PATH=$HOME/bin/rsync
-ExecStart=%h/apps/amber-archive/scripts/backup-amber.sh
+ExecStart=%h/apps/amber-web/scripts/backup-amber.sh

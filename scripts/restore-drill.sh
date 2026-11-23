@@ -156,8 +156,12 @@ for table, count in sorted(manifest["app_tables"].items()):
 for item in articles:
     rows.append(json.dumps({"op": "article", "id": item["id"], "sha256": item["sha256"], "sample": item["sample"]}))
 rows.append(json.dumps({"op": "snaps", "count": manifest["snaps_files"]}))
-rows.append(json.dumps({"op": "sources", "count": manifest["sources"]}))
-rows.append(json.dumps({"op": "candidates", "count": manifest["candidates"]}))
+for name, present in sorted(manifest.get("app_state_files", {}).items()):
+    rows.append(json.dumps({"op": "app_file", "name": name, "present": bool(present)}))
+if manifest.get("sources") is not None:
+    rows.append(json.dumps({"op": "sources", "count": manifest["sources"]}))
+if manifest.get("candidates") is not None:
+    rows.append(json.dumps({"op": "candidates", "count": manifest["candidates"]}))
 print("\n".join(rows))
 PY
 )" || die "backup manifest cannot be read"
@@ -196,8 +200,19 @@ while IFS= read -r line; do
       got="$(find "$copy/snaps" -type f | wc -l | tr -d ' ')"
       [[ "$got" == "$expected" ]] || die "snaps file count $got != manifest $expected"
       ;;
+    app_file)
+      name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["name"])' "$line")"
+      present="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["present"])' "$line")"
+      [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad app-state file name in manifest"
+      if [[ "$present" == True ]]; then
+        [[ -f "$copy/state/$name" ]] || die "app-state $name was present at backup and is missing"
+      else
+        [[ ! -e "$copy/state/$name" ]] || die "app-state $name was absent at backup and is in the copy"
+      fi
+      ;;
     sources)
       expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["count"])' "$line")"
+      [[ -f "$copy/state/sources.json" ]] || die "sources.json was recorded and is missing"
       got="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1], encoding="utf-8")).get("sources", [])))' "$copy/state/sources.json")"
       [[ "$got" == "$expected" ]] || die "source count $got != manifest $expected"
       ;;
@@ -211,9 +226,13 @@ while IFS= read -r line; do
 done <<<"$checks"
 [[ "$articles" -ge 1 ]] || die "manifest has no articles"
 log "manifest matched for $latest"
+candidates_out="absent"
+if [[ -f "$copy/state/app.sqlite3" ]]; then
+  candidates_out="$(sqlite3 "file:${copy}/state/app.sqlite3?mode=ro" 'SELECT COUNT(*) FROM "candidates"' 2>/dev/null || printf absent)"
+fi
 printf 'manifest ok library_snapshots=%s candidates=%s snaps_files=%s articles=%s\n' \
   "${library_snapshots:-0}" \
-  "$(sqlite3 "file:${copy}/state/app.sqlite3?mode=ro" 'SELECT COUNT(*) FROM "candidates"')" \
+  "$candidates_out" \
   "$(find "$copy/snaps" -type f | wc -l | tr -d ' ')" \
   "$articles"
 if [[ -f "$LIBRARY/amber.sqlite3" ]]; then

@@ -8,10 +8,11 @@ amber-web's unit is `docs/ops/amber-web.service`. It listens on `127.0.0.1:8084`
 
 Leave this in place until step 3. It is also the rollback. Do not run it after step 3: that would point 443 back at 8081.
 
+Import is not on the tailnet. It listens on `127.0.0.1:8083` only. The old `8444` serve route was removed on purpose and is not part of this cutover.
+
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8081
 tailscale serve --bg --https=8443 http://127.0.0.1:8082
-tailscale serve --bg --https=8444 http://127.0.0.1:8083
 ```
 
 ## 1. Enable amber-web on loopback
@@ -34,7 +35,6 @@ Run `docs/ops/dell-plx-cold-boot.md` while 443 still points at 8081 and 8443 sti
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8084
 tailscale serve --bg --https=8443 http://127.0.0.1:8082
-tailscale serve --bg --https=8444 http://127.0.0.1:8083
 ```
 
 Do not run `tailscale funnel`. `scripts/health-amber.sh` runs `tailscale serve status --json` and fails if that command fails, the output is not JSON, or any `AllowFunnel` value is true.

@@ -47,7 +47,34 @@ check() {
 check "$READER" yes
 check "$INGEST"
 check "$IMPORT"
-check "$WEB" yes
+# amber-web stays disabled until cutover. Port 8084 is required only once
+# the unit is enabled. A missing systemctl is a failure: the check cannot
+# tell the two states apart.
+if [[ -n "${AMBER_WEB_ENABLED+x}" ]]; then
+  case "$AMBER_WEB_ENABLED" in
+    1) web_enabled=1 ;;
+    0) web_enabled=0 ;;
+    *) die "AMBER_WEB_ENABLED must be 0 or 1" ;;
+  esac
+else
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is not available"
+  set +e
+  systemctl --user is-enabled amber-web.service >/dev/null 2>&1
+  web_code=$?
+  set -e
+  if [[ "$web_code" -eq 0 ]]; then
+    web_enabled=1
+  elif [[ "$web_code" -eq 1 || "$web_code" -eq 4 ]]; then
+    web_enabled=0
+  else
+    die "could not tell whether amber-web.service is enabled"
+  fi
+fi
+if [[ "$web_enabled" -eq 1 ]]; then
+  check "$WEB" yes
+else
+  log "amber-web disabled, pre-cutover"
+fi
 
 # User jerem must be able to run this without root. A permission failure
 # here fails the check every time.
@@ -71,6 +98,8 @@ except json.JSONDecodeError:
     sys.exit(2)
 def funnel_on(node):
     if isinstance(node, dict):
+        if "AllowFunnel" in node and not isinstance(node["AllowFunnel"], dict):
+            raise RuntimeError("AllowFunnel is not an object")
         allow = node.get("AllowFunnel")
         if isinstance(allow, dict) and any(value is True for value in allow.values()):
             return True
@@ -79,16 +108,16 @@ def funnel_on(node):
         return any(funnel_on(value) for value in node)
     return False
 if funnel_on(data):
-    sys.exit(1)
+    sys.exit(10)
 ' <<<"$status" 2>"$pyerr"
 code=$?
 set -e
 detail="$(tr '\n' ' ' <"$pyerr" | sed 's/[[:space:]]*$//')"
 rm -f "$pyerr"
-if [[ "$code" -eq 1 ]]; then
+if [[ "$code" -eq 10 ]]; then
   die "tailscale funnel is on"
 elif [[ "$code" -ne 0 ]]; then
-  die "tailscale serve status is not JSON${detail:+: $detail}"
+  die "tailscale funnel check failed${detail:+: $detail}"
 fi
 log "tailscale funnel is off"
 

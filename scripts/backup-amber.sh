@@ -49,10 +49,8 @@ fi
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is not on PATH"
 command -v "$RSYNC_BIN" >/dev/null 2>&1 || die "rsync not found: $RSYNC_BIN"
 [[ -f "$LIBRARY/amber.sqlite3" ]] || die "library database missing: $LIBRARY/amber.sqlite3"
-[[ -f "$STATE/app.sqlite3" ]] || die "app-state database missing: $STATE/app.sqlite3"
-for name in sources.json homepage.json; do
-  [[ -f "$STATE/$name" ]] || die "missing $STATE/$name"
-done
+# App-state may be empty before cutover. Back up the files that exist.
+# Do not create sources.json or homepage.json to fill the gap.
 
 resolve_dir() {
   local target="$1"
@@ -105,20 +103,22 @@ log "staging $TODAY under $stage"
 
 sqlite3 "$LIBRARY/amber.sqlite3" ".backup '$stage/amber.sqlite3'" \
   || die "sqlite3 backup of the library failed"
-sqlite3 "$STATE/app.sqlite3" ".backup '$stage/state/app.sqlite3'" \
-  || die "sqlite3 backup of app-state failed"
+if [[ -f "$STATE/app.sqlite3" ]]; then
+  sqlite3 "$STATE/app.sqlite3" ".backup '$stage/state/app.sqlite3'" \
+    || die "sqlite3 backup of app-state failed"
+fi
 
 # Whole app-state tree except the live database and its sidecars.
-while IFS= read -r -d '' path; do
-  rel="${path#"$STATE"/}"
-  case "$rel" in
-    app.sqlite3*) continue ;;
-  esac
-  mkdir -p "$stage/state/$(dirname "$rel")"
-  cp -p "$path" "$stage/state/$rel"
-done < <(find "$STATE" -mindepth 1 -type f -print0)
-[[ -f "$stage/state/sources.json" && -f "$stage/state/homepage.json" ]] \
-  || die "staged app-state is missing sources.json or homepage.json"
+if [[ -d "$STATE" ]]; then
+  while IFS= read -r -d '' path; do
+    rel="${path#"$STATE"/}"
+    case "$rel" in
+      app.sqlite3*) continue ;;
+    esac
+    mkdir -p "$stage/state/$(dirname "$rel")"
+    cp -p "$path" "$stage/state/$rel"
+  done < <(find "$STATE" -mindepth 1 -type f -print0)
+fi
 
 python3 - "$stage" "$LIBRARY" <<'PY' || die "could not write manifest"
 import hashlib, json, sqlite3, sys
@@ -143,14 +143,19 @@ def table_counts(path):
     return counts
 
 library_tables = table_counts(stage / "amber.sqlite3")
-app_tables = table_counts(stage / "state" / "app.sqlite3")
+app_db = stage / "state" / "app.sqlite3"
+app_tables = table_counts(app_db) if app_db.is_file() else {}
+app_state_files = {
+    name: (stage / "state" / name).is_file()
+    for name in ("app.sqlite3", "sources.json", "homepage.json")
+}
 db = sqlite3.connect(f"file:{stage / 'amber.sqlite3'}?mode=ro", uri=True)
-ids = []
+rows = []
 if "snapshots" in library_tables:
-    ids = [row[0] for row in db.execute("SELECT id FROM snapshots ORDER BY id LIMIT 5")]
+    rows = [row[0] for row in db.execute("SELECT id FROM snapshots ORDER BY id")]
 db.close()
 articles = []
-for sid in ids:
+for sid in rows:
     path = library / "snaps" / sid / "article.txt"
     if not path.is_file():
         continue
@@ -159,25 +164,30 @@ for sid in ids:
     if not sample:
         continue
     articles.append({"id": sid, "sha256": hashlib.sha256(raw).hexdigest(), "sample": sample})
-if not articles:
-    raise SystemExit("no article.txt files to record")
+    if len(articles) == 5:
+        break
+if len(articles) < 5:
+    raise SystemExit(f"only {len(articles)} non-empty articles; need 5")
 snaps = library / "snaps"
 snaps_files = sum(1 for path in snaps.rglob("*") if path.is_file()) if snaps.is_dir() else 0
-sources_doc = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-8"))
-sources = sources_doc.get("sources")
-if not isinstance(sources, list):
-    raise SystemExit("sources.json has no sources list")
-if "candidates" not in app_tables:
-    raise SystemExit("app-state has no candidates table")
+sources = None
+if app_state_files["sources.json"]:
+    sources_doc = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-8"))
+    sources = sources_doc.get("sources")
+    if not isinstance(sources, list):
+        raise SystemExit("sources.json has no sources list")
+    sources = len(sources)
+candidates = app_tables.get("candidates") if app_state_files["app.sqlite3"] else None
 (stage / "manifest.json").write_text(
     json.dumps(
         {
             "library_tables": library_tables,
             "app_tables": app_tables,
+            "app_state_files": app_state_files,
             "articles": articles,
             "snaps_files": snaps_files,
-            "sources": len(sources),
-            "candidates": app_tables["candidates"],
+            "sources": sources,
+            "candidates": candidates,
         },
         indent=2,
     )
