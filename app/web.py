@@ -16,19 +16,20 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import tempfile
 import threading
 import time
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
-from . import capture, db
+from . import capture, config, db
 from .api import _read_body_capped
 from .config import USER_AGENT, WEBAPP_DIR
 from .security import validate_public_http_url
@@ -520,8 +521,15 @@ async def feedproxy(request: Request, url: str = ""):
 # --- homepage and sources stores ---------------------------------------------
 
 
+def store_dir() -> Path:
+    """JSON stores. Ingest mode keeps them beside the app-state database."""
+    if config.ingest_library():
+        return config.app_state_dir()
+    return Path(db.DATA_DIR)
+
+
 def _write_json_unlocked(name: str, obj: dict) -> None:
-    data_dir = db.DATA_DIR
+    data_dir = store_dir()
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     data_dir.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=data_dir, prefix=f".{name}.", suffix=".tmp")
@@ -558,7 +566,7 @@ def _put_sources(sources: list[dict], expected: str | None, updated_at: str) -> 
 
 def _read_json(name: str) -> dict | None:
     try:
-        data = json.loads((db.DATA_DIR / name).read_bytes())
+        data = json.loads((store_dir() / name).read_bytes())
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
@@ -595,6 +603,29 @@ def _normalize_timestamp(value: object) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+@router.get("/api/homepage/rebuild-request")
+async def get_rebuild_request():
+    stored = await asyncio.to_thread(_read_json, "rebuild-request.json")
+    if not isinstance(stored, dict):
+        return JSONResponse({"requested_at": None}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(stored, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/api/homepage/rebuild-request")
+async def post_rebuild_request(request: Request):
+    await _json_body(request, 4096)
+    homepage = await asyncio.to_thread(_read_json, "homepage.json")
+    baseline = homepage.get("timestamp") if isinstance(homepage, dict) else None
+    body = {
+        "requested_at": _stamp_iso(),
+        "id": secrets.token_hex(16),
+        "baseline_timestamp": baseline if isinstance(baseline, str) else None,
+        "fulfilled_at": None,
+    }
+    await asyncio.to_thread(_write_json_atomic, "rebuild-request.json", body)
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/api/homepage")
 async def get_homepage():
     stored = await asyncio.to_thread(_read_json, "homepage.json")
@@ -624,10 +655,31 @@ async def put_homepage(request: Request):
     if size > MAX_HOMEPAGE_CODE_BYTES:
         raise HTTPException(413, '"code" is larger than 2 MB.')
     timestamp = _normalize_timestamp(body.get("timestamp"))
-    await asyncio.to_thread(
-        _write_json_atomic, "homepage.json", {"code": code, "timestamp": timestamp, "bytes": size}
-    )
-    return JSONResponse({"bytes": size, "timestamp": timestamp}, headers={"Cache-Control": "no-store"})
+    incoming = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if incoming > datetime.now(timezone.utc) + timedelta(hours=24):
+        raise HTTPException(422, '"timestamp" is more than 24 hours ahead.')
+
+    def _store() -> JSONResponse:
+        with _store_lock:
+            stored = _read_json("homepage.json")
+            current = stored.get("timestamp") if isinstance(stored, dict) else None
+            if isinstance(current, str) and timestamp < current:
+                return JSONResponse(
+                    {
+                        "detail": "Homepage is older than the copy already stored.",
+                        "timestamp": current,
+                    },
+                    status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            _write_json_unlocked(
+                "homepage.json", {"code": code, "timestamp": timestamp, "bytes": size}
+            )
+        return JSONResponse(
+            {"bytes": size, "timestamp": timestamp}, headers={"Cache-Control": "no-store"}
+        )
+
+    return await asyncio.to_thread(_store)
 
 
 def _clean_sources(raw: object) -> list[dict]:

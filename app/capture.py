@@ -983,7 +983,7 @@ async def worker() -> None:
                 if started is not None:
                     stats = job.setdefault("capture_stats", empty_capture_stats())
                     stats["duration_ms"] = _elapsed_ms(started)
-                job["status"] = "failed"
+                job["status"] = "unconfirmed" if isinstance(exc, UnconfirmedPush) else "failed"
                 job["error"] = str(exc)
                 db.fail_capture(
                     job["id"],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import mimetypes
 import os
@@ -11,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -47,7 +48,7 @@ def mime_for_filename(filename: str) -> str:
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or "application/octet-stream"
 
-from . import capture, db, recapture
+from . import auth, capture, db, recapture
 from .db import LibraryUnavailable
 from .api import (
     MAX_IMPORT_BODY_BYTES,
@@ -159,16 +160,25 @@ def _allowed_extension_ids() -> set[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.configure_library_access()
+    if auth.password_configured():
+        auth.required_password()
     if db.readonly_library():
         db.require_ingest_settings()
+        auth.required_password()
+        listen = _bound_listen_host()
+        if listen not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError(
+                f"ingest mode listens on 127.0.0.1 (refusing {listen}). "
+                "Pass --host 127.0.0.1. AMBER_HOST and UVICORN_HOST are checked too."
+            )
         db.prepare_scratch()
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
     if db.hold_instance_lock():
+        db.fail_interrupted()
         if db.readonly_library():
             db.sweep_scratch()
-        db.fail_interrupted()
     else:
         log.warning(
             "Another Amber process holds %s; leaving its in-flight captures alone.",
@@ -187,7 +197,7 @@ async def lifespan(app: FastAPI):
         )
     for entry in REJECTED_EXTRA_HOSTS:
         log.warning(
-            "AMBER_ALLOWED_HOSTS: ignoring %r (use bare hostnames: no scheme, port, path or wildcard).",
+            "AMBER_ALLOWED_HOSTS: ignoring %r (use a hostname or IPv4 address, optional :port; no scheme, path or wildcard).",
             entry,
         )
     if WEBAPP_DIR is not None:
@@ -281,10 +291,69 @@ async def reject_cross_site_writes(request: Request, call_next):
     return await call_next(request)
 
 
-# Added before TrustedHostMiddleware so the Host header is validated first.
+# TrustedHost is added last so it runs first. Auth sits inside it: a bad Host
+# is rejected before a missing cookie is. Loopback is not an authenticated user.
+app.add_middleware(auth.AuthMiddleware)
 app.add_middleware(BaseHTTPMiddleware, dispatch=reject_cross_site_writes)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
+
+
+def _bound_listen_host() -> str:
+    """The address uvicorn will bind, from --host, UVICORN_HOST, or AMBER_HOST."""
+    chosen = os.environ.get("UVICORN_HOST", "").strip() or HOST
+    argv = sys.argv[1:]
+    for index, arg in enumerate(argv):
+        if arg == "--host" and index + 1 < len(argv):
+            chosen = argv[index + 1]
+        elif arg.startswith("--host="):
+            chosen = arg.split("=", 1)[1]
+    return chosen.strip() or HOST
+
+
+def _safe_next(raw: str | None) -> str:
+    nxt = raw or "/saved"
+    if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+        return "/saved"
+    return nxt
+
+
+@app.get("/healthz", response_class=PlainTextResponse)
+async def healthz():
+    return "ok"
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request, next: str = "/saved"):
+    if auth.password_configured() and auth.session_ok(request.cookies.get(auth.COOKIE_NAME)):
+        return RedirectResponse(_safe_next(next), status_code=303)
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"next": _safe_next(next), "error": None},
+    )
+
+
+@app.post("/login")
+async def login_submit(request: Request, password: str = Form(""), next: str = Form("/saved")):
+    target = _safe_next(next)
+    if not auth.password_configured() or not auth.password_ok(password):
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {"next": target, "error": "That password does not match."},
+            status_code=401,
+        )
+    response = RedirectResponse(target, status_code=303)
+    auth.set_session_cookie(response, secure=auth.request_is_https(request))
+    return response
+
+
+@app.post("/logout")
+async def logout():
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
 
 
 @app.get("/favicon.ico")
@@ -419,7 +488,15 @@ async def saving(request: Request, job_id: str):
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
+    if job and job.get("status") in {"unconfirmed", "unknown"}:
+        db.recheck_unsettled(job_id)
+        row = db._job_row(job_id)
+        if row is not None:
+            job["status"] = row["status"]
+            job["error"] = row["error"]
+            job["snapshot_id"] = row["snapshot_id"] or job.get("snapshot_id")
     if not job:
+        db.recheck_unsettled(job_id)
         snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)
         if not snap:
             failed = import_failure(job_id)
@@ -512,17 +589,25 @@ app.include_router(api_router)
 app.include_router(web_router)
 
 
+_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Amber is unavailable</title></head>
+<body><h1>Amber is unavailable</h1><p>{detail}</p></body></html>
+"""
+
+
 @app.exception_handler(LibraryUnavailable)
-async def library_unavailable(_request: Request, exc: LibraryUnavailable):
-    return JSONResponse({"detail": str(exc)}, status_code=503)
+async def library_unavailable(request: Request, exc: LibraryUnavailable):
+    detail = str(exc)
+    accepts = request.headers.get("accept", "")
+    if request.url.path.startswith("/api") or "text/html" not in accepts:
+        return JSONResponse({"detail": detail}, status_code=503)
+    return HTMLResponse(_UNAVAILABLE_HTML.format(detail=html.escape(detail)), status_code=503)
 
 
 def _require_complete(sid: str, suffix: str = "") -> dict:
     if not ID_RE.fullmatch(sid):
         raise HTTPException(404, "Not found")
     snap = db.get_snapshot(sid)
-    if snap and snap["id"] != sid:
-        return RedirectResponse(f"/{snap['id']}{suffix}", status_code=303)  # type: ignore[return-value]
     if not snap:
         published = db.published_job_id(sid)
         if published:
@@ -572,6 +657,17 @@ async def snapshot_screenshot(request: Request, sid: str):
         "snapshot.html",
         {"snap": snap, "mode": "screenshot"},
     )
+
+
+@app.get("/{sid}/article.txt", response_class=PlainTextResponse)
+async def snapshot_article_txt(sid: str):
+    snap = _require_complete(sid, "/article.txt")
+    if isinstance(snap, RedirectResponse):
+        return snap
+    path = db.snap_dir(sid) / "article.txt"
+    if not path.is_file():
+        raise HTTPException(404, "No article text")
+    return FileResponse(path, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/{sid}/text", response_class=HTMLResponse)

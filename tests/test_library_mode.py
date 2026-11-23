@@ -162,9 +162,13 @@ def _point_at_library(monkeypatch, library: Path, db_path: Path) -> None:
 def ingest_paths(tmp_path, monkeypatch):
     library = tmp_path / "library"
     db_path = _write_library(library)
-    state = tmp_path / "state" / "app.sqlite3"
+    state_dir = tmp_path / "state"
+    state = state_dir / "app.sqlite3"
     scratch = tmp_path / "scratch"
-    monkeypatch.setenv("AMBER_APP_STATE", str(state))
+    monkeypatch.setenv("AMBER_APP_STATE", str(state_dir))
+    monkeypatch.setenv("AMBER_READER_PASSWORD", "test-password")
+    monkeypatch.setattr("app.auth.session_ok", lambda _cookie: True)
+    monkeypatch.setattr("app.auth.basic_ok", lambda _header: True)
     monkeypatch.setenv("AMBER_SCRATCH_DIR", str(scratch))
     token = tmp_path / "ingest.token"
     token.write_text(TOKEN + "\n", encoding="utf-8")
@@ -324,6 +328,11 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
     finally:
         conn.close()
 
+    before_tree = {
+        name: digest
+        for name, digest in _tree(library).items()
+        if not name.endswith(("-wal", "-shm"))
+    }
     paths = _get_paths()
     assert any(path.startswith("/api/candidates") for path in paths)
     assert "/recapture" in paths
@@ -358,6 +367,12 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
 
     assert _sha(db_path) == content
     assert _schema_and_rows(db_path) == (schema, rows)
+    after_tree = {
+        name: digest
+        for name, digest in _tree(library).items()
+        if not name.endswith(("-wal", "-shm"))
+    }
+    assert after_tree == before_tree
     assert not (library / "amber.lock").exists()
     assert (ingest_paths["state"].with_name(ingest_paths["state"].name + ".lock")).is_file()
     assert not ingest_paths["state"].samefile(
@@ -852,9 +867,6 @@ def test_repeat_push_of_the_same_bytes_is_a_noop(capture_app, tmp_path):
 
 
 def test_default_mode_keeps_an_explicit_paywalled_flag():
-    missing = None
-    assert (1 if missing else 0) == 0
-    assert (1 if 1 else 0) == 1
     assert db.paywalled_bool(1, 400) is True
     assert db.paywalled_bool(0, 12) is False
     assert db.paywalled_bool(None, 12) is True
@@ -1039,6 +1051,7 @@ def test_save_in_a_writable_directory_without_sidecars(ingest_paths, allow_priva
         server.shutdown()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory mode 0555")
 def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
     from app.main import app
 
@@ -1086,6 +1099,13 @@ def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
             assert "Traceback" not in response.text
             search = client.get("/search", params={"q": "Shelf"})
             assert search.status_code == 503
+            page = client.get("/", headers={"accept": "text/html"})
+            assert page.status_code == 503
+            assert "text/html" in page.headers["content-type"]
+            assert "Amber is unavailable" in page.text
+            api = client.get("/api/snapshots", headers={"accept": "text/html"})
+            assert api.status_code == 503
+            assert api.headers["content-type"].startswith("application/json")
         assert {path.name for path in library.iterdir()} == names_before
         conn = sqlite3.connect(state)
         try:
@@ -1094,7 +1114,8 @@ def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
             ).fetchone()
         finally:
             conn.close()
-        assert published == ("capturing", None)
+        assert published[0] == "unknown"
+        assert "not marked failed" in (published[1] or "")
         assert not (library / "amber.sqlite3-wal").exists()
         assert not (library / "amber.sqlite3-shm").exists()
     finally:
@@ -1118,6 +1139,7 @@ def test_lost_response_retries_the_same_id(capture_app, tmp_path):
     assert (scratch / "snaps" / "Z2345").is_dir()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory mode 0555")
 def test_unconfirmed_push_keeps_scratch_when_the_library_cannot_be_read(ingest_paths, tmp_path):
     from urllib.error import URLError
 
@@ -1173,10 +1195,112 @@ def test_retarget_rewrites_srcset_and_scripts_only(tmp_path):
         encoding="utf-8",
     )
     (folder / "res" / "app.js").write_text('const u = "/Z2345/r/app.js";', encoding="utf-8")
+    nested = folder / "res" / "icons"
+    nested.mkdir()
+    (nested / "mark.svg").write_text('<svg href="/Z2345/r/mark.svg"/>', encoding="utf-8")
+    (folder / "res" / "mod.mjs").write_text('import "/Z2345/r/mod.mjs";', encoding="utf-8")
     (folder / "article.html").write_text("see /Z2345/ in the prose", encoding="utf-8")
     _retarget_scratch(scratch, "Z2345", "Z2346")
     moved = scratch / "snaps" / "Z2346"
     assert "/Z2346/r/a.jpg" in (moved / "page.html").read_text(encoding="utf-8")
     assert "/Z2345/" not in (moved / "page.html").read_text(encoding="utf-8")
     assert "/Z2346/r/app.js" in (moved / "res" / "app.js").read_text(encoding="utf-8")
+    assert "/Z2346/r/mark.svg" in (moved / "res" / "icons" / "mark.svg").read_text(encoding="utf-8")
+    assert "/Z2346/r/mod.mjs" in (moved / "res" / "mod.mjs").read_text(encoding="utf-8")
     assert (moved / "article.html").read_text(encoding="utf-8") == "see /Z2345/ in the prose"
+
+
+def test_unconfirmed_job_waits_for_a_real_library_row(ingest_paths):
+    from app import capture
+    from app.main import app
+
+    sid = "Z6789"
+    db._init_app_state()
+    db.prepare_scratch()
+    scratch = ingest_paths["scratch"] / "snaps" / sid
+    scratch.mkdir(parents=True)
+    (scratch / "page.html").write_text("kept", encoding="utf-8")
+    with db._state_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, snapshot_id, created_at
+            ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                      'unconfirmed', 'lost', ?, '2026-01-01T00:00:00Z')
+            """,
+            (sid, sid),
+        )
+        conn.commit()
+    capture.jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "status": "unconfirmed",
+        "error": "lost",
+        "url": "https://example.com/a",
+        "final_url": None,
+        "title": None,
+        "resources": [],
+        "capture_stats": {},
+    }
+    try:
+        with TestClient(app) as client:
+            first = client.get(f"/api/jobs/{sid}").json()
+            assert first["status"] == "unconfirmed"
+            assert scratch.is_dir()
+            conn = sqlite3.connect(ingest_paths["db_path"])
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    id, url, url_normalized, title, created_at, status, paywalled
+                ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                          'Landed', '2026-01-02T00:00:00Z', 'complete', 0)
+                """,
+                (sid,),
+            )
+            conn.commit()
+            conn.close()
+            second = client.get(f"/api/jobs/{sid}").json()
+            assert second["status"] == "complete"
+        assert not scratch.exists()
+    finally:
+        capture.jobs.pop(sid, None)
+
+
+def test_worker_records_an_unconfirmed_push(ingest_paths, monkeypatch):
+    import asyncio
+
+    from app import capture
+    from app.library_import import UnconfirmedPush
+
+    sid = "Z6792"
+    db._init_app_state()
+    db.prepare_scratch()
+    db.begin_capture(sid, "https://example.com/a", "https://example.com/a")
+    capture.jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "status": "capturing",
+        "url": "https://example.com/a",
+        "resources": [],
+        "capture_stats": {},
+    }
+    capture.job_queue = asyncio.Queue()
+
+    async def explode(_job_id: str) -> None:
+        raise UnconfirmedPush(sid)
+
+    monkeypatch.setattr(capture, "run_job", explode)
+
+    async def go() -> None:
+        await capture.job_queue.put(sid)
+        task = asyncio.create_task(capture.worker())
+        await capture.job_queue.join()
+        task.cancel()
+
+    try:
+        asyncio.run(go())
+        assert capture.jobs[sid]["status"] == "unconfirmed"
+        row = db._job_row(sid)
+        assert row["status"] == "unconfirmed"
+    finally:
+        capture.jobs.pop(sid, None)

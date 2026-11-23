@@ -51,7 +51,7 @@ from .config import DELL_ID_PREFIX
 from .db import new_snapshot_id
 from .import_child import TooComplex, blocked_for, ingest_in_child
 from .library_contract import ID_RE, read_token_file, tokens_equal
-from .library_push import PushError, PushRejected, push_snapshot
+from .library_push import PushError, PushRejected, push_snapshot, snapshot_push
 from .security import article_match_key
 
 log = logging.getLogger("amber.library_import")
@@ -427,11 +427,14 @@ def _separate(left: Path, right: Path, left_name: str, right_name: str) -> None:
         )
 
 
-def wipe_scratch_tree(root: Path) -> None:
+def wipe_scratch_tree(root: Path, *, keep: set[str] | None = None) -> None:
     """Drop unpublished scratch snapshots. ``root`` is not the library."""
+    held = keep or set()
     snaps = root / "snaps"
     if snaps.exists():
         for child in list(snaps.iterdir()):
+            if child.name in held:
+                continue
             if child.is_symlink() or child.is_file():
                 child.unlink()
             else:
@@ -442,7 +445,11 @@ def wipe_scratch_tree(root: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         try:
-            conn.execute("DELETE FROM snapshots")
+            if held:
+                marks = ",".join("?" for _ in held)
+                conn.execute(f"DELETE FROM snapshots WHERE id NOT IN ({marks})", tuple(held))
+            else:
+                conn.execute("DELETE FROM snapshots")
             conn.commit()
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
@@ -524,9 +531,9 @@ def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
         if not path.is_file() or path.is_symlink():
             continue
         name = path.name
-        if name not in {"page.html", "reader.html", "article.html", "meta.json"} and not (
-            path.parent.name == "res" and path.suffix.lower() in {".css", ".js"}
-        ):
+        rel = path.relative_to(folder)
+        asset = "res" in rel.parts[:-1] and path.suffix.lower() in {".css", ".js", ".mjs", ".svg"}
+        if name not in {"page.html", "reader.html", "article.html", "meta.json"} and not asset:
             continue
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
         updated = text.replace(f"/{old}/r/", f"/{new}/r/")
@@ -576,28 +583,95 @@ def _retarget_scratch(scratch: Path, old: str, new: str) -> None:
 
 
 class UnconfirmedPush(Exception):
-    """The push response was lost and the library could not be checked."""
+    """The push may have landed, and neither ingest nor the library confirmed it."""
 
     def __init__(self, sid: str):
-        super().__init__(sid)
+        super().__init__(
+            f"Ingest did not confirm snapshot {sid}. The capture is still in scratch."
+        )
         self.sid = sid
 
 
-def _published(library_dir: Path, sid: str) -> bool | None:
-    """Whether ingest stored ``sid``. None when the library cannot be read."""
+_TRANSPORT_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    ConnectionError,
+    http.client.IncompleteRead,
+)
+
+
+def _ingest_lists_id(ingest_url: str, token: str, sid: str) -> bool | None:
+    """Whether ingest's revision list contains ``sid``. None when the call fails."""
+    request = urllib.request.Request(
+        ingest_url.rstrip("/") + "/v1/revisions",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except _TRANSPORT_ERRORS + (json.JSONDecodeError, UnicodeError, OSError):
+        return None
+    revisions = payload.get("revisions") if isinstance(payload, dict) else None
+    if not isinstance(revisions, list):
+        return None
+    return any(isinstance(item, dict) and item.get("id") == sid for item in revisions)
+
+
+def _hash_matches(library_dir: Path, scratch: Path, sid: str) -> str:
+    """``match``, ``absent``, ``mismatch``, or ``unknown``."""
     db_path = library_dir / "amber.sqlite3"
     try:
         conn = open_library_ro(db_path)
-    except db.LibraryUnavailable:
-        return None
+    except (db.LibraryUnavailable, sqlite3.Error, OSError):
+        return "unknown"
     try:
         try:
-            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
+            row = conn.execute(
+                "SELECT files_json FROM library_revisions WHERE id = ?",
+                (sid,),
+            ).fetchone()
         except sqlite3.Error:
-            return None
-        return row is not None
+            return "unknown"
     finally:
         conn.close()
+    if row is None:
+        return "absent"
+    try:
+        document, _blobs = snapshot_push(scratch, sid)
+    except (OSError, PushError, sqlite3.Error):
+        return "unknown"
+    stored = row["files_json"]
+    expected = {
+        (item["path"], item["sha256"])
+        for item in document["files"]
+        if isinstance(item, dict) and "path" in item and "sha256" in item
+    }
+    try:
+        parsed = json.loads(stored)
+    except json.JSONDecodeError:
+        return "unknown"
+    if not isinstance(parsed, list):
+        return "unknown"
+    got = {
+        (item.get("path"), item.get("sha256"))
+        for item in parsed
+        if isinstance(item, dict)
+    }
+    return "match" if got == expected else "mismatch"
+
+
+def _landed(library_dir: Path, scratch: Path, sid: str, ingest_url: str, token: str) -> bool | None:
+    """True when ingest stored these bytes, False when it does not have the id.
+
+    None means the answer is not settled, so scratch must stay.
+    """
+    listed = _ingest_lists_id(ingest_url, token, sid)
+    hashed = _hash_matches(library_dir, scratch, sid)
+    if hashed == "match":
+        return True
+    if hashed == "absent" and listed is not True:
+        return False
+    return None
 
 
 def _push_confirmed(
@@ -618,12 +692,12 @@ def _push_confirmed(
     try:
         push_snapshot(scratch, sid, ingest_url, token, transport=transport)
         return
-    except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected) as first:
+    except _TRANSPORT_ERRORS as first:
         try:
             push_snapshot(scratch, sid, ingest_url, token, transport=transport)
             return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
-            present = _published(library_dir, sid)
+        except _TRANSPORT_ERRORS:
+            present = _landed(library_dir, scratch, sid, ingest_url, token)
             if present is True:
                 return
             if present is False:

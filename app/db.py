@@ -145,10 +145,13 @@ def _ro_open_failed(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     code = getattr(exc, "sqlite_errorcode", None)
-    if not isinstance(code, int):
-        return False
-    primary = code & 0xFF
-    return primary in {sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY}
+    if isinstance(code, int):
+        cantopen = getattr(sqlite3, "SQLITE_CANTOPEN", 14)
+        readonly = getattr(sqlite3, "SQLITE_READONLY", 8)
+        return (code & 0xFF) in {cantopen, readonly}
+    # Python 3.10's sqlite3.OperationalError has no sqlite_errorcode.
+    text = str(exc).lower()
+    return "unable to open" in text or "readonly" in text or "read-only" in text
 
 
 def open_library_ro(db_path: Path) -> sqlite3.Connection:
@@ -293,9 +296,10 @@ def _index_sql(db: sqlite3.Connection, name: str) -> str:
         "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
         (name,),
     ).fetchone()
-    if row is None or not row["sql"]:
+    if row is None:
         return ""
-    return row["sql"]
+    sql = row["sql"] if isinstance(row, sqlite3.Row) else row[0]
+    return sql or ""
 
 
 def _blank(value: object) -> bool:
@@ -498,15 +502,42 @@ def scratch_dir() -> Path:
     return path
 
 
+_RECAPTURE_QUEUE_DDL = """
+CREATE TABLE IF NOT EXISTS recapture_queue (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    next_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
 def _init_app_state() -> None:
     path = _state_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
         conn.executescript(_JOBS_DDL)
+        conn.executescript(_RECAPTURE_QUEUE_DDL)
+        _ensure_candidates_table(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def candidates_connect() -> sqlite3.Connection:
+    """The database that owns the candidates table.
+
+    Ingest mode keeps it in app-state. The shared library stays read-only.
+    """
+    if readonly_library():
+        _init_app_state()
+        conn = _state_conn()
+        _ensure_candidates_table(conn)
+        return conn
+    return connect()
 
 
 def _state_conn() -> sqlite3.Connection:
@@ -527,13 +558,39 @@ def prepare_scratch() -> None:
         conn.close()
 
 
+def scratch_ids_to_keep() -> set[str]:
+    """Scratch snapshots whose push is not settled yet."""
+    path = _state_file()
+    if not path.is_file():
+        return set()
+    conn = sqlite3.connect(path)
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, snapshot_id FROM jobs
+                WHERE status IN ('unconfirmed', 'unknown')
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+    finally:
+        conn.close()
+    kept: set[str] = set()
+    for row in rows:
+        for sid in (row[0], row[1]):
+            if sid:
+                kept.add(sid)
+    return kept
+
+
 def sweep_scratch() -> None:
     """Drop unpublished scratch snapshots. The library is not in this directory."""
     from .library_import import wipe_scratch_tree
 
     root = scratch_dir()
     if root.exists():
-        wipe_scratch_tree(root)
+        wipe_scratch_tree(root, keep=scratch_ids_to_keep())
 
 
 def _scratch_conn() -> sqlite3.Connection:
@@ -665,7 +722,11 @@ def fail_capture(job_id: str, sid: str, error: str, *, keep_scratch: bool = Fals
         if not keep_scratch:
             discard_scratch(gone)
         release_dell_id(gone)
-    update_job(job_id, status="failed", error=error)
+    update_job(
+        job_id,
+        status="unconfirmed" if keep_scratch else "failed",
+        error=error,
+    )
 
 
 def fill_scratch_paywalled(scratch: Path, sid: str) -> None:
@@ -778,15 +839,27 @@ def fail_interrupted() -> int:
         with _state_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, snapshot_id FROM jobs
-                WHERE status IN ('pending', 'capturing', 'queued')
+                SELECT id, snapshot_id, status FROM jobs
+                WHERE status IN ('pending', 'capturing', 'queued', 'unconfirmed', 'unknown')
                 """
             ).fetchall()
             changed = 0
             for row in rows:
                 published = row["snapshot_id"] or row["id"]
                 present = _library_has_snapshot(published)
+                if row["status"] == "unconfirmed" and present is not True:
+                    continue
                 if present is None:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'unknown',
+                            error = 'The library could not be read. The job was not marked failed.'
+                        WHERE id = ?
+                        """,
+                        (row["id"],),
+                    )
+                    changed += 1
                     continue
                 if present:
                     conn.execute(
@@ -921,10 +994,33 @@ def published_job_id(sid: str) -> str | None:
     return published
 
 
+def recheck_unsettled(job_id: str) -> None:
+    """Move a job that was left capturing or unconfirmed once the library answers."""
+    if not readonly_library():
+        return
+    row = _job_row(job_id)
+    if row is None or row["status"] not in {"unknown", "unconfirmed"}:
+        return
+    published = row["snapshot_id"] or row["id"]
+    present = _library_has_snapshot(published)
+    if present is None:
+        return
+    if present:
+        update_job(job_id, status="complete", snapshot_id=published, error=None)
+        discard_scratch(row["id"])
+        if published != row["id"]:
+            discard_scratch(published)
+        return
+    if row["status"] == "unknown":
+        update_job(job_id, status="failed", error="Interrupted before it finished.")
+        discard_scratch(row["id"])
+
+
 def job_snapshot(sid: str) -> dict | None:
     """In-flight job, or the library row a finished job published."""
     if not readonly_library():
         return None
+    recheck_unsettled(sid)
     return _job_snapshot(sid)
 
 
@@ -1105,7 +1201,7 @@ def complete_snapshots() -> list[dict]:
 def recapture_snapshots() -> list[dict]:
     """Snaps waiting on a recapture, paused, or stopped."""
     if readonly_library():
-        return []
+        return _recapture_attached()
     with connect() as db:
         rows = db.execute(
             """
@@ -1239,6 +1335,40 @@ def insert_gift_candidate_in(
     raise RuntimeError("Could not allocate a candidate id.")
 
 
+def _recapture_attached() -> list[dict]:
+    """Queue rows in app-state joined to the library through a read-only ATTACH."""
+    _init_app_state()
+    library = Path(DB_PATH)
+    state_uri = "file:{}?mode=rw".format(quote(str(_state_file()), safe="/:"))
+    conn = sqlite3.connect(state_uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        uri = "file:{}?mode=ro".format(quote(str(library), safe="/:"))
+        try:
+            conn.execute("ATTACH DATABASE ? AS library", (uri,))
+            conn.execute("PRAGMA library.query_only=ON")
+        except sqlite3.OperationalError as exc:
+            if _ro_open_failed(exc):
+                raise LibraryUnavailable(_RO_DETAIL) from exc
+            raise
+        rows = conn.execute(
+            """
+            SELECT s.*, q.state AS recapture_state, q.next_at AS recapture_next_at,
+                   q.attempts AS recapture_attempts, q.last_error AS recapture_last_error
+            FROM recapture_queue q
+            JOIN library.snapshots s ON s.id = q.id
+            WHERE q.state IN (
+                'pending', 'running', 'gave_up',
+                'needs_browser_capture', 'needs_fresh_gift'
+            )
+            ORDER BY s.created_at ASC, s.rowid ASC
+            """
+        ).fetchall()
+        return [_as_snap(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def insert_gift_candidate(
     *,
     unlock_url: str,
@@ -1252,7 +1382,7 @@ def insert_gift_candidate(
     expires_at: str,
     expires_estimated: bool,
 ) -> dict:
-    with connect() as conn:
+    with candidates_connect() as conn:
         stored = insert_gift_candidate_in(
             conn,
             unlock_url=unlock_url,
@@ -1292,22 +1422,18 @@ def update_gift_candidate_in(conn: sqlite3.Connection, cid: str, **fields: Any) 
 
 
 def update_gift_candidate(cid: str, **fields: Any) -> None:
-    with connect() as conn:
+    with candidates_connect() as conn:
         update_gift_candidate_in(conn, cid, **fields)
         conn.commit()
 
 
 def get_gift_candidate(cid: str) -> dict | None:
-    if readonly_library():
-        return None
-    with connect() as conn:
+    with candidates_connect() as conn:
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
         return _as_candidate(row) if row else None
 
 
 def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
-    if readonly_library():
-        return []
     rows = conn.execute(
         "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"
     ).fetchall()
@@ -1315,13 +1441,13 @@ def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
 
 
 def list_gift_candidates() -> list[dict]:
-    with connect() as conn:
+    with candidates_connect() as conn:
         return load_gift_candidates(conn)
 
 
 def purge_gift_candidates(expired_before: str) -> int:
     """Delete candidates whose expires_at is strictly older than ``expired_before``."""
-    with connect() as conn:
+    with candidates_connect() as conn:
         cur = conn.execute(
             "DELETE FROM candidates WHERE expires_at < ?",
             (expired_before,),
