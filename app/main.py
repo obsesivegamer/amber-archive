@@ -16,6 +16,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -489,15 +490,17 @@ async def saving(request: Request, job_id: str):
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
     if job and job.get("status") in {"unconfirmed", "unknown"}:
-        db.recheck_unsettled(job_id)
-        row = db._job_row(job_id)
+        await run_in_threadpool(db.recheck_unsettled, job_id)
+        row = await run_in_threadpool(db._job_row, job_id)
         if row is not None:
             job["status"] = row["status"]
             job["error"] = row["error"]
             job["snapshot_id"] = row["snapshot_id"] or job.get("snapshot_id")
     if not job:
-        db.recheck_unsettled(job_id)
-        snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)
+        await run_in_threadpool(db.recheck_unsettled, job_id)
+        snap = await run_in_threadpool(db.job_snapshot, job_id) or await run_in_threadpool(
+            db.get_snapshot, job_id
+        )
         if not snap:
             failed = import_failure(job_id)
             if failed is None:

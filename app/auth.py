@@ -58,7 +58,12 @@ def required_password() -> str:
         ):
             return _password_cache[2]
         password = read_token_file(path)
-        _password_cache = (resolved, path.stat().st_mtime_ns, password)
+        try:
+            mtime_after = path.stat().st_mtime_ns
+        except OSError:
+            return password
+        if mtime_after == mtime:
+            _password_cache = (resolved, mtime, password)
         return password
     _password_cache = None
     password = os.environ.get("AMBER_READER_PASSWORD", "")
@@ -161,7 +166,8 @@ def _open(path: str) -> bool:
     return path in OPEN_PATHS or path.startswith("/static/")
 
 
-CHALLENGE = f'AmberBasic realm="{REALM}"'
+# Live amber-reader (a6efb06) sends this. Scripts must send Authorization up front.
+CHALLENGE = f'Basic realm="{REALM}", charset="UTF-8"'
 
 
 class AuthMiddleware(BaseHTTPMiddleware):

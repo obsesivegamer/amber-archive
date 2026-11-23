@@ -829,6 +829,18 @@ def _library_has_snapshot(sid: str) -> bool | None:
     return row is not None
 
 
+def _ingest_lists_snapshot(sid: str) -> bool | None:
+    """Whether ingest's revision list contains ``sid``. None if ingest cannot be asked."""
+    from .library_import import _ingest_lists_id
+    from .library_push import _push_settings
+
+    settings = _push_settings()
+    if settings is None:
+        return None
+    url, token = settings
+    return _ingest_lists_id(url, token, sid)
+
+
 def fail_interrupted() -> int:
     """Mark rows left pending/capturing by a previous process as failed.
 
@@ -848,6 +860,17 @@ def fail_interrupted() -> int:
                 published = row["snapshot_id"] or row["id"]
                 present = _library_has_snapshot(published)
                 if row["status"] == "unconfirmed" and present is not True:
+                    if present is False and _ingest_lists_snapshot(published) is False:
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                            SET status = 'failed',
+                                error = 'Ingest does not have this snapshot.'
+                            WHERE id = ?
+                            """,
+                            (row["id"],),
+                        )
+                        changed += 1
                     continue
                 if present is None:
                     conn.execute(

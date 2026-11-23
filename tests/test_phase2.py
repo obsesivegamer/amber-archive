@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import time
 
 import pytest
@@ -32,6 +33,32 @@ FIND = {
     "snapshot_id": None,
     "created_at": "2026-10-09T19:25:47Z",
 }
+
+
+def _ingest_env(tmp_path, monkeypatch):
+    library = tmp_path / "library"
+    library.mkdir()
+    db_path = library / "amber.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(db.SCHEMA)
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("AMBER_LIBRARY_MODE", "ingest")
+    monkeypatch.setenv("AMBER_DATA_DIR", str(library))
+    monkeypatch.setenv("AMBER_APP_STATE", str(tmp_path / "app-state"))
+    monkeypatch.setenv("AMBER_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setenv("AMBER_INGEST_URL", "http://127.0.0.1:9")
+    token = tmp_path / "token"
+    token.write_text("token\n", encoding="utf-8")
+    token.chmod(0o600)
+    monkeypatch.setenv("AMBER_INGEST_TOKEN_FILE", str(token))
+    monkeypatch.setattr("app.db.DATA_DIR", library)
+    monkeypatch.setattr("app.db.DB_PATH", db_path)
+    monkeypatch.setattr("app.db.SNAPS_DIR", library / "snaps")
+    monkeypatch.setattr("app.config.DATA_DIR", library)
+    monkeypatch.setattr(db, "_access", None)
+    monkeypatch.setattr(db, "_writing_scratch", False)
+    return library, db_path
 
 
 def _basic() -> dict[str, str]:
@@ -181,6 +208,7 @@ def test_phone_routes_are_not_missing(authed, tmp_path):
     db.update_snapshot("Z2345", status="complete", title="Hello", word_count=40, paywalled=1)
     calls = [
         ("GET", "/api/snapshots?since_days=14&limit=5"),
+        ("GET", "/api/snapshots/Z2345/text"),
         ("GET", "/api/lookup?url=https://example.com/a"),
         ("GET", "/api/jobs/Z2345"),
         ("GET", "/api/candidates"),
@@ -533,4 +561,127 @@ def test_recapture_attach_failure_is_a_503(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_writing_scratch", False)
     with pytest.raises(db.LibraryUnavailable):
         db.recapture_snapshots()
+
+
+def test_py310_open_failure_uses_the_message():
+    class Old(sqlite3.OperationalError):
+        @property
+        def sqlite_errorcode(self):
+            return None
+
+    assert db._ro_open_failed(Old("unable to open database file")) is True
+    assert db._ro_open_failed(Old("attempt to write a readonly database")) is True
+    assert db._ro_open_failed(Old("disk I/O error")) is False
+
+
+def test_events_and_save_read_app_state(tmp_path, monkeypatch, capsys):
+    import asyncio
+    from datetime import datetime, timezone
+
+    from app.candidates import add_finds, events_since, main, save_candidate
+
+    library, db_path = _ingest_env(tmp_path, monkeypatch)
+    url = "http://93.184.216.34/story"
+    assert add_finds(
+        [
+            {
+                "unlock_url": url,
+                "publisher": "nyt",
+                "title": "Cities after the storm",
+                "found_at": "2026-11-23T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z",
+            }
+        ]
+    ) == ["added"]
+    cid = db.list_gift_candidates()[0]["id"]
+    sid = "Z2345"
+    folder = library / "snaps" / sid
+    folder.mkdir(parents=True)
+    (folder / "article.txt").write_text("city " * 160, encoding="utf-8")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        INSERT INTO snapshots (
+            id, url, url_normalized, final_url, title, site_name, created_at,
+            word_count, paywalled, status
+        ) VALUES (?, ?, ?, ?, 'Cities after the storm', 'Example',
+                  '2026-10-09T19:25:47Z', 220, 0, 'complete')
+        """,
+        (sid, url, url, url),
+    )
+    conn.commit()
+    conn.close()
+    library_after_seed = db_path.read_bytes()
+    result = asyncio.run(save_candidate(cid))
+    assert result.status_code == 200
+    events = events_since(datetime(2020, 1, 1, tzinfo=timezone.utc))
+    assert any(item["event"] == "click" and item["id"] == cid for item in events["events"])
+    assert main(["list", "--events", "--since", "2020-01-01T00:00:00Z"]) == 0
+    assert cid in capsys.readouterr().out
+    state = sqlite3.connect(tmp_path / "app-state" / "app.sqlite3")
+    clicked = state.execute(
+        "SELECT clicked_at FROM candidates WHERE id = ?", (cid,)
+    ).fetchone()[0]
+    state.close()
+    assert clicked
+    assert db_path.read_bytes() == library_after_seed
+
+
+def test_import_exact_rejects_unknown_fields(tmp_path, monkeypatch):
+    from app.candidates import import_exact
+
+    _ingest_env(tmp_path, monkeypatch)
+    raw = json.dumps({"candidates": [{**FIND, "not_a_column": 1}]})
+    assert import_exact(raw) == 1
+
+
+def test_restart_fails_an_unconfirmed_job_ingest_does_not_have(tmp_path, monkeypatch):
+    _ingest_env(tmp_path, monkeypatch)
+    sid = "Z6789"
+    db._init_app_state()
+    db.prepare_scratch()
+    scratch = tmp_path / "scratch" / "snaps" / sid
+    scratch.mkdir(parents=True)
+    with db._state_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, snapshot_id, created_at
+            ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                      'unconfirmed', 'lost', ?, '2026-01-01T00:00:00Z')
+            """,
+            (sid, sid),
+        )
+        conn.commit()
+    monkeypatch.setattr(db, "_ingest_lists_snapshot", lambda _sid: False)
+    assert db.fail_interrupted() == 1
+    row = db._job_row(sid)
+    assert row["status"] == "failed"
+    db.sweep_scratch()
+    assert not scratch.exists()
+
+
+def test_restart_keeps_unconfirmed_when_ingest_cannot_be_asked(tmp_path, monkeypatch):
+    _ingest_env(tmp_path, monkeypatch)
+    sid = "Z6793"
+    db._init_app_state()
+    db.prepare_scratch()
+    scratch = tmp_path / "scratch" / "snaps" / sid
+    scratch.mkdir(parents=True)
+    with db._state_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, snapshot_id, created_at
+            ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                      'unconfirmed', 'lost', ?, '2026-01-01T00:00:00Z')
+            """,
+            (sid, sid),
+        )
+        conn.commit()
+    monkeypatch.setattr(db, "_ingest_lists_snapshot", lambda _sid: None)
+    assert db.fail_interrupted() == 0
+    assert db._job_row(sid)["status"] == "unconfirmed"
+    db.sweep_scratch()
+    assert scratch.is_dir()
 

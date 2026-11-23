@@ -832,6 +832,11 @@ def import_exact(raw: str) -> int:
                 conn.rollback()
                 print("rejected: each candidate must be an object", file=sys.stderr)
                 return 1
+            extra = sorted(set(row) - set(columns))
+            if extra:
+                conn.rollback()
+                print(f"rejected: unknown candidate field {extra[0]}", file=sys.stderr)
+                return 1
             values = []
             for name in columns:
                 value = row.get(name)
@@ -846,9 +851,9 @@ def import_exact(raw: str) -> int:
                 values,
             )
         conn.commit()
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as exc:
         conn.rollback()
-        print("rejected: the candidate store is not empty", file=sys.stderr)
+        print(f"rejected: {exc}", file=sys.stderr)
         return 1
     finally:
         conn.close()
