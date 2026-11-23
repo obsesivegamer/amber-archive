@@ -660,20 +660,21 @@ async def put_homepage(request: Request):
         raise HTTPException(422, '"timestamp" is more than 24 hours ahead.')
 
     def _store() -> JSONResponse:
-        stored = _read_json("homepage.json")
-        current = stored.get("timestamp") if isinstance(stored, dict) else None
-        if isinstance(current, str) and timestamp < current:
-            return JSONResponse(
-                {
-                    "detail": "Homepage is older than the copy already stored.",
-                    "timestamp": current,
-                },
-                status_code=409,
-                headers={"Cache-Control": "no-store"},
+        with _store_lock:
+            stored = _read_json("homepage.json")
+            current = stored.get("timestamp") if isinstance(stored, dict) else None
+            if isinstance(current, str) and timestamp < current:
+                return JSONResponse(
+                    {
+                        "detail": "Homepage is older than the copy already stored.",
+                        "timestamp": current,
+                    },
+                    status_code=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            _write_json_unlocked(
+                "homepage.json", {"code": code, "timestamp": timestamp, "bytes": size}
             )
-        _write_json_atomic(
-            "homepage.json", {"code": code, "timestamp": timestamp, "bytes": size}
-        )
         return JSONResponse(
             {"bytes": size, "timestamp": timestamp}, headers={"Cache-Control": "no-store"}
         )

@@ -270,3 +270,77 @@ def test_recapture_queue_attaches_the_library_read_only(tmp_path, monkeypatch):
     assert [row["id"] for row in rows] == ["AbC12"]
     assert rows[0]["title"] == "Joined"
     assert rows[0]["recapture_state"] == "pending"
+
+
+def test_candidates_closes_the_state_connection_when_the_library_will_not_open(tmp_path, monkeypatch):
+    import sqlite3
+
+    from app.candidates import get_candidates_payload
+    from app.db import LibraryUnavailable
+
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setenv("AMBER_LIBRARY_MODE", "ingest")
+    monkeypatch.setenv("AMBER_DATA_DIR", str(library))
+    monkeypatch.setenv("AMBER_APP_STATE", str(tmp_path / "app-state"))
+    monkeypatch.setenv("AMBER_SCRATCH_DIR", str(tmp_path / "scratch"))
+    monkeypatch.setenv("AMBER_INGEST_URL", "http://127.0.0.1:9")
+    token = tmp_path / "token"
+    token.write_text("token\n", encoding="utf-8")
+    token.chmod(0o600)
+    monkeypatch.setenv("AMBER_INGEST_TOKEN_FILE", str(token))
+    monkeypatch.setattr("app.db.DATA_DIR", library)
+    monkeypatch.setattr("app.db.DB_PATH", library / "amber.sqlite3")
+    db._access = True
+    db._writing_scratch = False
+    opened = {}
+    real = db.candidates_connect
+
+    def wrapped():
+        conn = real()
+        opened["conn"] = conn
+        return conn
+
+    monkeypatch.setattr(db, "candidates_connect", wrapped)
+
+    def refuse():
+        raise LibraryUnavailable("The library cannot be opened read-only.")
+
+    monkeypatch.setattr(db, "connect", refuse)
+    with pytest.raises(LibraryUnavailable):
+        get_candidates_payload("live")
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened["conn"].execute("SELECT 1")
+
+
+def test_an_unconfirmed_job_stays_unconfirmed_until_the_library_confirms(authed, monkeypatch):
+    from app import capture
+    from app.main import app
+
+    capture.jobs["Z2345"] = {
+        "id": "Z2345",
+        "snapshot_id": "Z2345",
+        "status": "unconfirmed",
+        "error": "Ingest did not confirm snapshot Z2345. The capture is still in scratch.",
+        "url": "https://example.com/a",
+        "final_url": None,
+        "title": None,
+        "resources": [],
+        "capture_stats": {},
+    }
+    stored = {"status": "unconfirmed", "snapshot_id": "Z2345", "error": capture.jobs["Z2345"]["error"]}
+
+    def settle(_job_id):
+        stored["status"] = "complete"
+        stored["error"] = None
+
+    monkeypatch.setattr(db, "recheck_unsettled", settle)
+    monkeypatch.setattr(db, "_job_row", lambda _sid: stored)
+    try:
+        with TestClient(app) as client:
+            client.cookies.set(auth.COOKIE_NAME, _reader_cookie())
+            body = client.get("/api/jobs/Z2345").json()
+            assert body["status"] == "complete"
+            assert body["error"] is None
+    finally:
+        capture.jobs.pop("Z2345", None)

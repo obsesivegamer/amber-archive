@@ -463,6 +463,13 @@ async def saving(request: Request, job_id: str):
 @app.get("/api/jobs/{job_id}")
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
+    if job and job.get("status") in {"unconfirmed", "unknown"}:
+        db.recheck_unsettled(job_id)
+        row = db._job_row(job_id)
+        if row is not None:
+            job["status"] = row["status"]
+            job["error"] = row["error"]
+            job["snapshot_id"] = row["snapshot_id"] or job.get("snapshot_id")
     if not job:
         db.recheck_unsettled(job_id)
         snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)

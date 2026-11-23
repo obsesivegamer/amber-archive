@@ -559,8 +559,10 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
     moment = now or datetime.now(timezone.utc)
     today = moment.astimezone(timezone.utc).strftime("%Y-%m-%d")
     state = db.candidates_connect()
-    library = db.connect() if db.readonly_library() else state
+    library = state
     try:
+        if db.readonly_library():
+            library = db.connect()
         rows = db.load_gift_candidates(state)
         snapshots = db.load_snapshots(
             library, [row.get("snapshot_id") or "" for row in rows]
@@ -598,9 +600,9 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
             )
         return {"candidates": listed, "updated_at": format_time(moment)}
     finally:
-        state.close()
         if library is not state:
             library.close()
+        state.close()
 
 
 def events_since(since: datetime) -> dict:
