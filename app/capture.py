@@ -37,7 +37,7 @@ from .config import (
     VIEWPORT,
 )
 from . import db
-from .extract import article_is_paywalled, extract_article
+from .extract import extract_article
 from .freeze import freeze_html, rewrite_css
 from .ingest import render_reader_jpeg
 from .reader import build_reader_html
@@ -931,9 +931,11 @@ def enqueue_capture(
     if job_queue.qsize() >= MAX_QUEUED_JOBS:
         raise QueueFull
     if db.readonly_library():
-        from .library_import import allocate_dell_id
+        from .library_import import _scratch_contains, allocate_dell_id
 
-        sid = allocate_dell_id(db.DATA_DIR, scratch_has=db.scratch_contains)
+        sid = allocate_dell_id(
+            db.DATA_DIR, scratch_has=_scratch_contains(db.scratch_dir())
+        )
     else:
         sid = db.allocate_id()
     db.begin_capture(sid, url, url_normalized)
@@ -1126,9 +1128,6 @@ async def run_job(job_id: str) -> None:
         "created_at": db.now_iso(),
     }
     db.write_json(folder / "meta.json", meta)
-    explicit = meta.get("paywalled")
-    if not isinstance(explicit, bool):
-        explicit = article_is_paywalled(meta.get("word_count"))
     db.mark_capture(
         sid,
         final_url=final_url,
@@ -1139,7 +1138,7 @@ async def run_job(job_id: str) -> None:
         description=meta["description"],
         http_status=http_status,
         word_count=meta["word_count"],
-        paywalled=1 if explicit else 0,
+        paywalled=1 if db.paywalled_bool(meta.get("paywalled"), meta.get("word_count")) else 0,
         status="complete",
         error=None,
     )
@@ -1148,12 +1147,17 @@ async def run_job(job_id: str) -> None:
         def _track(active: str, bound=job) -> None:
             bound["snapshot_id"] = active
 
-        final = db.publish_capture(sid, on_id=_track)
+        final = await asyncio.to_thread(db.publish_capture, sid, on_id=_track)
         job["snapshot_id"] = final
-        db.finish_job(job["id"], final)
-        db.discard_scratch(sid)
-        if final != sid:
-            db.discard_scratch(final)
+        try:
+            db.finish_job(job["id"], final)
+        except Exception as exc:
+            logger.error("job record for %s failed (%s)", job["id"], type(exc).__name__)
+        for gone in {sid, final}:
+            try:
+                db.discard_scratch(gone)
+            except Exception as exc:
+                logger.error("scratch cleanup for %s failed (%s)", gone, type(exc).__name__)
     job["status"] = "complete"
     job["title"] = meta["title"]
     job.pop("_capture_started", None)

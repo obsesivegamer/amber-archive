@@ -460,6 +460,7 @@ def _wipe_scratch() -> None:
 
 def bind_scratch(scratch: Path) -> None:
     """Point this process's archive database at the scratch tree."""
+    db.use_scratch_database()
     scratch.mkdir(parents=True, exist_ok=True)
     snaps = scratch / "snaps"
     db_path = scratch / "amber.sqlite3"
@@ -507,8 +508,6 @@ def _scratch_contains(scratch: Path) -> Callable[[str], bool]:
 
 
 def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
-    url_old = f"/{old}/r/"
-    url_new = f"/{new}/r/"
     for path in folder.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
@@ -525,7 +524,7 @@ def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
         }:
             continue
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
-        updated = text.replace(url_old, url_new)
+        updated = text.replace(f"/{old}/", f"/{new}/")
         updated = updated.replace(
             f'name="amber-snapshot" content="{old}"',
             f'name="amber-snapshot" content="{new}"',
@@ -611,9 +610,6 @@ def commit_captured_snapshot(
                 reserved = fresh
                 _retarget_scratch(scratch, current, fresh)
                 current = fresh
-                if on_id is not None:
-                    on_id(current)
-        raise PushError("could not allocate a snapshot id")
     finally:
         if reserved:
             release_dell_id(reserved)

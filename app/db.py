@@ -55,23 +55,56 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+# None until configure_library_access(). True only when this process may
+# open the shared library and must not write it.
+_access: bool | None = None
+_writing_scratch = False
+
+
+def use_scratch_database() -> None:
+    """The import worker retargets this process at its scratch database."""
+    global _access, _writing_scratch
+    _writing_scratch = True
+    _access = None
+
+
+def configure_library_access() -> None:
+    """Decide once whether the shared library is read-only.
+
+    Ingest mode never falls through to the write path. A path that does not
+    resolve, or that is not the configured library, is an error.
+    """
+    global _access
+    if _writing_scratch or not config.ingest_library():
+        _access = None
+        return
+    try:
+        current = Path(DB_PATH).resolve()
+        library = config.configured_library_db()
+    except OSError as exc:
+        raise RuntimeError(
+            "AMBER_LIBRARY_MODE=ingest cannot resolve the library database"
+        ) from exc
+    if current != library:
+        raise RuntimeError(
+            "AMBER_LIBRARY_MODE=ingest but the database path is not the configured library"
+        )
+    _access = True
+
+
 def readonly_library() -> bool:
     """The open database is the shared library and this process must not write it."""
-    if not config.ingest_library():
+    if _writing_scratch or not config.ingest_library():
         return False
-    try:
-        return Path(DB_PATH).resolve() == config.configured_library_db()
-    except OSError:
-        return False
+    if _access is not True:
+        configure_library_access()
+    return True
 
 
 def paywalled_bool(flag: object, word_count: object) -> bool:
-    """The boolean ingest requires. A missing flag uses the word-count rule."""
+    """Boolean for a snapshot. Only a missing flag uses the word-count rule."""
     if flag is None:
-        if isinstance(word_count, bool) or not isinstance(word_count, int):
-            count = None
-        else:
-            count = word_count
+        count = word_count if isinstance(word_count, int) and not isinstance(word_count, bool) else None
         return article_is_paywalled(count)
     return bool(flag)
 
@@ -404,7 +437,7 @@ _JOB_FIELDS = {"status", "error", "title", "final_url", "snapshot_id"}
 
 def _outside_library(path: Path) -> None:
     library = Path(DATA_DIR).resolve()
-    if path == library or path == library / "amber.sqlite3" or library in path.parents:
+    if path == library or library in path.parents:
         raise RuntimeError(f"{path} must be outside the library directory")
 
 
@@ -420,7 +453,7 @@ def scratch_dir() -> Path:
     if path == library or library in path.parents or path in library.parents:
         raise RuntimeError("scratch directory must be separate from the library")
     state = _state_file()
-    if state == path or path in state.parents or state.is_relative_to(path):
+    if state.is_relative_to(path) or path.is_relative_to(state):
         raise RuntimeError("AMBER_APP_STATE must not live inside the scratch directory")
     return path
 
@@ -462,26 +495,7 @@ def sweep_scratch() -> None:
 
 
 def _scratch_conn() -> sqlite3.Connection:
-    prepare_scratch()
     return _connect_readwrite(scratch_dir() / "amber.sqlite3")
-
-
-def scratch_contains(sid: str) -> bool:
-    root = scratch_dir()
-    if (root / "snaps" / sid).exists():
-        return True
-    db_path = root / "amber.sqlite3"
-    if not db_path.is_file():
-        return False
-    conn = sqlite3.connect(db_path)
-    try:
-        try:
-            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
-        except sqlite3.Error:
-            return False
-        return row is not None
-    finally:
-        conn.close()
 
 
 def begin_capture(sid: str, url: str, url_normalized: str) -> None:
@@ -581,8 +595,11 @@ def fail_capture(job_id: str, sid: str, error: str) -> None:
     if not readonly_library():
         update_snapshot(sid, status="failed", error=error)
         return
+    from .library_import import release_dell_id
+
     for gone in {job_id, sid}:
         discard_scratch(gone)
+        release_dell_id(gone)
     update_job(job_id, status="failed", error=error)
 
 
@@ -595,7 +612,7 @@ def fill_scratch_paywalled(scratch: Path, sid: str) -> None:
         ).fetchone()
         if row is None or row[0] is not None:
             return
-        flag = 1 if article_is_paywalled(row[1]) else 0
+        flag = 1 if paywalled_bool(None, row[1]) else 0
         conn.execute(
             "UPDATE snapshots SET paywalled = ? WHERE id = ? AND paywalled IS NULL",
             (flag, sid),
@@ -605,14 +622,20 @@ def fill_scratch_paywalled(scratch: Path, sid: str) -> None:
         conn.close()
 
 
+def require_ingest_settings() -> None:
+    from .library_push import _push_settings
+
+    if _push_settings() is None:
+        raise RuntimeError(
+            "AMBER_INGEST_URL and AMBER_INGEST_TOKEN_FILE are required when AMBER_LIBRARY_MODE=ingest"
+        )
+
+
 def publish_capture(sid: str, on_id: Callable[[str], None] | None = None) -> str:
     from .library_import import commit_captured_snapshot
     from .library_push import _push_settings
 
-    settings = _push_settings()
-    if settings is None:
-        raise RuntimeError("AMBER_INGEST_URL and AMBER_INGEST_TOKEN_FILE are required")
-    url, token = settings
+    url, token = _push_settings()
     return commit_captured_snapshot(
         DATA_DIR,
         scratch_dir(),
@@ -628,7 +651,8 @@ _instance_lock = None
 
 def lock_path() -> Path:
     if readonly_library():
-        return _state_file()
+        state = _state_file()
+        return state.with_name(state.name + ".lock")
     return DATA_DIR / "amber.lock"
 
 
@@ -636,8 +660,9 @@ def hold_instance_lock() -> bool:
     """Take an exclusive lock for this process's life.
 
     False means another Amber process already owns this data directory, so
-    its in-flight jobs are not ours to touch. In ingest mode the lock is the
-    app-state database, not a file in the library directory.
+    its in-flight jobs are not ours to touch. In ingest mode the lock is a
+    sibling of the app-state database, not the database file and not a file
+    in the library directory.
     """
     global _instance_lock
     if _instance_lock is not None:
@@ -787,8 +812,19 @@ def _job_snapshot(sid: str) -> dict | None:
         conn.close()
     if row is None:
         return None
+    published = row["snapshot_id"] or row["id"]
+    if row["status"] == "complete":
+        with connect() as conn:
+            library_row = conn.execute(
+                "SELECT * FROM snapshots WHERE id = ?",
+                (published,),
+            ).fetchone()
+        if library_row is None:
+            return None
+        return _as_snap(library_row)
     return {
         "id": row["id"],
+        "snapshot_id": published,
         "url": row["url"],
         "url_normalized": row["url_normalized"],
         "final_url": row["final_url"],
@@ -800,7 +836,6 @@ def _job_snapshot(sid: str) -> dict | None:
         "created_at": row["created_at"],
         "http_status": None,
         "word_count": None,
-        "paywalled": False,
         "status": row["status"],
         "error": row["error"],
     }
@@ -949,7 +984,7 @@ def complete_snapshots() -> list[dict]:
 def recapture_snapshots() -> list[dict]:
     """Snaps waiting on a recapture, paused, or stopped."""
     with connect() as db:
-        if readonly_library() and not _has_column(db, "snapshots", "recapture_state"):
+        if readonly_library():
             return []
         rows = db.execute(
             """
@@ -1148,7 +1183,7 @@ def get_gift_candidate(cid: str) -> dict | None:
 
 
 def load_gift_candidates(conn: sqlite3.Connection) -> list[dict]:
-    if readonly_library() and not _has_table(conn, "candidates"):
+    if readonly_library():
         return []
     rows = conn.execute(
         "SELECT * FROM candidates ORDER BY found_at DESC, rowid DESC"

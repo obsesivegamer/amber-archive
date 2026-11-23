@@ -157,9 +157,11 @@ def _allowed_extension_ids() -> set[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    db.configure_library_access()
     if db.readonly_library():
+        db.require_ingest_settings()
         db.prepare_scratch()
+    db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
     if db.hold_instance_lock():
@@ -404,7 +406,7 @@ async def saving(request: Request, job_id: str):
     if not job:
         snap = db.get_snapshot(job_id)
         if snap and snap["status"] == "complete":
-            return RedirectResponse(f"/{job_id}", status_code=303)
+            return RedirectResponse(f"/{snap.get('snapshot_id') or snap['id']}", status_code=303)
         raise HTTPException(404, "No such job")
     return templates.TemplateResponse(
         request,
@@ -437,16 +439,17 @@ async def job_status(job_id: str):
         error = snap.get("error")
         if status == "failed" and not error:
             error = "Capture was interrupted before it finished."
+        published = snap.get("snapshot_id") or snap["id"]
         return {
             "id": job_id,
-            "snapshot_id": job_id,
+            "snapshot_id": published,
             "status": status,
             "error": error,
             "resources": [],
             "title": snap.get("title"),
             "url": snap.get("url"),
             "final_url": snap.get("final_url"),
-            "capture_stats": _read_capture_stats(job_id),
+            "capture_stats": _read_capture_stats(published),
         }
     return {
         "id": job["id"],
