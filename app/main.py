@@ -160,11 +160,17 @@ def _allowed_extension_ids() -> set[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.configure_library_access()
+    if auth.password_configured():
+        auth.required_password()
     if db.readonly_library():
         db.require_ingest_settings()
         auth.required_password()
-        if HOST not in {"127.0.0.1", "localhost", "::1"}:
-            raise RuntimeError("ingest mode listens on 127.0.0.1")
+        listen = _bound_listen_host()
+        if listen not in {"127.0.0.1", "localhost", "::1"}:
+            raise RuntimeError(
+                f"ingest mode listens on 127.0.0.1 (refusing {listen}). "
+                "Pass --host 127.0.0.1. AMBER_HOST and UVICORN_HOST are checked too."
+            )
         db.prepare_scratch()
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
@@ -293,6 +299,18 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 
 
+def _bound_listen_host() -> str:
+    """The address uvicorn will bind, from --host, UVICORN_HOST, or AMBER_HOST."""
+    chosen = os.environ.get("UVICORN_HOST", "").strip() or HOST
+    argv = sys.argv[1:]
+    for index, arg in enumerate(argv):
+        if arg == "--host" and index + 1 < len(argv):
+            chosen = argv[index + 1]
+        elif arg.startswith("--host="):
+            chosen = arg.split("=", 1)[1]
+    return chosen.strip() or HOST
+
+
 def _safe_next(raw: str | None) -> str:
     nxt = raw or "/saved"
     if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
@@ -328,6 +346,13 @@ async def login_submit(request: Request, password: str = Form(""), next: str = F
         )
     response = RedirectResponse(target, status_code=303)
     auth.set_session_cookie(response, secure=auth.request_is_https(request))
+    return response
+
+
+@app.post("/logout")
+async def logout():
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
     return response
 
 

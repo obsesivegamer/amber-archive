@@ -790,30 +790,21 @@ def _cmd_purge() -> int:
     return 0
 
 
-_EXACT_FIELDS = (
-    "id",
-    "unlock_url",
-    "canonical_url",
-    "match_key",
-    "publisher",
-    "title",
-    "source_url",
-    "source_author",
-    "found_at",
-    "expires_at",
-    "expires_estimated",
-    "dismissed_at",
-    "clicked_at",
-    "snapshot_id",
-    "created_at",
-)
+def _candidate_columns(conn: sqlite3.Connection) -> list[str]:
+    return [row[1] for row in conn.execute("PRAGMA table_info(candidates)")]
 
 
 def export_exact() -> str:
     db.init_db()
-    rows = []
-    for row in sorted(db.list_gift_candidates(), key=lambda item: item["id"]):
-        rows.append({name: row.get(name) for name in _EXACT_FIELDS})
+    conn = db.candidates_connect()
+    try:
+        columns = _candidate_columns(conn)
+        fetched = conn.execute(
+            f"SELECT {', '.join(columns)} FROM candidates ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    rows = [{columns[index]: row[index] for index in range(len(columns))} for row in fetched]
     return json.dumps({"candidates": rows}, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
@@ -828,28 +819,37 @@ def import_exact(raw: str) -> int:
         print('rejected: expected {"candidates": [...]}', file=sys.stderr)
         return 1
     db.init_db()
-    if db.list_gift_candidates():
-        print("rejected: the candidate store is not empty", file=sys.stderr)
-        return 1
     conn = db.candidates_connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = _candidate_columns(conn)
+        if conn.execute("SELECT 1 FROM candidates LIMIT 1").fetchone():
+            conn.rollback()
+            print("rejected: the candidate store is not empty", file=sys.stderr)
+            return 1
         for row in rows:
             if not isinstance(row, dict):
+                conn.rollback()
                 print("rejected: each candidate must be an object", file=sys.stderr)
                 return 1
-            values = [row.get(name) for name in _EXACT_FIELDS]
-            if row.get("expires_estimated") is True:
-                values[_EXACT_FIELDS.index("expires_estimated")] = 1
-            elif row.get("expires_estimated") is False:
-                values[_EXACT_FIELDS.index("expires_estimated")] = 0
+            values = []
+            for name in columns:
+                value = row.get(name)
+                if name == "expires_estimated" and isinstance(value, bool):
+                    value = 1 if value else 0
+                values.append(value)
             conn.execute(
                 f"""
-                INSERT INTO candidates ({", ".join(_EXACT_FIELDS)})
-                VALUES ({", ".join("?" for _ in _EXACT_FIELDS)})
+                INSERT INTO candidates ({", ".join(columns)})
+                VALUES ({", ".join("?" for _ in columns)})
                 """,
                 values,
             )
         conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        print("rejected: the candidate store is not empty", file=sys.stderr)
+        return 1
     finally:
         conn.close()
     return 0

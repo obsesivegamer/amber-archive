@@ -1208,3 +1208,99 @@ def test_retarget_rewrites_srcset_and_scripts_only(tmp_path):
     assert "/Z2346/r/mark.svg" in (moved / "res" / "icons" / "mark.svg").read_text(encoding="utf-8")
     assert "/Z2346/r/mod.mjs" in (moved / "res" / "mod.mjs").read_text(encoding="utf-8")
     assert (moved / "article.html").read_text(encoding="utf-8") == "see /Z2345/ in the prose"
+
+
+def test_unconfirmed_job_waits_for_a_real_library_row(ingest_paths):
+    from app import capture
+    from app.main import app
+
+    sid = "Z6789"
+    db._init_app_state()
+    db.prepare_scratch()
+    scratch = ingest_paths["scratch"] / "snaps" / sid
+    scratch.mkdir(parents=True)
+    (scratch / "page.html").write_text("kept", encoding="utf-8")
+    with db._state_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, snapshot_id, created_at
+            ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                      'unconfirmed', 'lost', ?, '2026-01-01T00:00:00Z')
+            """,
+            (sid, sid),
+        )
+        conn.commit()
+    capture.jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "status": "unconfirmed",
+        "error": "lost",
+        "url": "https://example.com/a",
+        "final_url": None,
+        "title": None,
+        "resources": [],
+        "capture_stats": {},
+    }
+    try:
+        with TestClient(app) as client:
+            first = client.get(f"/api/jobs/{sid}").json()
+            assert first["status"] == "unconfirmed"
+            assert scratch.is_dir()
+            conn = sqlite3.connect(ingest_paths["db_path"])
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    id, url, url_normalized, title, created_at, status, paywalled
+                ) VALUES (?, 'https://example.com/a', 'https://example.com/a',
+                          'Landed', '2026-01-02T00:00:00Z', 'complete', 0)
+                """,
+                (sid,),
+            )
+            conn.commit()
+            conn.close()
+            second = client.get(f"/api/jobs/{sid}").json()
+            assert second["status"] == "complete"
+        assert not scratch.exists()
+    finally:
+        capture.jobs.pop(sid, None)
+
+
+def test_worker_records_an_unconfirmed_push(ingest_paths, monkeypatch):
+    import asyncio
+
+    from app import capture
+    from app.library_import import UnconfirmedPush
+
+    sid = "Z6792"
+    db._init_app_state()
+    db.prepare_scratch()
+    db.begin_capture(sid, "https://example.com/a", "https://example.com/a")
+    capture.jobs[sid] = {
+        "id": sid,
+        "snapshot_id": sid,
+        "status": "capturing",
+        "url": "https://example.com/a",
+        "resources": [],
+        "capture_stats": {},
+    }
+    capture.job_queue = asyncio.Queue()
+
+    async def explode(_job_id: str) -> None:
+        raise UnconfirmedPush(sid)
+
+    monkeypatch.setattr(capture, "run_job", explode)
+
+    async def go() -> None:
+        await capture.job_queue.put(sid)
+        task = asyncio.create_task(capture.worker())
+        await capture.job_queue.join()
+        task.cancel()
+
+    try:
+        asyncio.run(go())
+        assert capture.jobs[sid]["status"] == "unconfirmed"
+        row = db._job_row(sid)
+        assert row["status"] == "unconfirmed"
+    finally:
+        capture.jobs.pop(sid, None)

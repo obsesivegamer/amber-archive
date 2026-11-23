@@ -145,10 +145,13 @@ def _ro_open_failed(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     code = getattr(exc, "sqlite_errorcode", None)
-    if not isinstance(code, int):
-        return False
-    primary = code & 0xFF
-    return primary in {sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY}
+    if isinstance(code, int):
+        cantopen = getattr(sqlite3, "SQLITE_CANTOPEN", 14)
+        readonly = getattr(sqlite3, "SQLITE_READONLY", 8)
+        return (code & 0xFF) in {cantopen, readonly}
+    # Python 3.10's sqlite3.OperationalError has no sqlite_errorcode.
+    text = str(exc).lower()
+    return "unable to open" in text or "readonly" in text or "read-only" in text
 
 
 def open_library_ro(db_path: Path) -> sqlite3.Connection:
@@ -844,6 +847,8 @@ def fail_interrupted() -> int:
             for row in rows:
                 published = row["snapshot_id"] or row["id"]
                 present = _library_has_snapshot(published)
+                if row["status"] == "unconfirmed" and present is not True:
+                    continue
                 if present is None:
                     conn.execute(
                         """
@@ -1334,11 +1339,18 @@ def _recapture_attached() -> list[dict]:
     """Queue rows in app-state joined to the library through a read-only ATTACH."""
     _init_app_state()
     library = Path(DB_PATH)
-    conn = sqlite3.connect(_state_file())
+    state_uri = "file:{}?mode=rw".format(quote(str(_state_file()), safe="/:"))
+    conn = sqlite3.connect(state_uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
         uri = "file:{}?mode=ro".format(quote(str(library), safe="/:"))
-        conn.execute("ATTACH DATABASE ? AS library", (uri,))
+        try:
+            conn.execute("ATTACH DATABASE ? AS library", (uri,))
+            conn.execute("PRAGMA library.query_only=ON")
+        except sqlite3.OperationalError as exc:
+            if _ro_open_failed(exc):
+                raise LibraryUnavailable(_RO_DETAIL) from exc
+            raise
         rows = conn.execute(
             """
             SELECT s.*, q.state AS recapture_state, q.next_at AS recapture_next_at,

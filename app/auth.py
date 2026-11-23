@@ -34,12 +34,33 @@ class MissingPassword(RuntimeError):
     pass
 
 
+# path, mtime_ns, password. Invalidated when the file's mtime changes.
+_password_cache: tuple[str, int, str] | None = None
+
+
 def required_password() -> str:
+    global _password_cache
     raw = os.environ.get("AMBER_READER_PASSWORD_FILE", "").strip()
     if raw:
         from .library_contract import read_token_file
 
-        return read_token_file(Path(raw))
+        path = Path(raw)
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = -1
+        resolved = str(path)
+        if (
+            _password_cache is not None
+            and _password_cache[0] == resolved
+            and _password_cache[1] == mtime
+            and mtime >= 0
+        ):
+            return _password_cache[2]
+        password = read_token_file(path)
+        _password_cache = (resolved, path.stat().st_mtime_ns, password)
+        return password
+    _password_cache = None
     password = os.environ.get("AMBER_READER_PASSWORD", "")
     if not password.strip():
         raise MissingPassword(
