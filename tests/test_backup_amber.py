@@ -648,7 +648,23 @@ def test_local_drill_reports_a_missing_destination(tmp_path: Path):
     assert "no backup destination" in bad.stderr
 
 
-def test_reader_count_must_match(tmp_path: Path):
+def test_drill_refuses_symlink_into_the_live_library(tmp_path: Path):
+    paths = _layout(tmp_path)
+    assert _run(_env(paths, AMBER_BACKUP_DATE="2026-08-01")).returncode == 0
+    live = paths["library"] / "amber.sqlite3"
+    backed = paths["dest"] / "2026-08-01" / "amber.sqlite3"
+    backed.unlink()
+    backed.symlink_to(live)
+    env = _env(paths)
+    env["AMBER_RESTORE_SKIP_SERVER"] = "1"
+    result = subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert not live.with_name("amber.sqlite3-wal").exists()
+    assert not live.with_name("amber.sqlite3-shm").exists()
+
+
+def test_reader_serves_text_not_a_count(tmp_path: Path):
     paths = _layout(tmp_path)
     assert _run(_env(paths, AMBER_BACKUP_DATE="2026-03-03")).returncode == 0
     def serve(payload: str, port: str) -> subprocess.CompletedProcess[str]:

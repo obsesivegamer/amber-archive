@@ -59,6 +59,24 @@ refuse_live() {
   esac
 }
 
+# cp -a and rsync -a keep symlinks. A link in the backup must not resolve
+# to the live library, or the reader would open that database and write
+# its -wal/-shm files there.
+refuse_escaped_links() {
+  local root="$1" root_real link target
+  root_real="$(readlink -f "$root")"
+  while IFS= read -r -d '' link; do
+    if ! target="$(readlink -f "$link" 2>/dev/null)"; then
+      die "refusing dangling symlink $link"
+    fi
+    case "$target" in
+      "$root_real"|"$root_real"/*) ;;
+      *) die "refusing symlink $link that points outside the backup" ;;
+    esac
+    refuse_live "$target"
+  done < <(find -P "$root" -type l -print0)
+}
+
 remote=0
 case "$DEST" in
   *:*) remote=1 ;;
@@ -119,6 +137,7 @@ EOF
     "$DEST/$latest/" "$copy/" || die "could not copy $latest"
 fi
 
+refuse_escaped_links "$copy"
 [[ -f "$copy/manifest.json" ]] || die "backup $latest has no manifest"
 [[ -f "$copy/.complete" ]] || die "backup $latest is not marked complete"
 checks="$(python3 - "$copy" <<'PY'
@@ -212,9 +231,15 @@ port="${AMBER_RESTORE_PORT:-18081}"
 reader_copy="$WORK/reader-data"
 refuse_live "$reader_copy"
 mkdir -p "$reader_copy"
-cp -a "$copy/amber.sqlite3" "$reader_copy/amber.sqlite3"
+# --copy-links materializes a regular file. A preserved symlink here would
+# still be the live database even after the check above.
+"$RSYNC_BIN" -aL "$copy/amber.sqlite3" "$reader_copy/amber.sqlite3"
 if [[ -d "$copy/snaps" ]]; then
-  cp -a "$copy/snaps" "$reader_copy/snaps"
+  mkdir -p "$reader_copy/snaps"
+  "$RSYNC_BIN" -aL "$copy/snaps/" "$reader_copy/snaps/"
+fi
+if find -P "$reader_copy" -type l -print -quit | grep -q .; then
+  die "reader copy still contains a symlink"
 fi
 # env replaces itself with the server, so the recorded pid is the server.
 cmd=()
