@@ -162,10 +162,6 @@ async def lifespan(app: FastAPI):
     if db.readonly_library():
         db.require_ingest_settings()
         db.prepare_scratch()
-        try:
-            db.ensure_library_sidecars()
-        except LibraryUnavailable as exc:
-            log.warning("%s", exc)
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.

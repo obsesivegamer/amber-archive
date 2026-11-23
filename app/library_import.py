@@ -18,6 +18,7 @@ would never fire.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import os
@@ -100,11 +101,8 @@ class MatchLocks:
 
 
 def open_library_ro(db_path: Path) -> sqlite3.Connection:
-    """Open the shared library read-only. Caller closes it on every path."""
-    uri = "file:{}?mode=ro".format(quote(str(db_path), safe="/:"))
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open the shared library read-only. Same helper as every other library read."""
+    return db.open_library_ro(db_path)
 
 
 def _library_has_id(conn: sqlite3.Connection, sid: str) -> bool:
@@ -515,6 +513,8 @@ _AMBER_URLS = (
     "url(/{old}/",
     "url('/{old}/",
     'url("/{old}/',
+    'srcset="/{old}/',
+    "srcset='/{old}/",
 )
 
 
@@ -525,11 +525,11 @@ def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
             continue
         name = path.name
         if name not in {"page.html", "reader.html", "article.html", "meta.json"} and not (
-            path.parent.name == "res" and path.suffix.lower() == ".css"
+            path.parent.name == "res" and path.suffix.lower() in {".css", ".js"}
         ):
             continue
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
-        updated = text
+        updated = text.replace(f"/{old}/r/", f"/{new}/r/")
         for pattern in _AMBER_URLS:
             updated = updated.replace(pattern.format(old=old), pattern.format(old=new))
         updated = updated.replace(
@@ -575,23 +575,60 @@ def _retarget_scratch(scratch: Path, old: str, new: str) -> None:
         conn.close()
 
 
-def _push_confirmed(scratch: Path, sid: str, ingest_url: str, token: str, *, transport) -> None:
-    """Push once, and again if the response never arrived.
+class UnconfirmedPush(Exception):
+    """The push response was lost and the library could not be checked."""
 
-    The second push sends the same id and bytes. Ingest answers 200 when
-    the first one committed and the response was lost. Scratch stays until
-    a response confirms the push.
+    def __init__(self, sid: str):
+        super().__init__(sid)
+        self.sid = sid
+
+
+def _published(library_dir: Path, sid: str) -> bool | None:
+    """Whether ingest stored ``sid``. None when the library cannot be read."""
+    db_path = library_dir / "amber.sqlite3"
+    try:
+        conn = open_library_ro(db_path)
+    except db.LibraryUnavailable:
+        return None
+    try:
+        try:
+            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _push_confirmed(
+    scratch: Path,
+    sid: str,
+    ingest_url: str,
+    token: str,
+    library_dir: Path,
+    *,
+    transport,
+) -> None:
+    """Push once, and again if the transport drops the response.
+
+    The second push sends the same id and bytes. Scratch is only discarded
+    by the caller after this returns. If both responses are lost, scratch
+    stays unless a read shows the id is absent.
     """
     try:
         push_snapshot(scratch, sid, ingest_url, token, transport=transport)
         return
-    except (urllib.error.URLError, TimeoutError, OSError, PushError) as first:
-        if isinstance(first, PushError) and "ingest" not in str(first):
-            raise
+    except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected) as first:
         try:
             push_snapshot(scratch, sid, ingest_url, token, transport=transport)
-        except (urllib.error.URLError, TimeoutError, OSError, PushError):
-            raise first
+            return
+        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+            present = _published(library_dir, sid)
+            if present is True:
+                return
+            if present is False:
+                raise first
+            raise UnconfirmedPush(sid) from first
 
 
 def commit_captured_snapshot(
@@ -621,6 +658,7 @@ def commit_captured_snapshot(
                     current,
                     ingest_url,
                     token,
+                    library_dir,
                     transport=transport,
                 )
                 return current
@@ -629,10 +667,12 @@ def commit_captured_snapshot(
                     raise
                 release_dell_id(current)
                 reserved = ""
-                fresh = allocate_dell_id(
-                    library_dir,
-                    scratch_has=scratch_contains(scratch),
-                )
+                scratch_taken = scratch_contains(scratch)
+
+                def taken(candidate: str, _scratch_taken=scratch_taken) -> bool:
+                    return _scratch_taken(candidate) or db.job_id_taken(candidate)
+
+                fresh = allocate_dell_id(library_dir, scratch_has=taken)
                 reserved = fresh
                 if on_id is not None:
                     on_id(fresh)

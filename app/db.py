@@ -135,48 +135,56 @@ def _connect_readwrite(path: Path) -> sqlite3.Connection:
 
 
 class LibraryUnavailable(Exception):
-    """The shared library cannot be read without creating files in its directory."""
+    """The shared library could not be opened read-only."""
 
 
-_WAL_DETAIL = (
-    "The library WAL files are missing. Ingest must keep the database open "
-    "so amber.sqlite3-wal and amber.sqlite3-shm exist and stay readable. "
-    "The web user must not be able to create files in the library directory."
-)
+_RO_DETAIL = "The library cannot be opened read-only."
 
 
-def _sidecar_paths(db_path: Path) -> tuple[Path, Path]:
-    return (
-        db_path.with_name(db_path.name + "-wal"),
-        db_path.with_name(db_path.name + "-shm"),
-    )
+def _ro_open_failed(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(code, int):
+        return False
+    primary = code & 0xFF
+    return primary in {sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY}
 
 
-def ensure_library_sidecars() -> None:
-    """Refuse to open a WAL library whose sidecars are absent.
+def open_library_ro(db_path: Path) -> sqlite3.Connection:
+    """Open ``db_path`` with ``mode=ro``. The caller closes it.
 
-    A ``mode=ro`` open creates ``-wal`` and ``-shm`` when they are missing
-    and the directory is writable. Ingest mode never does that. When ingest
-    holds the database open, both files are already there.
+    ``-wal`` and ``-shm`` are SQLite's coordination files. Creating or using
+    them from this open does not change the database. ``immutable=1`` is not
+    used. A directory that cannot host those files raises `LibraryUnavailable`.
     """
-    wal, shm = _sidecar_paths(Path(DB_PATH))
-    if wal.is_file() and shm.is_file():
-        return
-    raise LibraryUnavailable(_WAL_DETAIL)
-
-
-def _connect_library_ro() -> sqlite3.Connection:
-    ensure_library_sidecars()
-    uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_ClosingConnection)
+    uri = "file:{}?mode=ro".format(quote(str(db_path), safe="/:"))
+    try:
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_ClosingConnection)
+    except sqlite3.OperationalError as exc:
+        if _ro_open_failed(exc):
+            raise LibraryUnavailable(_RO_DETAIL) from exc
+        raise
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA foreign_keys=ON")
+        # A read-only directory with no sidecars accepts the connection and
+        # then refuses the first read. Surface that as one open failure.
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        if _ro_open_failed(exc):
+            raise LibraryUnavailable(_RO_DETAIL) from exc
+        raise
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+def _connect_library_ro() -> sqlite3.Connection:
+    return open_library_ro(Path(DB_PATH))
 
 
 # 8 characters, not the 5-character snapshot id, so a candidate route cannot
@@ -532,6 +540,28 @@ def _scratch_conn() -> sqlite3.Connection:
     return _connect_readwrite(scratch_dir() / "amber.sqlite3")
 
 
+def job_id_taken(sid: str) -> bool:
+    """True when this id is already a jobs primary key."""
+    try:
+        path = _state_file()
+    except RuntimeError:
+        return False
+    if not path.is_file():
+        return False
+    conn = sqlite3.connect(
+        "file:{}?mode=ro".format(quote(str(path), safe="/:")),
+        uri=True,
+    )
+    try:
+        try:
+            row = conn.execute("SELECT 1 FROM jobs WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+    finally:
+        conn.close()
+
+
 def begin_capture(sid: str, url: str, url_normalized: str) -> None:
     if not readonly_library():
         insert_snapshot(sid, url, url_normalized)
@@ -625,14 +655,15 @@ def discard_scratch(sid: str) -> None:
         conn.close()
 
 
-def fail_capture(job_id: str, sid: str, error: str) -> None:
+def fail_capture(job_id: str, sid: str, error: str, *, keep_scratch: bool = False) -> None:
     if not readonly_library():
         update_snapshot(sid, status="failed", error=error)
         return
     from .library_import import release_dell_id
 
     for gone in {job_id, sid}:
-        discard_scratch(gone)
+        if not keep_scratch:
+            discard_scratch(gone)
         release_dell_id(gone)
     update_job(job_id, status="failed", error=error)
 
@@ -725,14 +756,15 @@ def hold_instance_lock() -> bool:
     return True
 
 
-def _library_has_snapshot(sid: str) -> bool:
+def _library_has_snapshot(sid: str) -> bool | None:
+    """Whether ``sid`` is in the library. None when the library cannot be read."""
     if not sid:
         return False
     try:
         with connect() as conn:
             row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
     except (LibraryUnavailable, sqlite3.Error, OSError):
-        return False
+        return None
     return row is not None
 
 
@@ -753,7 +785,10 @@ def fail_interrupted() -> int:
             changed = 0
             for row in rows:
                 published = row["snapshot_id"] or row["id"]
-                if _library_has_snapshot(published):
+                present = _library_has_snapshot(published)
+                if present is None:
+                    continue
+                if present:
                     conn.execute(
                         """
                         UPDATE jobs

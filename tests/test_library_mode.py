@@ -149,18 +149,6 @@ def _write_library(root: Path) -> Path:
     return db_path
 
 
-def _freeze_library(root: Path) -> None:
-    """Mode 444 on the database and its WAL files, and a read-only snaps/ tree."""
-    for name in ("amber.sqlite3", "amber.sqlite3-wal", "amber.sqlite3-shm"):
-        path = root / name
-        if path.exists():
-            os.chmod(path, 0o444)
-    snaps = root / "snaps"
-    for path in snaps.rglob("*"):
-        os.chmod(path, 0o555 if path.is_dir() else 0o444)
-    os.chmod(snaps, 0o555)
-
-
 def _point_at_library(monkeypatch, library: Path, db_path: Path) -> None:
     monkeypatch.setenv("AMBER_DATA_DIR", str(library))
     monkeypatch.setenv("AMBER_LIBRARY_MODE", "ingest")
@@ -262,17 +250,35 @@ def _get_paths() -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _schema_and_rows(db_path: Path):
+    conn = sqlite3.connect(
+        "file:{}?mode=ro".format(quote(str(db_path), safe="/:")),
+        uri=True,
+    )
+    try:
+        schema = conn.execute(
+            """
+            SELECT type, name, sql FROM sqlite_master
+            WHERE sql IS NOT NULL
+            ORDER BY type, name
+            """
+        ).fetchall()
+        rows = conn.execute(
+            "SELECT id, title, paywalled FROM snapshots ORDER BY id"
+        ).fetchall()
+        return schema, rows
+    finally:
+        conn.close()
+
+
 def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
     from app.library_import import allocate_dell_id
     from app.main import app
 
     library = ingest_paths["library"]
     db_path = ingest_paths["db_path"]
-    _freeze_library(library)
-    before = _tree(library)
-    wal = db_path.with_name(db_path.name + "-wal")
-    assert wal.is_file()
-    assert (library / "snaps").stat().st_mode & 0o222 == 0
+    content = _sha(db_path)
+    schema, rows = _schema_and_rows(db_path)
 
     scratch = ingest_paths["scratch"]
     (scratch / "snaps" / "Z2345").mkdir(parents=True)
@@ -303,6 +309,15 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
                 snapshot_id, created_at
             ) VALUES ('Z2345', 'https://example.com/x', 'https://example.com/x',
                       'capturing', NULL, NULL, NULL, 'Z2345', '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, error, title, final_url,
+                snapshot_id, created_at
+            ) VALUES ('Zpub1', 'https://example.com/already', 'https://example.com/already',
+                      'capturing', NULL, NULL, NULL, 'K7mQp', '2026-01-01T00:00:00Z')
             """
         )
         conn.commit()
@@ -341,9 +356,8 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
 
         release_dell_id(allocated)
 
-    assert _tree(library) == before
-    assert _sha(db_path) == before["amber.sqlite3"]
-    assert _sha(wal) == before["amber.sqlite3-wal"]
+    assert _sha(db_path) == content
+    assert _schema_and_rows(db_path) == (schema, rows)
     assert not (library / "amber.lock").exists()
     assert (ingest_paths["state"].with_name(ingest_paths["state"].name + ".lock")).is_file()
     assert not ingest_paths["state"].samefile(
@@ -352,9 +366,13 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
     conn = sqlite3.connect(state)
     try:
         row = conn.execute("SELECT status, error FROM jobs WHERE id = 'Z2345'").fetchone()
+        published = conn.execute(
+            "SELECT status, error, snapshot_id FROM jobs WHERE id = 'Zpub1'"
+        ).fetchone()
     finally:
         conn.close()
     assert row == ("failed", "Interrupted before it finished.")
+    assert published == ("complete", None, "K7mQp")
 
 
 def _scratch_row(root: Path, sid: str, *, paywalled, word_count: int, title: str) -> None:
@@ -539,16 +557,6 @@ def _serve_ingest(library: Path, mode: str) -> tuple[ThreadingHTTPServer, str]:
     server.delay = 0
     server.gate = threading.Event()
     server.dropped = False
-    # Ingest keeps a connection open, so a checkpoint does not delete -wal/-shm.
-    server.hold = sqlite3.connect(library / "amber.sqlite3")
-    server.hold.execute("SELECT COUNT(*) FROM snapshots").fetchone()
-    stop = server.shutdown
-
-    def shutdown() -> None:
-        server.hold.close()
-        stop()
-
-    server.shutdown = shutdown
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -907,25 +915,128 @@ def test_failed_capture_releases_the_reserved_id(ingest_paths):
     assert _scratch_rows(ingest_paths["scratch"]) == 0
 
 
-def test_reads_with_a_live_writer_create_no_files(ingest_paths):
+def _drop_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+
+
+def _insert_closed(db_path: Path, sid: str, title: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO snapshots (
+                id, url, url_normalized, final_url, title, status, created_at, paywalled
+            ) VALUES (?, 'https://example.com/w', 'https://example.com/w',
+                      'https://example.com/w', ?, 'complete', '2026-01-02T00:00:00Z', 0)
+            """,
+            (sid, title),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+def test_reads_after_the_writer_commits_and_closes(ingest_paths):
+    from app.main import app
+
+    db_path = ingest_paths["db_path"]
+    _insert_closed(db_path, "Z1111", "Closed Writer")
+    _drop_sidecars(db_path)
+    content = _sha(db_path)
+    schema, rows = _schema_and_rows(db_path)
+    _drop_sidecars(db_path)
+    with TestClient(app) as client:
+        home = client.get("/")
+        assert home.status_code == 200
+        assert "Closed Writer" in home.text
+    assert _sha(db_path) == content
+    assert _schema_and_rows(db_path) == (schema, rows)
+
+    _insert_closed(db_path, "Z2222", "Second Close")
+    _drop_sidecars(db_path)
+    after_writer = _sha(db_path)
+    assert after_writer != content
+    with TestClient(app) as client:
+        found = client.get("/search", params={"q": "Second"})
+        assert found.status_code == 200
+        assert "Second Close" in found.text
+    assert _sha(db_path) == after_writer
+    schema2, rows2 = _schema_and_rows(db_path)
+    assert schema2 == schema
+    assert {row[0] for row in rows2} == {row[0] for row in rows} | {"Z2222"}
+
+
+def test_web_does_not_write_rows_on_save_failure_or_conflict(ingest_paths, allow_private):
     from app.main import app
 
     library = ingest_paths["library"]
-    held = sqlite3.connect(ingest_paths["db_path"])
-    held.execute("BEGIN")
-    names_before = {path.name for path in library.iterdir()}
-    db_hash = _sha(ingest_paths["db_path"])
-    wal = ingest_paths["db_path"].with_name(ingest_paths["db_path"].name + "-wal")
-    wal_hash = _sha(wal)
+    db_path = ingest_paths["db_path"]
+    _drop_sidecars(db_path)
+    content = _sha(db_path)
+    schema, rows = _schema_and_rows(db_path)
+    os.environ["AMBER_INGEST_URL"] = "http://127.0.0.1:9"
+    with TestClient(app) as client:
+        failed_id = _save(client, "https://example.com/story")
+        job = _wait(client, failed_id)
+        assert job["status"] == "failed"
+    assert _sha(db_path) == content
+    assert _schema_and_rows(db_path) == (schema, rows)
+
+    server, base = _serve_ingest(library, "ok")
+    os.environ["AMBER_INGEST_URL"] = base
+    _drop_sidecars(db_path)
     try:
         with TestClient(app) as client:
-            assert client.get("/").status_code == 200
-            assert client.get("/search", params={"q": "Shelf"}).status_code == 200
-        assert {path.name for path in library.iterdir()} == names_before
-        assert _sha(ingest_paths["db_path"]) == db_hash
-        assert _sha(wal) == wal_hash
+            sid = _save(client, "https://example.com/story")
+            job = _wait(client, sid)
+            assert job["status"] == "complete"
+            found = client.get("/search", params={"q": "Example"})
+            assert sid in found.text
+        schema_ok, rows_ok = _schema_and_rows(db_path)
+        assert schema_ok == schema
+        assert {row[0] for row in rows_ok} == {row[0] for row in rows} | {sid}
     finally:
-        held.close()
+        server.shutdown()
+
+    server, base = _serve_ingest(library, "conflict")
+    os.environ["AMBER_INGEST_URL"] = base
+    before_ids = {row[0] for row in _schema_and_rows(db_path)[1]}
+    try:
+        with TestClient(app) as client:
+            first = _save(client, "https://example.com/long")
+            job = _wait(client, first)
+            final = job["snapshot_id"]
+            assert final != first
+            assert job["status"] == "complete"
+        schema_conflict, rows_conflict = _schema_and_rows(db_path)
+        assert schema_conflict == schema
+        assert {row[0] for row in rows_conflict} == before_ids | {final}
+        assert first not in {row[0] for row in rows_conflict}
+    finally:
+        server.shutdown()
+
+
+def test_save_in_a_writable_directory_without_sidecars(ingest_paths, allow_private):
+    from app.main import app
+
+    library = ingest_paths["library"]
+    db_path = ingest_paths["db_path"]
+    _drop_sidecars(db_path)
+    schema, rows = _schema_and_rows(db_path)
+    _drop_sidecars(db_path)
+    server, base = _serve_ingest(library, "ok")
+    os.environ["AMBER_INGEST_URL"] = base
+    try:
+        with TestClient(app) as client:
+            sid = _save(client, "https://example.com/story")
+            assert _wait(client, sid)["status"] == "complete"
+        schema2, rows2 = _schema_and_rows(db_path)
+        assert schema2 == schema
+        assert {row[0] for row in rows2} == {row[0] for row in rows} | {sid}
+    finally:
+        server.shutdown()
 
 
 def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
@@ -934,17 +1045,56 @@ def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
     library = ingest_paths["library"]
     for name in ("amber.sqlite3-wal", "amber.sqlite3-shm"):
         (library / name).unlink(missing_ok=True)
+    state = ingest_paths["state"]
+    state.parent.mkdir(parents=True)
+    conn = sqlite3.connect(state)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                url_normalized TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                title TEXT,
+                final_url TEXT,
+                snapshot_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, url, url_normalized, status, snapshot_id, created_at
+            ) VALUES ('Zpub1', 'https://example.com/already', 'https://example.com/already',
+                      'capturing', 'K7mQp', '2026-01-01T00:00:00Z')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
     os.chmod(library, 0o555)
     names_before = {path.name for path in library.iterdir()}
     try:
         with TestClient(app, raise_server_exceptions=False) as client:
             response = client.get("/")
             assert response.status_code == 503
-            assert "WAL" in response.text
+            assert response.status_code != 500
+            assert "read-only" in response.text
             assert "Traceback" not in response.text
             search = client.get("/search", params={"q": "Shelf"})
             assert search.status_code == 503
         assert {path.name for path in library.iterdir()} == names_before
+        conn = sqlite3.connect(state)
+        try:
+            published = conn.execute(
+                "SELECT status, error FROM jobs WHERE id = 'Zpub1'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert published == ("capturing", None)
         assert not (library / "amber.sqlite3-wal").exists()
         assert not (library / "amber.sqlite3-shm").exists()
     finally:
@@ -958,9 +1108,75 @@ def test_lost_response_retries_the_same_id(capture_app, tmp_path):
     scratch = tmp_path / "lost"
     _scratch_row(scratch, "Z2345", paywalled=0, word_count=120, title="Same Bytes")
     try:
-        _push_confirmed(scratch, "Z2345", base, TOKEN, transport=None)
+        _push_confirmed(
+            scratch, "Z2345", base, TOKEN, capture_app["library"], transport=None
+        )
     finally:
         server.shutdown()
     assert [item["id"] for item in server.posts] == ["Z2345", "Z2345"]
     assert _library_ids(capture_app["db_path"]).count("Z2345") == 1
     assert (scratch / "snaps" / "Z2345").is_dir()
+
+
+def test_unconfirmed_push_keeps_scratch_when_the_library_cannot_be_read(ingest_paths, tmp_path):
+    from urllib.error import URLError
+
+    from app.library_import import UnconfirmedPush, _push_confirmed
+
+    scratch = tmp_path / "keep"
+    _scratch_row(scratch, "Z2345", paywalled=0, word_count=40, title="Kept")
+    library = ingest_paths["library"]
+    _drop_sidecars(ingest_paths["db_path"])
+    os.chmod(library, 0o555)
+
+    class Dropped:
+        def round_trip(self, *_args, **_kwargs):
+            raise URLError("timed out")
+
+    dropped = Dropped()
+
+    try:
+        with pytest.raises(UnconfirmedPush):
+            _push_confirmed(scratch, "Z2345", "http://127.0.0.1:9", TOKEN, library, transport=dropped)
+    finally:
+        os.chmod(library, 0o755)
+    assert (scratch / "snaps" / "Z2345").is_dir()
+    with pytest.raises(URLError):
+        _push_confirmed(scratch, "Z2345", "http://127.0.0.1:9", TOKEN, library, transport=dropped)
+    assert (scratch / "snaps" / "Z2345").is_dir()
+
+
+def test_released_job_id_is_not_issued_again(ingest_paths):
+    from app.library_import import allocate_dell_id
+
+    db._init_app_state()
+    db.prepare_scratch()
+    sid = allocate_dell_id(ingest_paths["library"], scratch_has=lambda _sid: False, new_id=lambda: "Z2345")
+    db.begin_capture(sid, "https://example.com/a", "https://example.com/a")
+    db.fail_capture(sid, sid, "capture failed")
+    with pytest.raises(RuntimeError, match="allocate"):
+        allocate_dell_id(
+            ingest_paths["library"],
+            scratch_has=db.job_id_taken,
+            new_id=lambda: "Z2345",
+        )
+
+
+def test_retarget_rewrites_srcset_and_scripts_only(tmp_path):
+    from app.library_import import _retarget_scratch
+
+    scratch = tmp_path / "scratch"
+    _scratch_row(scratch, "Z2345", paywalled=0, word_count=40, title="Move")
+    folder = scratch / "snaps" / "Z2345"
+    (folder / "page.html").write_text(
+        '<img srcset="/Z2345/r/a.jpg 1x, /Z2345/r/b.jpg 2x">',
+        encoding="utf-8",
+    )
+    (folder / "res" / "app.js").write_text('const u = "/Z2345/r/app.js";', encoding="utf-8")
+    (folder / "article.html").write_text("see /Z2345/ in the prose", encoding="utf-8")
+    _retarget_scratch(scratch, "Z2345", "Z2346")
+    moved = scratch / "snaps" / "Z2346"
+    assert "/Z2346/r/a.jpg" in (moved / "page.html").read_text(encoding="utf-8")
+    assert "/Z2345/" not in (moved / "page.html").read_text(encoding="utf-8")
+    assert "/Z2346/r/app.js" in (moved / "res" / "app.js").read_text(encoding="utf-8")
+    assert (moved / "article.html").read_text(encoding="utf-8") == "see /Z2345/ in the prose"

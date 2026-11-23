@@ -933,9 +933,12 @@ def enqueue_capture(
     if db.readonly_library():
         from .library_import import allocate_dell_id, scratch_contains
 
-        sid = allocate_dell_id(
-            db.DATA_DIR, scratch_has=scratch_contains(db.scratch_dir())
-        )
+        scratch_taken = scratch_contains(db.scratch_dir())
+
+        def _taken(candidate: str) -> bool:
+            return scratch_taken(candidate) or db.job_id_taken(candidate)
+
+        sid = allocate_dell_id(db.DATA_DIR, scratch_has=_taken)
     else:
         sid = db.allocate_id()
     db.begin_capture(sid, url, url_normalized)
@@ -964,6 +967,8 @@ async def worker() -> None:
         try:
             await run_job(job_id)
         except Exception as exc:
+            from .library_import import UnconfirmedPush
+
             job = jobs.get(job_id)
             # Exception messages can include publisher URLs or HTTP headers.
             # Keep the useful stack and type without logging those payloads.
@@ -984,6 +989,7 @@ async def worker() -> None:
                     job["id"],
                     job.get("snapshot_id") or job["id"],
                     str(exc)[:500],
+                    keep_scratch=isinstance(exc, UnconfirmedPush),
                 )
         finally:
             job_queue.task_done()
@@ -1153,6 +1159,10 @@ async def run_job(job_id: str) -> None:
 
         def _track(active: str, bound=job) -> None:
             bound["snapshot_id"] = active
+            try:
+                db.update_job(bound["id"], snapshot_id=active)
+            except Exception as exc:
+                logger.error("job id for %s failed (%s)", bound["id"], type(exc).__name__)
 
         final = await asyncio.to_thread(db.publish_capture, sid, on_id=_track)
         job["snapshot_id"] = final
