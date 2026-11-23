@@ -162,6 +162,8 @@ Amber can serve the new-tab's Latest, Library and Reader views as a web app, so 
 
 **Expose it to your own devices only.** Keep Amber listening on `127.0.0.1` and let Tailscale reverse-proxy to it. Do not use `tailscale funnel` (that is the public internet), and do not bind Amber to `0.0.0.0`. Everything Amber does (`/save`, `/api/import`, delete, the stores below) becomes reachable by every device on the tailnet, so use Tailscale ACLs if the tailnet is shared. Amber has no login of its own.
 
+In ingest mode (`AMBER_LIBRARY_MODE=ingest`) amber-web opens the library with `mode=ro`. That open may create `amber.sqlite3-wal` and `amber.sqlite3-shm`. amber-web must run as the library owner, or share a group with a group-writable umask, because those files are created with the database's mode and the next ingest write fails with `SQLITE_READONLY` if it cannot write them.
+
 ```sh
 tailscale serve --bg --https=443 localhost:8080
 ```

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import mimetypes
 import os
@@ -166,9 +167,9 @@ async def lifespan(app: FastAPI):
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
     if db.hold_instance_lock():
+        db.fail_interrupted()
         if db.readonly_library():
             db.sweep_scratch()
-        db.fail_interrupted()
     else:
         log.warning(
             "Another Amber process holds %s; leaving its in-flight captures alone.",
@@ -420,6 +421,7 @@ async def saving(request: Request, job_id: str):
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
     if not job:
+        db.recheck_unsettled(job_id)
         snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)
         if not snap:
             failed = import_failure(job_id)
@@ -512,17 +514,25 @@ app.include_router(api_router)
 app.include_router(web_router)
 
 
+_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Amber is unavailable</title></head>
+<body><h1>Amber is unavailable</h1><p>{detail}</p></body></html>
+"""
+
+
 @app.exception_handler(LibraryUnavailable)
-async def library_unavailable(_request: Request, exc: LibraryUnavailable):
-    return JSONResponse({"detail": str(exc)}, status_code=503)
+async def library_unavailable(request: Request, exc: LibraryUnavailable):
+    detail = str(exc)
+    accepts = request.headers.get("accept", "")
+    if request.url.path.startswith("/api") or "text/html" not in accepts:
+        return JSONResponse({"detail": detail}, status_code=503)
+    return HTMLResponse(_UNAVAILABLE_HTML.format(detail=html.escape(detail)), status_code=503)
 
 
 def _require_complete(sid: str, suffix: str = "") -> dict:
     if not ID_RE.fullmatch(sid):
         raise HTTPException(404, "Not found")
     snap = db.get_snapshot(sid)
-    if snap and snap["id"] != sid:
-        return RedirectResponse(f"/{snap['id']}{suffix}", status_code=303)  # type: ignore[return-value]
     if not snap:
         published = db.published_job_id(sid)
         if published:

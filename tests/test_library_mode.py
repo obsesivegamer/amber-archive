@@ -324,6 +324,11 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
     finally:
         conn.close()
 
+    before_tree = {
+        name: digest
+        for name, digest in _tree(library).items()
+        if not name.endswith(("-wal", "-shm"))
+    }
     paths = _get_paths()
     assert any(path.startswith("/api/candidates") for path in paths)
     assert "/recapture" in paths
@@ -358,6 +363,12 @@ def test_readonly_startup_and_get_routes_do_not_touch_the_library(ingest_paths):
 
     assert _sha(db_path) == content
     assert _schema_and_rows(db_path) == (schema, rows)
+    after_tree = {
+        name: digest
+        for name, digest in _tree(library).items()
+        if not name.endswith(("-wal", "-shm"))
+    }
+    assert after_tree == before_tree
     assert not (library / "amber.lock").exists()
     assert (ingest_paths["state"].with_name(ingest_paths["state"].name + ".lock")).is_file()
     assert not ingest_paths["state"].samefile(
@@ -852,9 +863,6 @@ def test_repeat_push_of_the_same_bytes_is_a_noop(capture_app, tmp_path):
 
 
 def test_default_mode_keeps_an_explicit_paywalled_flag():
-    missing = None
-    assert (1 if missing else 0) == 0
-    assert (1 if 1 else 0) == 1
     assert db.paywalled_bool(1, 400) is True
     assert db.paywalled_bool(0, 12) is False
     assert db.paywalled_bool(None, 12) is True
@@ -1039,6 +1047,7 @@ def test_save_in_a_writable_directory_without_sidecars(ingest_paths, allow_priva
         server.shutdown()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory mode 0555")
 def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
     from app.main import app
 
@@ -1086,6 +1095,13 @@ def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
             assert "Traceback" not in response.text
             search = client.get("/search", params={"q": "Shelf"})
             assert search.status_code == 503
+            page = client.get("/", headers={"accept": "text/html"})
+            assert page.status_code == 503
+            assert "text/html" in page.headers["content-type"]
+            assert "Amber is unavailable" in page.text
+            api = client.get("/api/snapshots", headers={"accept": "text/html"})
+            assert api.status_code == 503
+            assert api.headers["content-type"].startswith("application/json")
         assert {path.name for path in library.iterdir()} == names_before
         conn = sqlite3.connect(state)
         try:
@@ -1094,7 +1110,8 @@ def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
             ).fetchone()
         finally:
             conn.close()
-        assert published == ("capturing", None)
+        assert published[0] == "unknown"
+        assert "not marked failed" in (published[1] or "")
         assert not (library / "amber.sqlite3-wal").exists()
         assert not (library / "amber.sqlite3-shm").exists()
     finally:
@@ -1118,6 +1135,7 @@ def test_lost_response_retries_the_same_id(capture_app, tmp_path):
     assert (scratch / "snaps" / "Z2345").is_dir()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory mode 0555")
 def test_unconfirmed_push_keeps_scratch_when_the_library_cannot_be_read(ingest_paths, tmp_path):
     from urllib.error import URLError
 
@@ -1173,10 +1191,16 @@ def test_retarget_rewrites_srcset_and_scripts_only(tmp_path):
         encoding="utf-8",
     )
     (folder / "res" / "app.js").write_text('const u = "/Z2345/r/app.js";', encoding="utf-8")
+    nested = folder / "res" / "icons"
+    nested.mkdir()
+    (nested / "mark.svg").write_text('<svg href="/Z2345/r/mark.svg"/>', encoding="utf-8")
+    (folder / "res" / "mod.mjs").write_text('import "/Z2345/r/mod.mjs";', encoding="utf-8")
     (folder / "article.html").write_text("see /Z2345/ in the prose", encoding="utf-8")
     _retarget_scratch(scratch, "Z2345", "Z2346")
     moved = scratch / "snaps" / "Z2346"
     assert "/Z2346/r/a.jpg" in (moved / "page.html").read_text(encoding="utf-8")
     assert "/Z2345/" not in (moved / "page.html").read_text(encoding="utf-8")
     assert "/Z2346/r/app.js" in (moved / "res" / "app.js").read_text(encoding="utf-8")
+    assert "/Z2346/r/mark.svg" in (moved / "res" / "icons" / "mark.svg").read_text(encoding="utf-8")
+    assert "/Z2346/r/mod.mjs" in (moved / "res" / "mod.mjs").read_text(encoding="utf-8")
     assert (moved / "article.html").read_text(encoding="utf-8") == "see /Z2345/ in the prose"

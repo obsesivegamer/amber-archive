@@ -527,13 +527,39 @@ def prepare_scratch() -> None:
         conn.close()
 
 
+def scratch_ids_to_keep() -> set[str]:
+    """Scratch snapshots whose push is not settled yet."""
+    path = _state_file()
+    if not path.is_file():
+        return set()
+    conn = sqlite3.connect(path)
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, snapshot_id FROM jobs
+                WHERE status IN ('unconfirmed', 'unknown')
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return set()
+    finally:
+        conn.close()
+    kept: set[str] = set()
+    for row in rows:
+        for sid in (row[0], row[1]):
+            if sid:
+                kept.add(sid)
+    return kept
+
+
 def sweep_scratch() -> None:
     """Drop unpublished scratch snapshots. The library is not in this directory."""
     from .library_import import wipe_scratch_tree
 
     root = scratch_dir()
     if root.exists():
-        wipe_scratch_tree(root)
+        wipe_scratch_tree(root, keep=scratch_ids_to_keep())
 
 
 def _scratch_conn() -> sqlite3.Connection:
@@ -665,7 +691,11 @@ def fail_capture(job_id: str, sid: str, error: str, *, keep_scratch: bool = Fals
         if not keep_scratch:
             discard_scratch(gone)
         release_dell_id(gone)
-    update_job(job_id, status="failed", error=error)
+    update_job(
+        job_id,
+        status="unconfirmed" if keep_scratch else "failed",
+        error=error,
+    )
 
 
 def fill_scratch_paywalled(scratch: Path, sid: str) -> None:
@@ -778,8 +808,8 @@ def fail_interrupted() -> int:
         with _state_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, snapshot_id FROM jobs
-                WHERE status IN ('pending', 'capturing', 'queued')
+                SELECT id, snapshot_id, status FROM jobs
+                WHERE status IN ('pending', 'capturing', 'queued', 'unconfirmed', 'unknown')
                 """
             ).fetchall()
             changed = 0
@@ -787,6 +817,16 @@ def fail_interrupted() -> int:
                 published = row["snapshot_id"] or row["id"]
                 present = _library_has_snapshot(published)
                 if present is None:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'unknown',
+                            error = 'The library could not be read. The job was not marked failed.'
+                        WHERE id = ?
+                        """,
+                        (row["id"],),
+                    )
+                    changed += 1
                     continue
                 if present:
                     conn.execute(
@@ -921,10 +961,33 @@ def published_job_id(sid: str) -> str | None:
     return published
 
 
+def recheck_unsettled(job_id: str) -> None:
+    """Move a job that was left capturing or unconfirmed once the library answers."""
+    if not readonly_library():
+        return
+    row = _job_row(job_id)
+    if row is None or row["status"] not in {"unknown", "unconfirmed"}:
+        return
+    published = row["snapshot_id"] or row["id"]
+    present = _library_has_snapshot(published)
+    if present is None:
+        return
+    if present:
+        update_job(job_id, status="complete", snapshot_id=published, error=None)
+        discard_scratch(row["id"])
+        if published != row["id"]:
+            discard_scratch(published)
+        return
+    if row["status"] == "unknown":
+        update_job(job_id, status="failed", error="Interrupted before it finished.")
+        discard_scratch(row["id"])
+
+
 def job_snapshot(sid: str) -> dict | None:
     """In-flight job, or the library row a finished job published."""
     if not readonly_library():
         return None
+    recheck_unsettled(sid)
     return _job_snapshot(sid)
 
 
