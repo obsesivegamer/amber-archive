@@ -6,8 +6,8 @@ Description=Amber web in ingest mode
 
 [Service]
 WorkingDirectory=%h/apps/amber-archive
-# Password only. Bind, mode, hosts, and paths below are the unit's own
-# settings and are not taken from the reader's env file.
+# Password only. systemd applies EnvironmentFile= over Environment= no
+# matter the order, so this file must not set mode, hosts, or paths.
 EnvironmentFile=%h/.config/amber/amber-web.env
 Environment=PYTHONUNBUFFERED=1
 Environment=AMBER_LIBRARY_MODE=ingest

@@ -16,18 +16,26 @@ FUNNEL_CMD="${AMBER_TAILSCALE:-tailscale}"
 STAMP="${AMBER_BACKUP_STAMP:-${HOME}/.local/share/amber/backup-last-success}"
 MAX_AGE="${AMBER_BACKUP_MAX_AGE:-93600}"
 
-netrc="$(mktemp)"
-chmod 0600 "$netrc"
-trap 'rm -f "$netrc"' EXIT
+cfg="$(mktemp)"
+chmod 0600 "$cfg"
+trap 'rm -f "$cfg"' EXIT
+
+curl_quote() {
+  local text="$1"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  printf '"%s"' "$text"
+}
 
 check() {
   local url="$1" use_auth="${2:-}"
-  local host
-  host="$(printf '%s\n' "$url" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
   local -a args=(-fsS --max-time 5)
   if [[ -n "$use_auth" ]]; then
-    printf 'machine %s login %s password %s\n' "$host" "$USER_NAME" "$PASSWORD" >"$netrc"
-    args+=(--netrc-file "$netrc")
+    case "$PASSWORD" in
+      *$'\n'*) die "password contains a newline" ;;
+    esac
+    printf 'user = %s\n' "$(curl_quote "${USER_NAME}:${PASSWORD}")" >"$cfg"
+    args+=(-K "$cfg")
   fi
   if ! curl "${args[@]}" "$url" >/dev/null; then
     die "$url did not answer"
@@ -41,20 +49,42 @@ check "$INGEST"
 check "$IMPORT"
 check "$WEB" yes
 
-if ! status="$("$FUNNEL_CMD" funnel status 2>&1)"; then
-  die "tailscale funnel status failed"
+err="$(mktemp)"
+if ! status="$("$FUNNEL_CMD" serve status --json 2>"$err")"; then
+  rm -f "$err"
+  die "tailscale serve status failed"
 fi
-if printf '%s\n' "$status" | grep -Eiq 'funnel on'; then
-  die "tailscale funnel is on"
-fi
-trimmed="${status//[[:space:]]/}"
-if [[ -z "$trimmed" ]]; then
-  log "tailscale funnel is off"
-elif printf '%s\n' "$status" | grep -Eiq 'no funnel|funnel is disabled'; then
-  log "tailscale funnel is off"
-else
-  die "tailscale funnel status is not a known off state"
-fi
+rm -f "$err"
+python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if raw in ("", "null"):
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    sys.exit(2)
+
+def funnel_on(node):
+    if isinstance(node, dict):
+        allow = node.get("AllowFunnel")
+        if isinstance(allow, dict) and any(value is True for value in allow.values()):
+            return True
+        return any(funnel_on(value) for value in node.values())
+    if isinstance(node, list):
+        return any(funnel_on(value) for value in node)
+    return False
+
+if funnel_on(data):
+    sys.exit(1)
+' <<<"$status" || {
+  code=$?
+  if [[ "$code" -eq 1 ]]; then
+    die "tailscale funnel is on"
+  fi
+  die "tailscale serve status is not JSON"
+}
+log "tailscale funnel is off"
 
 if [[ ! -f "$STAMP" ]]; then
   die "no backup stamp at $STAMP"

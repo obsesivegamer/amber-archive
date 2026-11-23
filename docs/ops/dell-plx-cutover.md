@@ -4,6 +4,16 @@ Nothing in this change applies these commands. Funnel stays off.
 
 amber-web's unit is `docs/ops/amber-web.service`. It listens on `127.0.0.1:8084`. It is shipped disabled. The cold-boot check of port 8084 only works after the unit is enabled, and that enable happens before `tailscale serve` is pointed at 8084.
 
+## What is serving now
+
+Leave this in place until step 3. It is also the rollback. Do not run it after step 3: that would point 443 back at 8081.
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8081
+tailscale serve --bg --https=8443 http://127.0.0.1:8082
+tailscale serve --bg --https=8444 http://127.0.0.1:8083
+```
+
 ## 1. Enable amber-web on loopback
 
 Copy `docs/ops/amber-web.env.example` to `~/.config/amber/amber-web.env`, mode `0600`, with only `AMBER_READER_PASSWORD`. Do not use `amber-reader.env` here. That file can set data paths and ports, and those would override this unit.
@@ -27,12 +37,4 @@ tailscale serve --bg --https=8443 http://127.0.0.1:8082
 tailscale serve --bg --https=8444 http://127.0.0.1:8083
 ```
 
-Do not run `tailscale funnel`. `scripts/health-amber.sh` fails if funnel status is anything other than a known off state.
-
-Current serve, left in place until step 3:
-
-```bash
-tailscale serve --bg --https=443 http://127.0.0.1:8081
-tailscale serve --bg --https=8443 http://127.0.0.1:8082
-tailscale serve --bg --https=8444 http://127.0.0.1:8083
-```
+Do not run `tailscale funnel`. `scripts/health-amber.sh` runs `tailscale serve status --json` and fails if that command fails, the output is not JSON, or any `AllowFunnel` value is true.

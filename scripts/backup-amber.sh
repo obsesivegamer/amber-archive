@@ -10,14 +10,21 @@ die() { log "backup failed: $*"; exit 1; }
 
 LIBRARY="${AMBER_LIBRARY_DIR:-${HOME}/apps/amber-reader/data}"
 STATE="${AMBER_APP_STATE:-${HOME}/.local/share/amber/web-state}"
-STAGING_ROOT="${AMBER_BACKUP_STAGING:-${HOME}/.local/share/amber/backup-staging}"
+if [[ -z "${AMBER_BACKUP_STAGING+x}" ]]; then
+  STAGING_ROOT="${HOME}/.local/share/amber/backup-staging"
+elif [[ -z "$AMBER_BACKUP_STAGING" ]]; then
+  die "AMBER_BACKUP_STAGING is empty"
+else
+  STAGING_ROOT="$AMBER_BACKUP_STAGING"
+fi
 DEST="${AMBER_BACKUP_DEST:-boxj:amber-backups}"
 KEEP="${AMBER_BACKUP_KEEP:-30}"
 # Local rsync. On Dell this is the user-space binary, not DSM's.
 RSYNC_BIN="${AMBER_RSYNC:-rsync}"
-# Remote rsync. boxj's user-space binary, the one sync-boxj.sh runs there.
-# $HOME is expanded by the remote shell only if the path is passed quoted;
-# rsync execs this path, so set a full path when the home directory differs.
+# Remote rsync. boxj's shell runs this path; it is not executed on Dell.
+# sync-boxj.sh is not in this repo. amber-reader scripts/sync-from-mac.sh
+# invokes the remote PATH rsync and does not pass --rsync-path. The default
+# here is the user-space binary, $HOME/bin/rsync, which that shell expands.
 RSYNC_PATH="${AMBER_RSYNC_PATH:-\$HOME/bin/rsync}"
 if [[ -z "${AMBER_BACKUP_SSH+x}" ]]; then
   SSH=(ssh -p 3003 -o BatchMode=yes)
@@ -47,16 +54,50 @@ for name in sources.json homepage.json; do
   [[ -f "$STATE/$name" ]] || die "missing $STATE/$name"
 done
 
-stage="$STAGING_ROOT/current"
-# One staging directory. Drop anything left from the previous run, and
-# drop this one only after a successful copy so a failure keeps at most
-# that single directory.
-rm -rf "$STAGING_ROOT"
+resolve_dir() {
+  local target="$1"
+  if [[ -d "$target" ]]; then
+    (cd "$target" && pwd -P)
+  else
+    local parent base
+    parent="$(dirname "$target")"
+    base="$(basename "$target")"
+    if [[ -d "$parent" ]]; then
+      printf '%s/%s\n' "$(cd "$parent" && pwd -P)" "$base"
+    else
+      printf '%s\n' "$target"
+    fi
+  fi
+}
+stage_root="$(resolve_dir "$STAGING_ROOT")"
+home_real="$(resolve_dir "$HOME")"
+library_real="$(resolve_dir "$LIBRARY")"
+state_real="$(resolve_dir "$STATE")"
+[[ "$stage_root" != "/" ]] || die "refusing to use / as the staging root"
+[[ "$stage_root" != "$home_real" ]] || die "refusing to use the home directory as the staging root"
+refuse_stage() {
+  local live="$1" label="$2"
+  [[ -n "$live" ]] || return 0
+  [[ "$stage_root" != "$live" ]] || die "refusing to use $label as the staging root"
+  case "$stage_root" in
+    "$live"/*) die "refusing to stage inside $label" ;;
+  esac
+  case "$live" in
+    "$stage_root"/*) die "refusing to stage above $label" ;;
+  esac
+}
+refuse_stage "$library_real" "the library"
+refuse_stage "$state_real" "app-state"
+# Only this directory is ever deleted. Dated names here are previous runs.
+stage_base="$STAGING_ROOT/amber-backup-stage"
+stage="$stage_base/current"
+mkdir -p "$stage_base"
+find "$stage_base" -mindepth 1 -maxdepth 1 \( -name current -o -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' \) -exec rm -rf {} +
 mkdir -p "$stage/state"
 backup_ok=0
 cleanup_stage() {
   if [[ "$backup_ok" -eq 1 ]]; then
-    rm -rf "$STAGING_ROOT"
+    rm -rf "$stage"
   fi
 }
 trap cleanup_stage EXIT
@@ -80,10 +121,69 @@ done < <(find "$STATE" -mindepth 1 -type f -print0)
   || die "staged app-state is missing sources.json or homepage.json"
 
 python3 - "$stage" "$LIBRARY" <<'PY' || die "could not write manifest"
-import hashlib, json, sqlite3, sys
+import hashlib, json, re, sqlite3, sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
+
+# Same figure as GET /api/snapshots total_usable in app/api.py:
+# complete rows in the last 365 days, one per url_normalized, word_count and
+# article text at least 120 words, title not just the site, not a short stub.
+# limit only slices the snapshots array and is not part of this count.
+MAX_SINCE_DAYS = 365
+MIN_USABLE_WORDS = 120
+STUB_MAX_WORDS = 400
+STUB_RE = re.compile(r"subscribe to (?:unlock|read)|already a subscriber", re.IGNORECASE)
+
 stage, library = Path(sys.argv[1]), Path(sys.argv[2])
+
+def bare(host):
+    host = (host or "").strip().lower()
+    return host[4:] if host.startswith("www.") else host
+
+def host_of(url):
+    return bare(urlparse(url or "").hostname or "")
+
+def site_name(snap):
+    name = (snap.get("site_name") or "").strip()
+    if name and "." not in name:
+        return name
+    host = bare(name) or host_of(snap.get("final_url")) or host_of(snap.get("url"))
+    return host
+
+def title_is_just_a_name(snap, site):
+    title = bare(snap.get("title") or "")
+    if not title:
+        return True
+    names = {
+        bare(snap.get("site_name") or ""),
+        site.lower(),
+        host_of(snap.get("final_url")),
+        host_of(snap.get("url")),
+    }
+    return title in names
+
+def article_words(sid):
+    path = library / "snaps" / sid / "article.txt"
+    if not path.is_file():
+        return []
+    return path.read_text(encoding="utf-8").split()
+
+def is_usable(snap, site):
+    if snap["status"] != "complete":
+        return False
+    if int(snap.get("word_count") or 0) < MIN_USABLE_WORDS:
+        return False
+    if title_is_just_a_name(snap, site):
+        return False
+    words = article_words(snap["id"])
+    if len(words) < MIN_USABLE_WORDS:
+        return False
+    text = " ".join(words)
+    return not (len(words) < STUB_MAX_WORDS and STUB_RE.search(text[:300]))
+
 db = sqlite3.connect(stage / "amber.sqlite3")
+db.row_factory = sqlite3.Row
 count = db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
 ids = [
     row[0]
@@ -98,6 +198,35 @@ for sid in ids:
         continue
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     articles.append({"id": sid, "sha256": digest})
+if not articles:
+    raise SystemExit("no article.txt files to record")
+cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)")}
+needed = {"id", "status", "word_count", "title", "url", "url_normalized", "created_at"}
+if not needed <= cols:
+    raise SystemExit("staged library is missing columns needed for total_usable")
+cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_SINCE_DAYS)).strftime(
+    "%Y-%m-%dT%H:%M:%SZ"
+)
+rows = db.execute(
+    """
+    SELECT * FROM snapshots
+    WHERE status = 'complete' AND created_at >= ?
+    ORDER BY created_at DESC
+    """,
+    (cutoff,),
+).fetchall()
+seen = set()
+usable = 0
+snaps = library / "snaps"
+for row in rows:
+    snap = dict(row)
+    key = snap.get("url_normalized")
+    if key in seen:
+        continue
+    site = site_name(snap)
+    if is_usable(snap, site):
+        seen.add(key)
+        usable += 1
 state = sqlite3.connect(stage / "state" / "app.sqlite3")
 candidates = state.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
 sources = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-8"))
@@ -105,6 +234,8 @@ sources = json.loads((stage / "state" / "sources.json").read_text(encoding="utf-
     json.dumps(
         {
             "snapshots": count,
+            "total_usable": usable,
+            "since_days": MAX_SINCE_DAYS,
             "articles": articles,
             "candidates": candidates,
             "sources": len(sources.get("sources", [])),
@@ -126,41 +257,59 @@ else
   mkdir -p "$DEST"
 fi
 
-# Fills DAYS in the current shell. A failed ssh listing exits the script.
+# Fills DAYS (complete) and INCOMPLETE. One remote command lists both.
 DAYS=()
+INCOMPLETE=()
 list_days() {
-  local raw name code
-  local -a found=()
+  local raw kind name
+  local -a complete=() incomplete=()
   DAYS=()
+  INCOMPLETE=()
   if [[ "$remote" -eq 0 ]]; then
     if ! raw="$(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')"; then
       die "could not list $DEST"
     fi
+    while IFS= read -r name; do
+      [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+      if [[ -f "$DEST/$name/.complete" ]]; then
+        complete+=("$name")
+      else
+        incomplete+=("$name")
+      fi
+    done <<<"$raw"
   else
-    if ! raw="$("${SSH[@]}" "$host" "ls -1 $(printf '%q' "$path")")"; then
+    local script
+    script=$(cat <<EOF
+cd $(printf '%q' "$path") || exit 1
+for d in *; do
+  case "\$d" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      if [ -f "\$d/.complete" ]; then
+        printf 'C %s\n' "\$d"
+      else
+        printf 'I %s\n' "\$d"
+      fi
+      ;;
+  esac
+done
+EOF
+)
+    if ! raw="$("${SSH[@]}" "$host" "$script")"; then
       die "could not list $DEST"
     fi
+    while read -r kind name; do
+      [[ -n "$kind" ]] || continue
+      case "$kind" in
+        C) complete+=("$name") ;;
+        I) incomplete+=("$name") ;;
+      esac
+    done <<<"$raw"
   fi
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
-    if [[ "$remote" -eq 0 ]]; then
-      [[ -f "$DEST/$name/.complete" ]] || continue
-      found+=("$name")
-    else
-      set +e
-      "${SSH[@]}" "$host" "test -f $(printf '%q' "$path/$name/.complete")"
-      code=$?
-      set -e
-      if [[ "$code" -eq 0 ]]; then
-        found+=("$name")
-      elif [[ "$code" -ne 1 ]]; then
-        die "could not check $DEST/$name"
-      fi
-    fi
-  done <<<"$raw"
-  if ((${#found[@]})); then
-    mapfile -t DAYS < <(printf '%s\n' "${found[@]}" | sort)
+  if ((${#complete[@]})); then
+    mapfile -t DAYS < <(printf '%s\n' "${complete[@]}" | sort)
+  fi
+  if ((${#incomplete[@]})); then
+    mapfile -t INCOMPLETE < <(printf '%s\n' "${incomplete[@]}" | sort)
   fi
 }
 
@@ -218,6 +367,10 @@ if [[ -n "$prev" ]]; then
 fi
 if [[ "$remote" -eq 0 ]]; then
   mkdir -p "$DEST/$TODAY"
+  rm -f "$DEST/$TODAY/.complete"
+else
+  "${SSH[@]}" "$host" "rm -f $(printf '%q' "$path/$TODAY/.complete")" \
+    || die "could not clear the completion marker for $TODAY"
 fi
 rsync_to "$stage/amber.sqlite3" "$DEST/$TODAY/amber.sqlite3" "$root_link"
 rsync_to "$stage/manifest.json" "$DEST/$TODAY/manifest.json" "$root_link"
@@ -255,7 +408,23 @@ if ((${#DAYS[@]} > KEEP)); then
       "${SSH[@]}" "$host" "rm -rf $(printf '%q' "$path/$name")" || die "could not prune $name"
     fi
   done
+  list_days
 fi
+# Unmarked days older than the oldest kept complete backup, or older than
+# two days, are not versions. Drop those directories whole.
+oldest="${DAYS[0]:-$TODAY}"
+cutoff="$(date -u -d "$TODAY - 2 days" +%Y-%m-%d)"
+for name in "${INCOMPLETE[@]}"; do
+  [[ "$name" == "$TODAY" ]] && continue
+  if [[ "$name" < "$oldest" || "$name" < "$cutoff" ]]; then
+    log "pruning incomplete $name"
+    if [[ "$remote" -eq 0 ]]; then
+      rm -rf "$DEST/$name"
+    else
+      "${SSH[@]}" "$host" "rm -rf $(printf '%q' "$path/$name")" || die "could not prune $name"
+    fi
+  fi
+done
 
 mkdir -p "$(dirname "$STAMP")"
 date -u +%s >"$STAMP"

@@ -60,31 +60,43 @@ fi
 
 if [[ "$remote" -eq 0 ]]; then
   [[ -d "$DEST" ]] || die "no backup destination $DEST"
-  latest="$(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | while read -r name; do
-        [[ -f "$DEST/$name/.complete" ]] && printf '%s\n' "$name"
-      done | sort | tail -n 1)"
+  names=()
+  while IFS= read -r name; do
+    [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    if [[ -f "$DEST/$name/.complete" ]]; then
+      names+=("$name")
+    fi
+  done < <(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')
+  latest=""
+  if ((${#names[@]})); then
+    latest="$(printf '%s\n' "${names[@]}" | sort | tail -n 1)"
+  fi
   [[ -n "$latest" ]] || die "no complete backup under $DEST"
   copy="$DEST/$latest"
   refuse_live "$copy"
 else
   host="${DEST%%:*}"
   path="${DEST#*:}"
-  if ! listing="$("${SSH[@]}" "$host" "ls -1 $(printf '%q' "$path")")"; then
+  script=$(cat <<EOF
+cd $(printf '%q' "$path") || exit 1
+for d in *; do
+  case "\$d" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      if [ -f "\$d/.complete" ]; then
+        printf '%s\n' "\$d"
+      fi
+      ;;
+  esac
+done
+EOF
+)
+  if ! listing="$("${SSH[@]}" "$host" "$script")"; then
     die "could not list $DEST"
   fi
   names=()
   while IFS= read -r name; do
     [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
-    set +e
-    "${SSH[@]}" "$host" "test -f $(printf '%q' "$path/$name/.complete")"
-    code=$?
-    set -e
-    if [[ "$code" -eq 0 ]]; then
-      names+=("$name")
-    elif [[ "$code" -ne 1 ]]; then
-      die "could not check $DEST/$name"
-    fi
+    names+=("$name")
   done <<<"$listing"
   latest=""
   if ((${#names[@]})); then
@@ -116,12 +128,19 @@ if candidates != manifest["candidates"]:
 sources = json.loads((copy / "state" / "sources.json").read_text(encoding="utf-8"))
 if len(sources.get("sources", [])) != manifest["sources"]:
     raise SystemExit("source count does not match the manifest")
+if not manifest.get("articles"):
+    raise SystemExit("manifest has no articles")
+if "total_usable" not in manifest:
+    raise SystemExit("manifest has no total_usable")
 for item in manifest["articles"]:
     path = copy / "snaps" / item["id"] / "article.txt"
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != item["sha256"]:
         raise SystemExit(f"article {item['id']} hash does not match the manifest")
-print(f"manifest ok snapshots={count} candidates={candidates} articles={len(manifest['articles'])}", flush=True)
+print(
+    f"manifest ok snapshots={count} total_usable={manifest['total_usable']} candidates={candidates} articles={len(manifest['articles'])}",
+    flush=True,
+)
 PY
 log "manifest matched for $latest"
 if [[ -f "$LIBRARY/amber.sqlite3" ]]; then
@@ -180,17 +199,18 @@ password = os.environ.get("AMBER_READER_PASSWORD", "")
 if password:
     token = base64.b64encode(f"amber:{password}".encode()).decode()
     headers["Authorization"] = f"Basic {token}"
-count_url = f"{base}/api/snapshots?since_days=3650&limit=200"
+# total_usable is the full usable count. limit only slices the snapshots
+# array (this app clamps it to 200), so the page length is not the count.
+count_url = f"{base}/api/snapshots?since_days=365&limit=1"
 with urllib.request.urlopen(urllib.request.Request(count_url, headers=headers), timeout=5) as response:
     payload = json.loads(response.read().decode())
-if "count" in payload:
-    if payload["count"] != manifest["snapshots"]:
-        raise SystemExit(f"reader count {payload['count']} != manifest {manifest['snapshots']}")
-    print(f"reader count {payload['count']}", flush=True)
-elif "total_usable" in payload:
-    print(f"reader total_usable {payload['total_usable']}", flush=True)
-else:
-    raise SystemExit("reader did not report a count")
+if "total_usable" not in payload:
+    raise SystemExit("reader did not report total_usable")
+if payload["total_usable"] != manifest["total_usable"]:
+    raise SystemExit(
+        f"reader total_usable {payload['total_usable']} != manifest {manifest['total_usable']}"
+    )
+print(f"reader total_usable {payload['total_usable']}", flush=True)
 for item in manifest["articles"]:
     request = urllib.request.Request(f"{base}/{item['id']}/article.txt", headers=headers)
     with urllib.request.urlopen(request, timeout=5) as response:

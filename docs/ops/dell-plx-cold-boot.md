@@ -16,18 +16,20 @@ Settings, Accounts, Sign-in options. The switch is "Use my sign-in info to autom
 
 Reboot Dell-PLX. Do not sign in at the console and do not open Remote Desktop. Either of those starts `explorer.exe` and the check is void.
 
+The SSH session has to reach WSL on the `dell-plx-reader` tailnet node. That is sshd in WSL, or Tailscale SSH to that node. The Windows `dell-plx` node is not this session.
+
 ## Within 5 minutes
 
-On Dell-PLX, over SSH from another tailnet machine into WSL (not a console or RDP session):
+On Dell-PLX, over that SSH session (not a console or RDP session):
 
 ```bash
-powershell.exe -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"
+powershell.exe -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')"
 date -u +%Y-%m-%dT%H:%M:%SZ
 ```
 
-Write both into the record. The checks that follow use the same `date -u` line so the gap from boot is visible.
+Write both into the record. The boot time is UTC. The checks that follow use the same `date -u` line so the gap from boot is visible.
 
-From the phone, or from another tailnet device, not from Dell-PLX loopback:
+From another tailnet machine that has a shell, such as the Mac. Not from Dell-PLX loopback, and not from a phone browser:
 
 ```bash
 date -u +%Y-%m-%dT%H:%M:%SZ
@@ -56,6 +58,8 @@ tasklist.exe /FI "IMAGENAME eq explorer.exe"
 ```
 
 With nobody signed in, `query.exe user` prints `No User exists for *` and exits 1. `tasklist.exe` prints `INFO: No tasks are running which match the specified criteria.` Paste both into the record.
+
+If `query.exe` or `tasklist.exe` fails under the S4U session, paste that error into the record. Do not sign in at the desktop to get a substitute answer.
 
 A console or RDP sign-in would list a user and an `explorer.exe`. That means the S4U task was not the only session. The check failed.
 

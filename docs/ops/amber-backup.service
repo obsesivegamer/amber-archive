@@ -12,7 +12,9 @@ Environment=AMBER_BACKUP_DEST=boxj:amber-backups
 Environment=AMBER_BACKUP_KEEP=30
 # Local user-space rsync on Dell.
 Environment=AMBER_RSYNC=%h/bin/rsync
-# boxj user-space rsync. sync-boxj.sh is not in this repo; this is the
-# remote binary that script runs via --rsync-path. Override if it differs.
+# boxj's shell runs this path. sync-boxj.sh is not in this repo.
+# amber-reader scripts/sync-from-mac.sh does not pass --rsync-path.
+# Confirm $HOME/bin/rsync on boxj before enabling the timer, and set this
+# to sync-boxj.sh's remote path if that script names a different one.
 Environment=AMBER_RSYNC_PATH=$HOME/bin/rsync
 ExecStart=%h/apps/amber-archive/scripts/backup-amber.sh

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -12,16 +13,45 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKUP = ROOT / "scripts" / "backup-amber.sh"
 HEALTH = ROOT / "scripts" / "health-amber.sh"
 DRILL = ROOT / "scripts" / "restore-drill.sh"
-REAL_RSYNC = "/usr/bin/rsync"
+REAL_RSYNC = shutil.which("rsync")
 
 
 def _library_db(path: Path, rows: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE snapshots (id TEXT PRIMARY KEY, title TEXT, status TEXT)")
+    conn.execute(
+        """
+        CREATE TABLE snapshots (
+            id TEXT PRIMARY KEY,
+            url TEXT,
+            url_normalized TEXT,
+            final_url TEXT,
+            title TEXT,
+            site_name TEXT,
+            created_at TEXT,
+            word_count INTEGER,
+            status TEXT
+        )
+        """
+    )
     for index in range(rows):
+        usable = index == 0
         conn.execute(
-            "INSERT INTO snapshots VALUES (?, ?, 'complete')", (f"id{index}", "t")
+            """
+            INSERT INTO snapshots
+            (id, url, url_normalized, final_url, title, site_name, created_at, word_count, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'complete')
+            """,
+            (
+                f"id{index}",
+                f"https://example.com/{index}",
+                f"https://example.com/{index}",
+                f"https://example.com/{index}",
+                "A real headline" if usable else "t",
+                "Example",
+                "2026-06-01T00:00:00Z",
+                200 if usable else 2,
+            ),
         )
     conn.commit()
     conn.close()
@@ -45,10 +75,12 @@ def _layout(tmp_path: Path) -> dict[str, Path]:
     nested = state / "nested"
     nested.mkdir()
     (nested / "note.txt").write_text("nested", encoding="utf-8")
+    long_text = ("alpha " * 120).strip() + "\n"
     for sid in ("id0", "id1", "Z2345"):
         snap = library / "snaps" / sid
         snap.mkdir(parents=True)
-        (snap / "article.txt").write_text("same bytes\n", encoding="utf-8")
+        text = long_text if sid == "id0" else "same bytes\n"
+        (snap / "article.txt").write_text(text, encoding="utf-8")
     (library / "blobs").mkdir()
     (library / "blobs" / "aa").write_bytes(b"blob")
     return {
@@ -103,7 +135,7 @@ fi
 host="$1"
 shift
 cd "${{BOXJ_ROOT:?}}"
-if [[ "$*" == *\\ ls\\ * || "$*" == ls\\ * ]]; then
+if [[ "$*" == *for\\ d\\ in* || "$*" == *\\ ls\\ * || "$*" == ls\\ * ]]; then
   {"exit 1" if fail_ls else ":"}
 fi
 if [[ "${{1:-}}" == rsync || "${{1:-}}" == */rsync ]]; then
@@ -132,6 +164,8 @@ exec {REAL_RSYNC} "$@"
 
 def test_backup_copy_keeps_nested_state_and_drops_staging(tmp_path: Path):
     paths = _layout(tmp_path)
+    paths["stage"].mkdir()
+    (paths["stage"] / "keep-me").write_text("stay", encoding="utf-8")
     result = _run(_env(paths, AMBER_BACKUP_DATE="2026-04-02"))
     assert result.returncode == 0, result.stderr
     day = paths["dest"] / "2026-04-02"
@@ -149,11 +183,12 @@ def test_backup_copy_keeps_nested_state_and_drops_staging(tmp_path: Path):
     assert (day / ".complete").is_file()
     manifest = json.loads((day / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["snapshots"] == 2
+    assert manifest["total_usable"] == 1
     assert manifest["candidates"] == 1
     assert manifest["sources"] == 1
-    assert manifest["articles"]
-    assert not (paths["stage"] / "current").exists()
-    assert list(paths["stage"].glob("*")) == []
+    assert len(manifest["articles"]) >= 1
+    assert not (paths["stage"] / "amber-backup-stage" / "current").exists()
+    assert (paths["stage"] / "keep-me").read_text() == "stay"
 
 
 def test_link_dest_keeps_old_extra_file_off_the_new_day(tmp_path: Path):
@@ -182,19 +217,27 @@ def test_prune_trusts_only_complete_directories(tmp_path: Path):
         day = paths["dest"] / f"2025-01-{index + 1:02d}"
         _complete(day)
         (day / "marker").write_text("old", encoding="utf-8")
-    incomplete = paths["dest"] / "2024-12-31"
-    incomplete.mkdir(parents=True)
-    (incomplete / "marker").write_text("incomplete", encoding="utf-8")
+    old_incomplete = paths["dest"] / "2024-12-31"
+    old_incomplete.mkdir(parents=True)
+    (old_incomplete / "marker").write_text("incomplete", encoding="utf-8")
+    recent = paths["dest"] / "2026-01-31"
+    recent.mkdir()
+    (recent / "marker").write_text("recent", encoding="utf-8")
+    stale = paths["dest"] / "2026-01-29"
+    stale.mkdir()
+    (stale / "marker").write_text("stale", encoding="utf-8")
     result = _run(_env(paths, AMBER_BACKUP_DATE="2026-02-01"))
     assert result.returncode == 0, result.stderr
     names = sorted(path.name for path in paths["dest"].iterdir())
     assert "2026-02-01" in names
     assert "2025-01-01" not in names
     assert "2025-01-02" not in names
+    assert "2024-12-31" not in names
+    assert "2026-01-29" not in names
     assert (paths["dest"] / "2025-01-03" / "marker").read_text() == "old"
-    assert (incomplete / "marker").read_text() == "incomplete"
+    assert (recent / "marker").read_text() == "recent"
     assert "pruning 2025-01-01" in result.stderr
-    assert len(names) == 31
+    assert "pruning incomplete 2024-12-31" in result.stderr
 
 
 def test_keep_below_one_does_not_delete(tmp_path: Path):
@@ -248,8 +291,10 @@ def test_remote_mkdir_before_rsync_and_rsync_path(tmp_path: Path):
     assert (day / "state" / "nested" / "note.txt").read_text() == "nested"
     log = ssh_log.read_text(encoding="utf-8")
     assert log.index("mkdir -p") < log.index("rsync")
-    assert log.index("rsync") < log.index(".complete")
-    assert "--rsync-path=rsync" in rsync_log.read_text(encoding="utf-8")
+    assert log.rindex(".complete") > log.index("rsync")
+    recorded = rsync_log.read_text(encoding="utf-8")
+    assert "--rsync-path=rsync" in recorded
+    assert "--delete" not in recorded
     kept = day / "snaps" / "Z2345" / "note.txt"
     kept.write_text("leave this", encoding="utf-8")
     env["AMBER_BACKUP_DATE"] = "2026-04-02"
@@ -307,13 +352,17 @@ def test_failed_run_keeps_only_the_staging_directory(tmp_path: Path):
     env["RSYNC_LOG"] = str(rsync_log)
     failed = _run(env)
     assert failed.returncode != 0
-    assert (paths["stage"] / "current" / "amber.sqlite3").is_file()
-    leftover = paths["stage"] / "2020-01-01"
+    assert (paths["stage"] / "amber-backup-stage" / "current" / "amber.sqlite3").is_file()
+    (paths["stage"] / "keep-me").write_text("stay", encoding="utf-8")
+    leftover = paths["stage"] / "amber-backup-stage" / "2020-01-01"
     leftover.mkdir()
     (leftover / "old").write_text("x", encoding="utf-8")
     ok = _run(_env(paths, AMBER_BACKUP_DATE="2026-05-02"))
     assert ok.returncode == 0, ok.stderr
-    assert not paths["stage"].exists()
+    assert paths["stage"].is_dir()
+    assert (paths["stage"] / "keep-me").read_text() == "stay"
+    assert not (paths["stage"] / "amber-backup-stage" / "current").exists()
+    assert not leftover.exists()
 
 
 def test_missing_library_fails_loudly(tmp_path: Path):
@@ -328,31 +377,27 @@ def test_health_hides_the_password_and_fails_closed(tmp_path: Path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     curl_log = tmp_path / "curl.log"
+    password = "secr#et word"
     (bin_dir / "curl").write_text(
         f"""#!/bin/sh
 printf '%s\\n' "$*" >> "{curl_log}"
-for arg in "$@"; do
-  case "$arg" in
-    *secret*) echo password-on-argv >> "{curl_log}"; exit 2 ;;
-  esac
-done
 url=
 prev=
-netrc=
+cfg=
 for arg in "$@"; do
   case "$arg" in
     http://*|https://*) url=$arg ;;
   esac
-  if [ "$prev" = "--netrc-file" ]; then
-    netrc=$arg
+  if [ "$prev" = "-K" ]; then
+    cfg=$arg
   fi
   prev=$arg
 done
 case "$url" in
   *8081*|*8084*)
-    [ -n "$netrc" ] || exit 5
-    [ "$(stat -c %a "$netrc")" = 600 ] || exit 4
-    grep -q secret "$netrc" || exit 3
+    [ -n "$cfg" ] || exit 5
+    [ "$(stat -c %a "$cfg")" = 600 ] || exit 4
+    grep -F -q 'user = "amber:{password}"' "$cfg" || exit 3
     ;;
 esac
 exit 0
@@ -364,46 +409,58 @@ exit 0
     stamp.write_text(subprocess.check_output(["date", "-u", "+%s"], text=True), encoding="utf-8")
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
-    env["AMBER_HEALTH_PASSWORD"] = "secret"
+    env["AMBER_HEALTH_PASSWORD"] = password
     env["AMBER_BACKUP_STAMP"] = str(stamp)
-    env["CURL_LOG"] = str(curl_log)
+    tailnet = {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {
+            "dell-plx-reader.tailf9612a.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8081"}}
+            }
+        },
+    }
+    funnel = {
+        **tailnet,
+        "AllowFunnel": {"dell-plx-reader.tailf9612a.ts.net:443": True},
+    }
 
     def tailscale(body: str, code: int) -> None:
         script = bin_dir / "tailscale"
-        script.write_text(f"#!/bin/sh\nprintf '%s\\n' {body!r}\nexit {code}\n", encoding="utf-8")
+        script.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" != serve ] || [ "$2" != status ] || [ "$3" != --json ]; then exit 2; fi\n'
+            f"printf '%s\\n' {body!r}\nexit {code}\n",
+            encoding="utf-8",
+        )
         script.chmod(0o755)
         env["AMBER_TAILSCALE"] = str(script)
 
-    tailscale("Funnel is disabled", 0)
-    disabled = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
-    assert disabled.returncode == 0, disabled.stderr
-    tailscale("No funnel", 0)
+    tailscale("null", 0)
+    empty = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
+    assert empty.returncode == 0, empty.stderr
+    tailscale(json.dumps(tailnet), 0)
     ok = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert ok.returncode == 0, ok.stderr
     logged = curl_log.read_text(encoding="utf-8")
-    assert "--netrc-file" in logged
-    assert "secret" not in logged
-    assert "password-on-argv" not in logged
+    assert "-K " in logged
+    assert password not in logged
 
-    tailscale("Funnel on", 0)
+    tailscale(json.dumps(funnel), 0)
     bad = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert bad.returncode != 0
     assert "funnel is on" in bad.stderr
 
-    tailscale("status unknown", 0)
+    tailscale("not-json", 0)
     unknown = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert unknown.returncode != 0
-    assert "not a known off state" in unknown.stderr
+    assert "not JSON" in unknown.stderr
 
-    tailscale("", 1)
+    tailscale("{}", 1)
     failed = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert failed.returncode != 0
-    assert "funnel status failed" in failed.stderr
+    assert "serve status failed" in failed.stderr
 
-    tailscale("", 0)
-    empty = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
-    assert empty.returncode == 0, empty.stderr
-
+    tailscale("null", 0)
     stamp.unlink()
     missing = subprocess.run([str(HEALTH)], env=env, text=True, capture_output=True, check=False)
     assert missing.returncode != 0
@@ -414,26 +471,50 @@ def test_restore_drill_uses_manifest_and_reader(tmp_path: Path):
     paths = _layout(tmp_path)
     assert _run(_env(paths, AMBER_BACKUP_DATE="2026-03-01")).returncode == 0
     conn = sqlite3.connect(paths["library"] / "amber.sqlite3")
-    conn.execute("INSERT INTO snapshots VALUES ('id9', 'later', 'complete')")
+    conn.execute(
+        """
+        INSERT INTO snapshots
+        (id, url, url_normalized, final_url, title, site_name, created_at, word_count, status)
+        VALUES ('id9', 'https://example.com/9', 'https://example.com/9', 'https://example.com/9',
+                'later', 'Example', '2026-06-01T00:00:00Z', 2, 'complete')
+        """
+    )
     conn.commit()
     conn.close()
     server = tmp_path / "reader.py"
     server.write_text(
         """
-import json, os, sqlite3
+import json, os, sys
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sqlite3
 data = Path(os.environ["AMBER_DATA_DIR"])
-print(f"reader-data={data}", flush=True)
-print(f"blobs={int((data / 'blobs').exists())}", flush=True)
+print("reader-data=" + str(data), flush=True)
+print("blobs=" + str(int((data / "blobs").exists())), flush=True)
+
+def usable_count():
+    db = sqlite3.connect(data / "amber.sqlite3")
+    db.row_factory = sqlite3.Row
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = db.execute(
+        "SELECT * FROM snapshots WHERE status = 'complete' AND created_at >= ? AND word_count >= 120",
+        (cutoff,),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        text = (data / "snaps" / row["id"] / "article.txt").read_text(encoding="utf-8")
+        if len(text.split()) >= 120:
+            count += 1
+    return count
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/healthz"):
             return self._send(200, b"ok")
         if self.path.startswith("/api/snapshots"):
-            db = sqlite3.connect(data / "amber.sqlite3")
-            count = db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-            return self._send(200, json.dumps({"count": count}).encode(), "application/json")
+            body = json.dumps({"total_usable": usable_count(), "snapshots": []}).encode()
+            return self._send(200, body, "application/json")
         if self.path.endswith("/article.txt"):
             sid = self.path.strip("/").split("/")[0]
             path = data / "snaps" / sid / "article.txt"
@@ -450,7 +531,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve_forever()
-""",
+""".replace("__ROOT__", repr(str(ROOT))),
         encoding="utf-8",
     )
     env = _env(paths)
@@ -459,14 +540,15 @@ ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve
     env["AMBER_READER_PASSWORD"] = "secret"
     result = subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "manifest ok snapshots=2" in result.stdout
-    assert "reader count 2" in result.stdout
+    assert "manifest ok snapshots=2 total_usable=1" in result.stdout
+    assert "reader total_usable 1" in result.stdout
     assert "served 2 articles" in result.stdout
     assert "live snapshot count (not checked): 3" in result.stderr
-    assert result.args == [str(DRILL)]
+    assert "secret" not in result.stdout
+    assert "secret" not in result.stderr
     data_line = next(line for line in result.stdout.splitlines() if line.startswith("reader-data="))
     data_dir = Path(data_line.split("=", 1)[1])
-    assert f"blobs=0" in result.stdout
+    assert "blobs=0" in result.stdout
     assert not data_dir.exists()
     assert not data_dir.parent.exists()
 
@@ -519,11 +601,148 @@ def test_restore_drill_refuses_live_paths_and_remote_blobs(tmp_path: Path):
     assert "AMBER_BACKUP_SSH is empty" in missing_ssh.stderr
 
 
+def test_staging_root_is_refused(tmp_path: Path):
+    paths = _layout(tmp_path)
+    library_db = paths["library"] / "amber.sqlite3"
+    original = library_db.read_bytes()
+    cases = {
+        "": "empty",
+        "/": "refusing to use /",
+        str(paths["library"].parent): "home directory",
+        str(paths["library"]): "the library",
+        str(paths["state"]): "app-state",
+    }
+    for staging, needle in cases.items():
+        result = _run(_env(paths, AMBER_BACKUP_STAGING=staging, AMBER_BACKUP_DATE="2026-07-01"))
+        assert result.returncode != 0, staging
+        assert needle in result.stderr
+        assert library_db.read_bytes() == original
+
+
+def test_failed_rerun_clears_complete_and_requires_an_article(tmp_path: Path):
+    paths = _layout(tmp_path)
+    assert _run(_env(paths, AMBER_BACKUP_DATE="2026-05-03")).returncode == 0
+    day = paths["dest"] / "2026-05-03"
+    assert (day / ".complete").is_file()
+    wrap = tmp_path / "rsync-fail"
+    wrap.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    wrap.chmod(0o755)
+    failed = _run(_env(paths, AMBER_BACKUP_DATE="2026-05-03", AMBER_RSYNC=str(wrap)))
+    assert failed.returncode != 0
+    assert not (day / ".complete").exists()
+    for article in (paths["library"] / "snaps").rglob("article.txt"):
+        article.unlink()
+    missing = _run(_env(paths, AMBER_BACKUP_DATE="2026-05-04"))
+    assert missing.returncode != 0
+    assert "no article.txt" in missing.stderr
+
+
+def test_local_drill_reports_a_missing_destination(tmp_path: Path):
+    paths = _layout(tmp_path)
+    assert _run(_env(paths, AMBER_BACKUP_DATE="2026-03-02")).returncode == 0
+    later = paths["dest"] / "2026-09-01"
+    later.mkdir()
+    (later / "marker").write_text("incomplete", encoding="utf-8")
+    env = _env(paths)
+    env["AMBER_RESTORE_SKIP_SERVER"] = "1"
+    ok = subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
+    assert ok.returncode == 0, ok.stderr
+    assert "manifest ok" in ok.stdout
+    missing = _env(paths)
+    missing["AMBER_BACKUP_DEST"] = str(tmp_path / "no-such-dest")
+    missing["AMBER_RESTORE_SKIP_SERVER"] = "1"
+    bad = subprocess.run([str(DRILL)], env=missing, text=True, capture_output=True, check=False)
+    assert bad.returncode != 0
+    assert "no backup destination" in bad.stderr
+
+
+def test_reader_count_must_match(tmp_path: Path):
+    paths = _layout(tmp_path)
+    assert _run(_env(paths, AMBER_BACKUP_DATE="2026-03-03")).returncode == 0
+    def serve(payload: str, port: str) -> subprocess.CompletedProcess[str]:
+        server = tmp_path / f"reader-{port}.py"
+        server.write_text(
+            f"""
+import json, os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+PAYLOAD = {payload!r}.encode()
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok" if self.path.startswith("/healthz") else PAYLOAD
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, fmt, *args):
+        return
+ThreadingHTTPServer(("127.0.0.1", int(os.environ["AMBER_PORT"])), Handler).serve_forever()
+""",
+            encoding="utf-8",
+        )
+        env = _env(paths)
+        env["AMBER_READER_CMD"] = f"python3 {server}"
+        env["AMBER_RESTORE_PORT"] = port
+        return subprocess.run([str(DRILL)], env=env, text=True, capture_output=True, check=False)
+
+    wrong = serve(json.dumps({"total_usable": 99, "snapshots": []}), "18762")
+    assert wrong.returncode != 0
+    assert "total_usable 99" in wrong.stderr
+    absent = serve(json.dumps({"snapshots": ["x"] * 200}), "18763")
+    assert absent.returncode != 0
+    assert "did not report total_usable" in absent.stderr
+
+
+def test_unit_env_loads_into_app_settings(tmp_path: Path):
+    home = tmp_path / "home"
+    env = os.environ.copy()
+    for line in (ROOT / "docs" / "ops" / "amber-web.service").read_text(encoding="utf-8").splitlines():
+        if not line.startswith("Environment="):
+            continue
+        key, value = line[len("Environment=") :].split("=", 1)
+        env[key] = value.replace("%h", str(home))
+    env["AMBER_READER_PASSWORD"] = "unit-secret"
+    env.pop("AMBER_READER_PASSWORD_FILE", None)
+    (home / "apps" / "amber-reader" / "data").mkdir(parents=True)
+    script = tmp_path / "check_unit_env.py"
+    script.write_text(
+        """
+import app.auth as auth
+import app.config as config
+from app.main import ALLOWED_HOSTS
+
+assert config.ingest_library()
+assert config.HOST == "127.0.0.1"
+assert config.PORT == 8084
+assert "dell-plx-reader.tailf9612a.ts.net" in config.EXTRA_HOSTS
+assert "127.0.0.1" in config.EXTRA_HOSTS
+assert auth.USERNAME == "amber"
+assert auth.required_password() == "unit-secret"
+assert auth.CHALLENGE == 'Basic realm="amber-reader", charset="UTF-8"'
+assert "/healthz" in auth.OPEN_PATHS
+assert "dell-plx-reader.tailf9612a.ts.net" in ALLOWED_HOSTS
+assert "127.0.0.1" in ALLOWED_HOSTS
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["python3", str(script)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_units_and_docs_keep_bind_and_cold_boot_order():
     unit = (ROOT / "docs" / "ops" / "amber-web.service").read_text(encoding="utf-8")
     assert "amber-reader.env" not in unit
     assert "amber-web.env" in unit
-    assert unit.index("EnvironmentFile=") < unit.index("AMBER_LIBRARY_MODE=ingest")
+    assert "only" in (ROOT / "docs" / "ops" / "amber-web.env.example").read_text(encoding="utf-8")
+    example = (ROOT / "docs" / "ops" / "amber-web.env.example").read_text(encoding="utf-8")
+    assignments = [line for line in example.splitlines() if line and not line.startswith("#")]
+    assert assignments == ["AMBER_READER_PASSWORD=replace-me"]
     assert "AMBER_ALLOWED_HOSTS=dell-plx-reader.tailf9612a.ts.net,127.0.0.1:8084" in unit
     assert "AMBER_HOST=127.0.0.1" in unit
     assert "--host 127.0.0.1 --port 8084" in unit
@@ -531,10 +750,12 @@ def test_units_and_docs_keep_bind_and_cold_boot_order():
     assert "AMBER_RSYNC_PATH=" in backup_unit
     assert "OnFailure=amber-backup-failed.service" in backup_unit
     cutover = (ROOT / "docs" / "ops" / "dell-plx-cutover.md").read_text(encoding="utf-8")
+    assert cutover.index("http://127.0.0.1:8081") < cutover.index("enable --now amber-web.service")
     assert cutover.index("enable --now amber-web.service") < cutover.index(
         "tailscale serve --bg --https=443 http://127.0.0.1:8084"
     )
     assert "18081" in cutover
+    assert "rollback" in cutover.lower()
     cold = (ROOT / "docs" / "ops" / "dell-plx-cold-boot.md").read_text(encoding="utf-8")
     assert "https://dell-plx-reader.tailf9612a.ts.net/healthz" in cold
     assert "https://dell-plx-reader.tailf9612a.ts.net:8443/healthz" in cold
@@ -542,6 +763,12 @@ def test_units_and_docs_keep_bind_and_cold_boot_order():
     assert "No User exists for *" in cold
     assert "tasklist.exe" in cold
     assert "explorer.exe" in cold
-    assert "LastBootUpTime" in cold
+    assert "ToUniversalTime()" in cold
+    assert "dell-plx-reader" in cold
+    assert "Do not sign in at the desktop" in cold
+    assert "Mac" in cold
     assert "S4U" in cold
     assert "127.0.0.1:8084/healthz" in cold
+    backup_doc = (ROOT / "docs" / "ops" / "dell-plx-backup.md").read_text(encoding="utf-8")
+    assert "ssh -p 3003 boxj '$HOME/bin/rsync --version'" in backup_doc
+    assert "scripts/sync-from-mac.sh" in backup_doc
