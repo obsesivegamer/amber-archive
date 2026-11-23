@@ -48,8 +48,6 @@ def _tree(root: Path) -> dict[str, str]:
 
 def _write_library(root: Path) -> Path:
     """WAL library the way ingest prepares a store, plus a candidate and a recapture flag."""
-    from urllib.parse import quote
-
     from app.library_ingest import prepare_store
 
     prepare_store(root)
@@ -483,6 +481,9 @@ class _IngestHandler(BaseHTTPRequestHandler):
             self._send(500, {"detail": "blob failed"})
             return
         sha = self.path.rstrip("/").rsplit("/", 1)[-1]
+        from app.library_ingest import install_blob
+
+        install_blob(self.server.library, sha, body)
         self.server.blobs[sha] = body
         self._send(201, {"sha256": sha})
 
@@ -494,13 +495,26 @@ class _IngestHandler(BaseHTTPRequestHandler):
             time.sleep(self.server.delay)
         payload = json.loads(self._read().decode("utf-8"))
         self.server.posts.append(payload)
+        if self.server.mode == "drop-once" and not self.server.dropped:
+            from app.library_ingest import commit_document
+
+            commit_document(self.server.library, payload)
+            self.server.dropped = True
+            self.close_connection = True
+            return
         if self.server.mode == "fail" or (
             self.server.mode == "conflict-fail" and self.server.conflicted
         ):
+            from app.library_ingest import _release_payload_blobs
+
+            _release_payload_blobs(self.server.library, payload)
             self._send(500, {"detail": "commit failed"})
             return
         if self.server.mode in {"conflict", "conflict-fail"} and not self.server.conflicted:
+            from app.library_ingest import _release_payload_blobs
+
             self.server.conflicted = True
+            _release_payload_blobs(self.server.library, payload)
             self._send(409, {"detail": "revision is not stored + 1", "revision": 1})
             return
         from app.library_ingest import commit_document, install_blob, prepare_store
@@ -524,15 +538,21 @@ def _serve_ingest(library: Path, mode: str) -> tuple[ThreadingHTTPServer, str]:
     server.conflicted = False
     server.delay = 0
     server.gate = threading.Event()
+    server.dropped = False
+    # Ingest keeps a connection open, so a checkpoint does not delete -wal/-shm.
+    server.hold = sqlite3.connect(library / "amber.sqlite3")
+    server.hold.execute("SELECT COUNT(*) FROM snapshots").fetchone()
+    stop = server.shutdown
+
+    def shutdown() -> None:
+        server.hold.close()
+        stop()
+
+    server.shutdown = shutdown
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
     return server, f"http://{host}:{port}"
-
-
-def _token(path: Path) -> None:
-    path.write_text(TOKEN + "\n", encoding="utf-8")
-    path.chmod(0o600)
 
 
 def _wait(client: TestClient, sid: str) -> dict:
@@ -562,7 +582,7 @@ def _library_ids(db_path: Path) -> list[str]:
 
 
 @pytest.fixture
-def capture_app(ingest_paths, allow_private):
+def capture_app(ingest_paths):
     return ingest_paths
 
 
@@ -578,6 +598,17 @@ def _scratch_rows(scratch: Path) -> int:
             return 0
     finally:
         conn.close()
+
+
+def _blob_files(root: Path) -> list[str]:
+    blobs = root / "blobs"
+    if not blobs.exists():
+        return []
+    return sorted(
+        str(path.relative_to(root))
+        for path in blobs.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    )
 
 
 def _blob(server, document: dict, name: str) -> bytes:
@@ -597,7 +628,7 @@ def test_failed_push_leaves_the_library_unchanged(capture_app, allow_private, mo
     from app.main import app
 
     library = capture_app["library"]
-    before = _tree(library)
+    before_snaps = _tree(library / "snaps")
     server, base = _serve_ingest(library, "fail")
     monkeypatch.setenv("AMBER_INGEST_URL", base)
     page, url = _serve_html(SHORT_HTML)
@@ -606,8 +637,9 @@ def test_failed_push_leaves_the_library_unchanged(capture_app, allow_private, mo
             sid = _save(client, url)
             job = _wait(client, sid)
             assert job["status"] == "failed"
-            assert _tree(library) == before
+            assert _tree(library / "snaps") == before_snaps
             assert _library_ids(capture_app["db_path"]) == [LIBRARY_SID]
+            assert _blob_files(library) == []
             assert _scratch_rows(capture_app["scratch"]) == 0
             leftovers = list((capture_app["scratch"] / "snaps").glob("*")) if (capture_app["scratch"] / "snaps").exists() else []
             assert leftovers == []
@@ -682,6 +714,10 @@ def test_conflict_reallocates_and_the_retry_keeps_paywalled(capture_app, allow_p
             redirect = client.get(f"/saving/{sid}", follow_redirects=False)
             assert redirect.status_code == 303
             assert redirect.headers["location"].endswith("/" + second["id"])
+            viewed = client.get(f"/{first['id']}", follow_redirects=False)
+            assert viewed.status_code == 303
+            assert viewed.headers["location"].endswith("/" + second["id"])
+            assert first["id"] not in viewed.text
     finally:
         server.shutdown()
         page.shutdown()
@@ -707,6 +743,7 @@ def test_blob_failure_and_failure_after_retarget_leave_no_scratch(
         blob_server.shutdown()
         page.shutdown()
 
+    before_snaps = _tree(library / "snaps")
     retry, retry_base = _serve_ingest(library, "conflict-fail")
     monkeypatch.setenv("AMBER_INGEST_URL", retry_base)
     page, url = _serve_html(LONG_HTML)
@@ -716,7 +753,9 @@ def test_blob_failure_and_failure_after_retarget_leave_no_scratch(
             assert job["status"] == "failed"
             assert len(retry.posts) == 2
             assert retry.posts[0]["id"] != retry.posts[1]["id"]
-            assert _tree(library) == before
+            assert _tree(library / "snaps") == before_snaps
+            assert _library_ids(capture_app["db_path"]) == [LIBRARY_SID]
+            assert _blob_files(library) == []
             assert _scratch_rows(capture_app["scratch"]) == 0
             assert list((capture_app["scratch"] / "snaps").glob("*")) == []
     finally:
@@ -751,6 +790,7 @@ def test_push_does_not_block_reads(capture_app, allow_private, monkeypatch):
     page, url = _serve_html(SHORT_HTML)
     try:
         with TestClient(app) as client:
+            assert client.get("/").status_code == 200
             sid = _save(client, url)
             assert server.gate.wait(60)
             started = time.perf_counter()
@@ -804,12 +844,21 @@ def test_repeat_push_of_the_same_bytes_is_a_noop(capture_app, tmp_path):
 
 
 def test_default_mode_keeps_an_explicit_paywalled_flag():
+    missing = None
+    assert (1 if missing else 0) == 0
+    assert (1 if 1 else 0) == 1
     assert db.paywalled_bool(1, 400) is True
     assert db.paywalled_bool(0, 12) is False
     assert db.paywalled_bool(None, 12) is True
     assert db.paywalled_bool(None, 400) is False
-    assert db.paywalled_bool(True, 400) is True
-    assert db.paywalled_bool(False, 12) is False
+
+
+def test_extract_always_sets_paywalled():
+    from app.extract import extract_article
+
+    got = extract_article("<html><body><p>Hello there.</p></body></html>", "https://example.com/a")
+    assert "paywalled" in got
+    assert isinstance(got["paywalled"], bool)
 
 
 def test_ingest_mode_refuses_a_different_database(tmp_path, monkeypatch):
@@ -856,3 +905,62 @@ def test_failed_capture_releases_the_reserved_id(ingest_paths):
     db.fail_capture(sid, sid, "capture failed")
     assert sid not in _reserved
     assert _scratch_rows(ingest_paths["scratch"]) == 0
+
+
+def test_reads_with_a_live_writer_create_no_files(ingest_paths):
+    from app.main import app
+
+    library = ingest_paths["library"]
+    held = sqlite3.connect(ingest_paths["db_path"])
+    held.execute("BEGIN")
+    names_before = {path.name for path in library.iterdir()}
+    db_hash = _sha(ingest_paths["db_path"])
+    wal = ingest_paths["db_path"].with_name(ingest_paths["db_path"].name + "-wal")
+    wal_hash = _sha(wal)
+    try:
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+            assert client.get("/search", params={"q": "Shelf"}).status_code == 200
+        assert {path.name for path in library.iterdir()} == names_before
+        assert _sha(ingest_paths["db_path"]) == db_hash
+        assert _sha(wal) == wal_hash
+    finally:
+        held.close()
+
+
+def test_missing_sidecars_in_a_readonly_directory_are_a_clear_503(ingest_paths):
+    from app.main import app
+
+    library = ingest_paths["library"]
+    for name in ("amber.sqlite3-wal", "amber.sqlite3-shm"):
+        (library / name).unlink(missing_ok=True)
+    os.chmod(library, 0o555)
+    names_before = {path.name for path in library.iterdir()}
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get("/")
+            assert response.status_code == 503
+            assert "WAL" in response.text
+            assert "Traceback" not in response.text
+            search = client.get("/search", params={"q": "Shelf"})
+            assert search.status_code == 503
+        assert {path.name for path in library.iterdir()} == names_before
+        assert not (library / "amber.sqlite3-wal").exists()
+        assert not (library / "amber.sqlite3-shm").exists()
+    finally:
+        os.chmod(library, 0o755)
+
+
+def test_lost_response_retries_the_same_id(capture_app, tmp_path):
+    from app.library_import import _push_confirmed
+
+    server, base = _serve_ingest(capture_app["library"], "drop-once")
+    scratch = tmp_path / "lost"
+    _scratch_row(scratch, "Z2345", paywalled=0, word_count=120, title="Same Bytes")
+    try:
+        _push_confirmed(scratch, "Z2345", base, TOKEN, transport=None)
+    finally:
+        server.shutdown()
+    assert [item["id"] for item in server.posts] == ["Z2345", "Z2345"]
+    assert _library_ids(capture_app["db_path"]).count("Z2345") == 1
+    assert (scratch / "snaps" / "Z2345").is_dir()

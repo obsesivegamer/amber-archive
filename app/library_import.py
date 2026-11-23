@@ -482,7 +482,7 @@ def _delete_scratch(sid: str, scratch: Path) -> None:
     db.delete_snapshot(sid)
 
 
-def _scratch_contains(scratch: Path) -> Callable[[str], bool]:
+def scratch_contains(scratch: Path) -> Callable[[str], bool]:
     root = scratch.resolve()
 
     def taken(sid: str) -> bool:
@@ -507,24 +507,31 @@ def _scratch_contains(scratch: Path) -> Callable[[str], bool]:
     return taken
 
 
+_AMBER_URLS = (
+    'href="/{old}/',
+    "href='/{old}/",
+    'src="/{old}/',
+    "src='/{old}/",
+    "url(/{old}/",
+    "url('/{old}/",
+    'url("/{old}/',
+)
+
+
 def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
+    """Rewrite Amber's own asset URLs. Leave the captured page's text alone."""
     for path in folder.rglob("*"):
         if not path.is_file() or path.is_symlink():
             continue
-        if path.suffix.lower() in {
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".gif",
-            ".webp",
-            ".woff",
-            ".woff2",
-            ".ttf",
-            ".otf",
-        }:
+        name = path.name
+        if name not in {"page.html", "reader.html", "article.html", "meta.json"} and not (
+            path.parent.name == "res" and path.suffix.lower() == ".css"
+        ):
             continue
         text = path.read_text(encoding="utf-8", errors="surrogateescape")
-        updated = text.replace(f"/{old}/", f"/{new}/")
+        updated = text
+        for pattern in _AMBER_URLS:
+            updated = updated.replace(pattern.format(old=old), pattern.format(old=new))
         updated = updated.replace(
             f'name="amber-snapshot" content="{old}"',
             f'name="amber-snapshot" content="{new}"',
@@ -568,6 +575,25 @@ def _retarget_scratch(scratch: Path, old: str, new: str) -> None:
         conn.close()
 
 
+def _push_confirmed(scratch: Path, sid: str, ingest_url: str, token: str, *, transport) -> None:
+    """Push once, and again if the response never arrived.
+
+    The second push sends the same id and bytes. Ingest answers 200 when
+    the first one committed and the response was lost. Scratch stays until
+    a response confirms the push.
+    """
+    try:
+        push_snapshot(scratch, sid, ingest_url, token, transport=transport)
+        return
+    except (urllib.error.URLError, TimeoutError, OSError, PushError) as first:
+        if isinstance(first, PushError) and "ingest" not in str(first):
+            raise
+        try:
+            push_snapshot(scratch, sid, ingest_url, token, transport=transport)
+        except (urllib.error.URLError, TimeoutError, OSError, PushError):
+            raise first
+
+
 def commit_captured_snapshot(
     library_dir: Path,
     scratch: Path,
@@ -590,7 +616,7 @@ def commit_captured_snapshot(
                 on_id(current)
             db.fill_scratch_paywalled(scratch, current)
             try:
-                push_snapshot(
+                _push_confirmed(
                     scratch,
                     current,
                     ingest_url,
@@ -605,10 +631,16 @@ def commit_captured_snapshot(
                 reserved = ""
                 fresh = allocate_dell_id(
                     library_dir,
-                    scratch_has=_scratch_contains(scratch),
+                    scratch_has=scratch_contains(scratch),
                 )
                 reserved = fresh
-                _retarget_scratch(scratch, current, fresh)
+                if on_id is not None:
+                    on_id(fresh)
+                try:
+                    _retarget_scratch(scratch, current, fresh)
+                except Exception:
+                    shutil.rmtree(scratch / "snaps" / fresh, ignore_errors=True)
+                    raise
                 current = fresh
     finally:
         if reserved:

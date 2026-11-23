@@ -48,6 +48,7 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db, recapture
+from .db import LibraryUnavailable
 from .api import (
     MAX_IMPORT_BODY_BYTES,
     _read_body_capped,
@@ -161,6 +162,10 @@ async def lifespan(app: FastAPI):
     if db.readonly_library():
         db.require_ingest_settings()
         db.prepare_scratch()
+        try:
+            db.ensure_library_sidecars()
+        except LibraryUnavailable as exc:
+            log.warning("%s", exc)
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
@@ -404,7 +409,7 @@ async def save(request: Request):
 async def saving(request: Request, job_id: str):
     job = capture.jobs.get(job_id)
     if not job:
-        snap = db.get_snapshot(job_id)
+        snap = db.job_snapshot(job_id)
         if snap and snap["status"] == "complete":
             return RedirectResponse(f"/{snap.get('snapshot_id') or snap['id']}", status_code=303)
         raise HTTPException(404, "No such job")
@@ -419,7 +424,7 @@ async def saving(request: Request, job_id: str):
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
     if not job:
-        snap = db.get_snapshot(job_id)
+        snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)
         if not snap:
             failed = import_failure(job_id)
             if failed is None:
@@ -511,11 +516,21 @@ app.include_router(api_router)
 app.include_router(web_router)
 
 
-def _require_complete(sid: str) -> dict:
+@app.exception_handler(LibraryUnavailable)
+async def library_unavailable(_request: Request, exc: LibraryUnavailable):
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
+
+def _require_complete(sid: str, suffix: str = "") -> dict:
     if not ID_RE.fullmatch(sid):
         raise HTTPException(404, "Not found")
     snap = db.get_snapshot(sid)
+    if snap and snap["id"] != sid:
+        return RedirectResponse(f"/{snap['id']}{suffix}", status_code=303)  # type: ignore[return-value]
     if not snap:
+        published = db.published_job_id(sid)
+        if published:
+            return RedirectResponse(f"/{published}{suffix}", status_code=303)  # type: ignore[return-value]
         raise HTTPException(404, "Not found")
     if snap["status"] != "complete":
         if snap["status"] in {"pending", "capturing"}:
@@ -541,7 +556,7 @@ async def snapshot(request: Request, sid: str):
 
 @app.get("/{sid}/webpage", response_class=HTMLResponse)
 async def snapshot_webpage(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/webpage")
     if isinstance(snap, RedirectResponse):
         return snap
     return templates.TemplateResponse(
@@ -553,7 +568,7 @@ async def snapshot_webpage(request: Request, sid: str):
 
 @app.get("/{sid}/screenshot", response_class=HTMLResponse)
 async def snapshot_screenshot(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/screenshot")
     if isinstance(snap, RedirectResponse):
         return snap
     return templates.TemplateResponse(
@@ -565,7 +580,7 @@ async def snapshot_screenshot(request: Request, sid: str):
 
 @app.get("/{sid}/text", response_class=HTMLResponse)
 async def snapshot_text(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/text")
     if isinstance(snap, RedirectResponse):
         return snap
     return RedirectResponse(f"/{sid}", status_code=303)
@@ -573,7 +588,7 @@ async def snapshot_text(request: Request, sid: str):
 
 @app.get("/{sid}/reader")
 async def snapshot_reader(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/reader")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "reader.html"
@@ -597,7 +612,7 @@ async def snapshot_reader(sid: str):
 
 @app.get("/{sid}/raw")
 async def snapshot_raw(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/raw")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "page.html"
@@ -621,7 +636,7 @@ async def snapshot_raw(sid: str):
 
 @app.get("/{sid}/image.jpg")
 async def snapshot_image(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/image.jpg")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "screenshot.jpg"
@@ -632,7 +647,7 @@ async def snapshot_image(sid: str):
 
 @app.get("/{sid}/thumb.jpg")
 async def snapshot_thumb(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/thumb.jpg")
     if isinstance(snap, RedirectResponse):
         return snap
     folder = db.snap_dir(sid)

@@ -931,10 +931,10 @@ def enqueue_capture(
     if job_queue.qsize() >= MAX_QUEUED_JOBS:
         raise QueueFull
     if db.readonly_library():
-        from .library_import import _scratch_contains, allocate_dell_id
+        from .library_import import allocate_dell_id, scratch_contains
 
         sid = allocate_dell_id(
-            db.DATA_DIR, scratch_has=_scratch_contains(db.scratch_dir())
+            db.DATA_DIR, scratch_has=scratch_contains(db.scratch_dir())
         )
     else:
         sid = db.allocate_id()
@@ -1128,6 +1128,13 @@ async def run_job(job_id: str) -> None:
         "created_at": db.now_iso(),
     }
     db.write_json(folder / "meta.json", meta)
+    # extract_article always sets paywalled (app/extract.py). Default mode
+    # keeps the previous `1 if flag else 0` rule. Ingest mode fills a missing
+    # flag from the word count before the push.
+    if db.readonly_library():
+        stored_paywalled = 1 if db.paywalled_bool(meta.get("paywalled"), meta.get("word_count")) else 0
+    else:
+        stored_paywalled = 1 if meta.get("paywalled") else 0
     db.mark_capture(
         sid,
         final_url=final_url,
@@ -1138,7 +1145,7 @@ async def run_job(job_id: str) -> None:
         description=meta["description"],
         http_status=http_status,
         word_count=meta["word_count"],
-        paywalled=1 if db.paywalled_bool(meta.get("paywalled"), meta.get("word_count")) else 0,
+        paywalled=stored_paywalled,
         status="complete",
         error=None,
     )
@@ -1151,8 +1158,11 @@ async def run_job(job_id: str) -> None:
         job["snapshot_id"] = final
         try:
             db.finish_job(job["id"], final)
-        except Exception as exc:
-            logger.error("job record for %s failed (%s)", job["id"], type(exc).__name__)
+        except Exception:
+            try:
+                db.finish_job(job["id"], final)
+            except Exception as exc:
+                logger.error("job record for %s failed (%s)", job["id"], type(exc).__name__)
         for gone in {sid, final}:
             try:
                 db.discard_scratch(gone)

@@ -134,7 +134,39 @@ def _connect_readwrite(path: Path) -> sqlite3.Connection:
     return conn
 
 
+class LibraryUnavailable(Exception):
+    """The shared library cannot be read without creating files in its directory."""
+
+
+_WAL_DETAIL = (
+    "The library WAL files are missing. Ingest must keep the database open "
+    "so amber.sqlite3-wal and amber.sqlite3-shm exist and stay readable. "
+    "The web user must not be able to create files in the library directory."
+)
+
+
+def _sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    return (
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    )
+
+
+def ensure_library_sidecars() -> None:
+    """Refuse to open a WAL library whose sidecars are absent.
+
+    A ``mode=ro`` open creates ``-wal`` and ``-shm`` when they are missing
+    and the directory is writable. Ingest mode never does that. When ingest
+    holds the database open, both files are already there.
+    """
+    wal, shm = _sidecar_paths(Path(DB_PATH))
+    if wal.is_file() and shm.is_file():
+        return
+    raise LibraryUnavailable(_WAL_DETAIL)
+
+
 def _connect_library_ro() -> sqlite3.Connection:
+    ensure_library_sidecars()
     uri = "file:{}?mode=ro".format(quote(str(DB_PATH), safe="/:"))
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False, factory=_ClosingConnection)
     try:
@@ -470,7 +502,9 @@ def _init_app_state() -> None:
 
 
 def _state_conn() -> sqlite3.Connection:
-    return sqlite3.connect(_state_file(), check_same_thread=False, factory=_ClosingConnection)
+    conn = sqlite3.connect(_state_file(), check_same_thread=False, factory=_ClosingConnection)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def prepare_scratch() -> None:
@@ -635,7 +669,12 @@ def publish_capture(sid: str, on_id: Callable[[str], None] | None = None) -> str
     from .library_import import commit_captured_snapshot
     from .library_push import _push_settings
 
-    url, token = _push_settings()
+    settings = _push_settings()
+    if settings is None:
+        raise RuntimeError(
+            "AMBER_INGEST_URL and AMBER_INGEST_TOKEN_FILE are required when AMBER_LIBRARY_MODE=ingest"
+        )
+    url, token = settings
     return commit_captured_snapshot(
         DATA_DIR,
         scratch_dir(),
@@ -686,19 +725,55 @@ def hold_instance_lock() -> bool:
     return True
 
 
+def _library_has_snapshot(sid: str) -> bool:
+    if not sid:
+        return False
+    try:
+        with connect() as conn:
+            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
+    except (LibraryUnavailable, sqlite3.Error, OSError):
+        return False
+    return row is not None
+
+
 def fail_interrupted() -> int:
-    """Mark rows left pending/capturing by a previous process as failed."""
+    """Mark rows left pending/capturing by a previous process as failed.
+
+    A job whose snapshot is already in the library was published. Mark that
+    one complete even if the local job update did not land.
+    """
     if readonly_library():
         with _state_conn() as conn:
-            cur = conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE jobs
-                SET status = 'failed', error = 'Interrupted before it finished.'
+                SELECT id, snapshot_id FROM jobs
                 WHERE status IN ('pending', 'capturing', 'queued')
                 """
-            )
+            ).fetchall()
+            changed = 0
+            for row in rows:
+                published = row["snapshot_id"] or row["id"]
+                if _library_has_snapshot(published):
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'complete', snapshot_id = ?, error = NULL
+                        WHERE id = ?
+                        """,
+                        (published, row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'failed', error = 'Interrupted before it finished.'
+                        WHERE id = ?
+                        """,
+                        (row["id"],),
+                    )
+                changed += 1
             conn.commit()
-            return cur.rowcount
+            return changed
     with connect() as db:
         cur = db.execute(
             """
@@ -788,16 +863,37 @@ def update_snapshot(sid: str, **fields: Any) -> None:
 
 
 def get_snapshot(sid: str) -> dict | None:
+    """The library row for ``sid``. Does not substitute a retargeted id."""
     with connect() as conn:
         row = conn.execute("SELECT * FROM snapshots WHERE id = ?", (sid,)).fetchone()
         if row is not None:
             return _as_snap(row)
-    if readonly_library():
-        return _job_snapshot(sid)
     return None
 
 
-def _job_snapshot(sid: str) -> dict | None:
+def published_job_id(sid: str) -> str | None:
+    """Library id a finished job was published under, when it is not ``sid``."""
+    if not readonly_library():
+        return None
+    row = _job_row(sid)
+    if row is None or row["status"] != "complete":
+        return None
+    published = row["snapshot_id"] or row["id"]
+    if not published or published == sid:
+        return None
+    if not _library_has_snapshot(published):
+        return None
+    return published
+
+
+def job_snapshot(sid: str) -> dict | None:
+    """In-flight job, or the library row a finished job published."""
+    if not readonly_library():
+        return None
+    return _job_snapshot(sid)
+
+
+def _job_row(sid: str) -> sqlite3.Row | None:
     path = _state_file()
     if not path.is_file():
         return None
@@ -805,11 +901,15 @@ def _job_snapshot(sid: str) -> dict | None:
     conn.row_factory = sqlite3.Row
     try:
         try:
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (sid,)).fetchone()
+            return conn.execute("SELECT * FROM jobs WHERE id = ?", (sid,)).fetchone()
         except sqlite3.Error:
             return None
     finally:
         conn.close()
+
+
+def _job_snapshot(sid: str) -> dict | None:
+    row = _job_row(sid)
     if row is None:
         return None
     published = row["snapshot_id"] or row["id"]
@@ -839,20 +939,6 @@ def _job_snapshot(sid: str) -> dict | None:
         "status": row["status"],
         "error": row["error"],
     }
-
-
-def _has_table(conn: sqlite3.Connection, name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (name,),
-    ).fetchone()
-    return row is not None
-
-
-def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    if not _has_table(conn, table):
-        return False
-    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
 # Stay well under SQLite's bound-variable limit (999 on older builds).
@@ -983,9 +1069,9 @@ def complete_snapshots() -> list[dict]:
 
 def recapture_snapshots() -> list[dict]:
     """Snaps waiting on a recapture, paused, or stopped."""
+    if readonly_library():
+        return []
     with connect() as db:
-        if readonly_library():
-            return []
         rows = db.execute(
             """
             SELECT * FROM snapshots
@@ -1177,6 +1263,8 @@ def update_gift_candidate(cid: str, **fields: Any) -> None:
 
 
 def get_gift_candidate(cid: str) -> dict | None:
+    if readonly_library():
+        return None
     with connect() as conn:
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
         return _as_candidate(row) if row else None
