@@ -1,0 +1,13 @@
+[Unit]
+Description=Amber daily backup to boxj
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/apps/amber-archive
+Environment=AMBER_LIBRARY_DIR=%h/apps/amber-reader/data
+Environment=AMBER_APP_STATE=%h/.local/share/amber/web-state
+Environment=AMBER_BACKUP_STAGING=%h/.local/share/amber/backup-staging
+Environment=AMBER_BACKUP_DEST=boxj:amber-backups
+Environment=AMBER_BACKUP_KEEP=30
+Environment=AMBER_RSYNC=%h/bin/rsync
+ExecStart=%h/apps/amber-archive/scripts/backup-amber.sh

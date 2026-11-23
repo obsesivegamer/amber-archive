@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Amber backup to boxj
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=amber-backup.service
+
+[Install]
+WantedBy=timers.target
