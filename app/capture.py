@@ -930,8 +930,18 @@ def enqueue_capture(
         return existing["id"]
     if job_queue.qsize() >= MAX_QUEUED_JOBS:
         raise QueueFull
-    sid = db.allocate_id()
-    db.insert_snapshot(sid, url, url_normalized)
+    if db.readonly_library():
+        from .library_import import allocate_dell_id, scratch_contains
+
+        scratch_taken = scratch_contains(db.scratch_dir())
+
+        def _taken(candidate: str) -> bool:
+            return scratch_taken(candidate) or db.job_id_taken(candidate)
+
+        sid = allocate_dell_id(db.DATA_DIR, scratch_has=_taken)
+    else:
+        sid = db.allocate_id()
+    db.begin_capture(sid, url, url_normalized)
     job = {
         "id": sid,
         "snapshot_id": sid,
@@ -957,6 +967,8 @@ async def worker() -> None:
         try:
             await run_job(job_id)
         except Exception as exc:
+            from .library_import import UnconfirmedPush
+
             job = jobs.get(job_id)
             # Exception messages can include publisher URLs or HTTP headers.
             # Keep the useful stack and type without logging those payloads.
@@ -973,7 +985,12 @@ async def worker() -> None:
                     stats["duration_ms"] = _elapsed_ms(started)
                 job["status"] = "failed"
                 job["error"] = str(exc)
-                db.update_snapshot(job["snapshot_id"], status="failed", error=str(exc)[:500])
+                db.fail_capture(
+                    job["id"],
+                    job.get("snapshot_id") or job["id"],
+                    str(exc)[:500],
+                    keep_scratch=isinstance(exc, UnconfirmedPush),
+                )
         finally:
             job_queue.task_done()
 
@@ -986,9 +1003,9 @@ async def run_job(job_id: str) -> None:
     job["_capture_started"] = started
     job["capture_stats"] = empty_capture_stats()
     job["status"] = "capturing"
-    db.update_snapshot(sid, status="capturing")
+    db.mark_capture(sid, status="capturing")
 
-    folder = db.snap_dir(sid)
+    folder = db.capture_folder(sid)
     res_dir = folder / "res"
     folder.mkdir(parents=True, exist_ok=True)
     res_dir.mkdir(parents=True, exist_ok=True)
@@ -1117,7 +1134,14 @@ async def run_job(job_id: str) -> None:
         "created_at": db.now_iso(),
     }
     db.write_json(folder / "meta.json", meta)
-    db.update_snapshot(
+    # extract_article always sets paywalled (app/extract.py). Default mode
+    # keeps the previous `1 if flag else 0` rule. Ingest mode fills a missing
+    # flag from the word count before the push.
+    if db.readonly_library():
+        stored_paywalled = 1 if db.paywalled_bool(meta.get("paywalled"), meta.get("word_count")) else 0
+    else:
+        stored_paywalled = 1 if meta.get("paywalled") else 0
+    db.mark_capture(
         sid,
         final_url=final_url,
         title=meta["title"],
@@ -1127,18 +1151,42 @@ async def run_job(job_id: str) -> None:
         description=meta["description"],
         http_status=http_status,
         word_count=meta["word_count"],
-        paywalled=1 if meta.get("paywalled") else 0,
+        paywalled=stored_paywalled,
         status="complete",
         error=None,
     )
+    if db.readonly_library():
+
+        def _track(active: str, bound=job) -> None:
+            bound["snapshot_id"] = active
+            try:
+                db.update_job(bound["id"], snapshot_id=active)
+            except Exception as exc:
+                logger.error("job id for %s failed (%s)", bound["id"], type(exc).__name__)
+
+        final = await asyncio.to_thread(db.publish_capture, sid, on_id=_track)
+        job["snapshot_id"] = final
+        try:
+            db.finish_job(job["id"], final)
+        except Exception:
+            try:
+                db.finish_job(job["id"], final)
+            except Exception as exc:
+                logger.error("job record for %s failed (%s)", job["id"], type(exc).__name__)
+        for gone in {sid, final}:
+            try:
+                db.discard_scratch(gone)
+            except Exception as exc:
+                logger.error("scratch cleanup for %s failed (%s)", gone, type(exc).__name__)
     job["status"] = "complete"
     job["title"] = meta["title"]
     job.pop("_capture_started", None)
-    # The screenshot is already in snaps/<id>/. Push now; hourly backfill
-    # catches a Dell-PLX that was down. No-op until AMBER_INGEST_URL is set.
-    from .library_push import schedule_library_push
+    if not db.readonly_library():
+        # The screenshot is already in snaps/<id>/. Push now; hourly backfill
+        # catches a Dell-PLX that was down. No-op until AMBER_INGEST_URL is set.
+        from .library_push import schedule_library_push
 
-    schedule_library_push(sid)
+        schedule_library_push(sid)
 
 
 async def fetch_document(url: str, *, skip_referrer_bounce: bool = False) -> dict:

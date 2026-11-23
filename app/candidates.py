@@ -558,6 +558,8 @@ def get_candidates_payload(include: str, *, now: datetime | None = None) -> dict
     db.init_db()
     moment = now or datetime.now(timezone.utc)
     today = moment.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    if db.readonly_library():
+        return {"candidates": [], "updated_at": format_time(moment)}
     with db.connect() as conn:
         rows = db.load_gift_candidates(conn)
         snapshots = db.load_snapshots(

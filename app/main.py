@@ -48,6 +48,7 @@ def mime_for_filename(filename: str) -> str:
     return guessed or "application/octet-stream"
 
 from . import capture, db, recapture
+from .db import LibraryUnavailable
 from .api import (
     MAX_IMPORT_BODY_BYTES,
     _read_body_capped,
@@ -157,15 +158,21 @@ def _allowed_extension_ids() -> set[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    db.configure_library_access()
+    if db.readonly_library():
+        db.require_ingest_settings()
+        db.prepare_scratch()
     db.init_db()
     # Captures and imports live in memory: any row still pending or capturing
     # now belongs to a process that no longer exists.
     if db.hold_instance_lock():
+        if db.readonly_library():
+            db.sweep_scratch()
         db.fail_interrupted()
     else:
         log.warning(
             "Another Amber process holds %s; leaving its in-flight captures alone.",
-            db.DATA_DIR / "amber.lock",
+            db.lock_path(),
         )
     if not _allowed_extension_ids():
         log.warning(
@@ -398,9 +405,9 @@ async def save(request: Request):
 async def saving(request: Request, job_id: str):
     job = capture.jobs.get(job_id)
     if not job:
-        snap = db.get_snapshot(job_id)
+        snap = db.job_snapshot(job_id)
         if snap and snap["status"] == "complete":
-            return RedirectResponse(f"/{job_id}", status_code=303)
+            return RedirectResponse(f"/{snap.get('snapshot_id') or snap['id']}", status_code=303)
         raise HTTPException(404, "No such job")
     return templates.TemplateResponse(
         request,
@@ -413,7 +420,7 @@ async def saving(request: Request, job_id: str):
 async def job_status(job_id: str):
     job = capture.jobs.get(job_id)
     if not job:
-        snap = db.get_snapshot(job_id)
+        snap = db.job_snapshot(job_id) or db.get_snapshot(job_id)
         if not snap:
             failed = import_failure(job_id)
             if failed is None:
@@ -433,16 +440,17 @@ async def job_status(job_id: str):
         error = snap.get("error")
         if status == "failed" and not error:
             error = "Capture was interrupted before it finished."
+        published = snap.get("snapshot_id") or snap["id"]
         return {
             "id": job_id,
-            "snapshot_id": job_id,
+            "snapshot_id": published,
             "status": status,
             "error": error,
             "resources": [],
             "title": snap.get("title"),
             "url": snap.get("url"),
             "final_url": snap.get("final_url"),
-            "capture_stats": _read_capture_stats(job_id),
+            "capture_stats": _read_capture_stats(published),
         }
     return {
         "id": job["id"],
@@ -504,11 +512,21 @@ app.include_router(api_router)
 app.include_router(web_router)
 
 
-def _require_complete(sid: str) -> dict:
+@app.exception_handler(LibraryUnavailable)
+async def library_unavailable(_request: Request, exc: LibraryUnavailable):
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
+
+def _require_complete(sid: str, suffix: str = "") -> dict:
     if not ID_RE.fullmatch(sid):
         raise HTTPException(404, "Not found")
     snap = db.get_snapshot(sid)
+    if snap and snap["id"] != sid:
+        return RedirectResponse(f"/{snap['id']}{suffix}", status_code=303)  # type: ignore[return-value]
     if not snap:
+        published = db.published_job_id(sid)
+        if published:
+            return RedirectResponse(f"/{published}{suffix}", status_code=303)  # type: ignore[return-value]
         raise HTTPException(404, "Not found")
     if snap["status"] != "complete":
         if snap["status"] in {"pending", "capturing"}:
@@ -534,7 +552,7 @@ async def snapshot(request: Request, sid: str):
 
 @app.get("/{sid}/webpage", response_class=HTMLResponse)
 async def snapshot_webpage(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/webpage")
     if isinstance(snap, RedirectResponse):
         return snap
     return templates.TemplateResponse(
@@ -546,7 +564,7 @@ async def snapshot_webpage(request: Request, sid: str):
 
 @app.get("/{sid}/screenshot", response_class=HTMLResponse)
 async def snapshot_screenshot(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/screenshot")
     if isinstance(snap, RedirectResponse):
         return snap
     return templates.TemplateResponse(
@@ -558,7 +576,7 @@ async def snapshot_screenshot(request: Request, sid: str):
 
 @app.get("/{sid}/text", response_class=HTMLResponse)
 async def snapshot_text(request: Request, sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/text")
     if isinstance(snap, RedirectResponse):
         return snap
     return RedirectResponse(f"/{sid}", status_code=303)
@@ -566,7 +584,7 @@ async def snapshot_text(request: Request, sid: str):
 
 @app.get("/{sid}/reader")
 async def snapshot_reader(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/reader")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "reader.html"
@@ -590,7 +608,7 @@ async def snapshot_reader(sid: str):
 
 @app.get("/{sid}/raw")
 async def snapshot_raw(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/raw")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "page.html"
@@ -614,7 +632,7 @@ async def snapshot_raw(sid: str):
 
 @app.get("/{sid}/image.jpg")
 async def snapshot_image(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/image.jpg")
     if isinstance(snap, RedirectResponse):
         return snap
     path = db.snap_dir(sid) / "screenshot.jpg"
@@ -625,7 +643,7 @@ async def snapshot_image(sid: str):
 
 @app.get("/{sid}/thumb.jpg")
 async def snapshot_thumb(sid: str):
-    snap = _require_complete(sid)
+    snap = _require_complete(sid, "/thumb.jpg")
     if isinstance(snap, RedirectResponse):
         return snap
     folder = db.snap_dir(sid)

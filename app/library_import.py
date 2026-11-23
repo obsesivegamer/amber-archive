@@ -18,6 +18,7 @@ would never fire.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import os
@@ -100,11 +101,8 @@ class MatchLocks:
 
 
 def open_library_ro(db_path: Path) -> sqlite3.Connection:
-    """Open the shared library read-only. Caller closes it on every path."""
-    uri = "file:{}?mode=ro".format(quote(str(db_path), safe="/:"))
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open the shared library read-only. Same helper as every other library read."""
+    return db.open_library_ro(db_path)
 
 
 def _library_has_id(conn: sqlite3.Connection, sid: str) -> bool:
@@ -429,22 +427,38 @@ def _separate(left: Path, right: Path, left_name: str, right_name: str) -> None:
         )
 
 
-def _wipe_scratch() -> None:
-    """Drop unpublished scratch snapshots left by a crash. The library is not here."""
-    snaps = db.SNAPS_DIR
+def wipe_scratch_tree(root: Path) -> None:
+    """Drop unpublished scratch snapshots. ``root`` is not the library."""
+    snaps = root / "snaps"
     if snaps.exists():
         for child in list(snaps.iterdir()):
             if child.is_symlink() or child.is_file():
                 child.unlink()
             else:
                 shutil.rmtree(child)
-    with db.connect() as conn:
-        conn.execute("DELETE FROM snapshots")
-        conn.commit()
+    db_path = root / "amber.sqlite3"
+    if not db_path.is_file():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            conn.execute("DELETE FROM snapshots")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+    finally:
+        conn.close()
+
+
+def _wipe_scratch() -> None:
+    """Drop unpublished scratch snapshots left by a crash. The library is not here."""
+    wipe_scratch_tree(db.DATA_DIR)
 
 
 def bind_scratch(scratch: Path) -> None:
     """Point this process's archive database at the scratch tree."""
+    db.use_scratch_database()
     scratch.mkdir(parents=True, exist_ok=True)
     snaps = scratch / "snaps"
     db_path = scratch / "amber.sqlite3"
@@ -464,6 +478,213 @@ def _delete_scratch(sid: str, scratch: Path) -> None:
     if not ID_RE.fullmatch(sid):
         raise RuntimeError("refusing to delete an id outside the archive alphabet")
     db.delete_snapshot(sid)
+
+
+def scratch_contains(scratch: Path) -> Callable[[str], bool]:
+    root = scratch.resolve()
+
+    def taken(sid: str) -> bool:
+        if (root / "snaps" / sid).exists():
+            return True
+        db_path = root / "amber.sqlite3"
+        if not db_path.is_file():
+            return False
+        conn = sqlite3.connect(db_path)
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM snapshots WHERE id = ?",
+                    (sid,),
+                ).fetchone()
+            except sqlite3.Error:
+                return False
+            return row is not None
+        finally:
+            conn.close()
+
+    return taken
+
+
+_AMBER_URLS = (
+    'href="/{old}/',
+    "href='/{old}/",
+    'src="/{old}/',
+    "src='/{old}/",
+    "url(/{old}/",
+    "url('/{old}/",
+    'url("/{old}/',
+    'srcset="/{old}/',
+    "srcset='/{old}/",
+)
+
+
+def _rewrite_snapshot_id(folder: Path, old: str, new: str) -> None:
+    """Rewrite Amber's own asset URLs. Leave the captured page's text alone."""
+    for path in folder.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        name = path.name
+        if name not in {"page.html", "reader.html", "article.html", "meta.json"} and not (
+            path.parent.name == "res" and path.suffix.lower() in {".css", ".js"}
+        ):
+            continue
+        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        updated = text.replace(f"/{old}/r/", f"/{new}/r/")
+        for pattern in _AMBER_URLS:
+            updated = updated.replace(pattern.format(old=old), pattern.format(old=new))
+        updated = updated.replace(
+            f'name="amber-snapshot" content="{old}"',
+            f'name="amber-snapshot" content="{new}"',
+        )
+        updated = updated.replace(
+            f"name='amber-snapshot' content='{old}'",
+            f"name='amber-snapshot' content='{new}'",
+        )
+        updated = updated.replace(
+            f'content="{old}" name="amber-snapshot"',
+            f'content="{new}" name="amber-snapshot"',
+        )
+        if path.name == "meta.json":
+            try:
+                meta = json.loads(updated)
+            except json.JSONDecodeError:
+                meta = None
+            if isinstance(meta, dict) and meta.get("id") == old:
+                meta["id"] = new
+                updated = json.dumps(meta, indent=2, ensure_ascii=False)
+        if updated != text:
+            path.write_text(updated, encoding="utf-8", errors="surrogateescape")
+
+
+def _retarget_scratch(scratch: Path, old: str, new: str) -> None:
+    if not ID_RE.fullmatch(old) or not ID_RE.fullmatch(new):
+        raise RuntimeError("refusing to retarget an id outside the archive alphabet")
+    src = scratch / "snaps" / old
+    dest = scratch / "snaps" / new
+    if src.is_symlink() or not src.is_dir():
+        raise RuntimeError("scratch snapshot is missing")
+    if dest.exists() or dest.is_symlink():
+        raise RuntimeError("scratch snapshot already exists")
+    src.rename(dest)
+    _rewrite_snapshot_id(dest, old, new)
+    conn = sqlite3.connect(scratch / "amber.sqlite3")
+    try:
+        conn.execute("UPDATE snapshots SET id = ? WHERE id = ?", (new, old))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class UnconfirmedPush(Exception):
+    """The push response was lost and the library could not be checked."""
+
+    def __init__(self, sid: str):
+        super().__init__(sid)
+        self.sid = sid
+
+
+def _published(library_dir: Path, sid: str) -> bool | None:
+    """Whether ingest stored ``sid``. None when the library cannot be read."""
+    db_path = library_dir / "amber.sqlite3"
+    try:
+        conn = open_library_ro(db_path)
+    except db.LibraryUnavailable:
+        return None
+    try:
+        try:
+            row = conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _push_confirmed(
+    scratch: Path,
+    sid: str,
+    ingest_url: str,
+    token: str,
+    library_dir: Path,
+    *,
+    transport,
+) -> None:
+    """Push once, and again if the transport drops the response.
+
+    The second push sends the same id and bytes. Scratch is only discarded
+    by the caller after this returns. If both responses are lost, scratch
+    stays unless a read shows the id is absent.
+    """
+    try:
+        push_snapshot(scratch, sid, ingest_url, token, transport=transport)
+        return
+    except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected) as first:
+        try:
+            push_snapshot(scratch, sid, ingest_url, token, transport=transport)
+            return
+        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+            present = _published(library_dir, sid)
+            if present is True:
+                return
+            if present is False:
+                raise first
+            raise UnconfirmedPush(sid) from first
+
+
+def commit_captured_snapshot(
+    library_dir: Path,
+    scratch: Path,
+    sid: str,
+    ingest_url: str,
+    token: str,
+    *,
+    transport=None,
+    on_id: Callable[[str], None] | None = None,
+) -> str:
+    """Push one captured snapshot. A 409 id collision allocates again and retries.
+
+    Returns the id ingest stored. The caller deletes the scratch snapshot.
+    """
+    current = sid
+    reserved = sid
+    try:
+        for _attempt in range(_ALLOC_TRIES):
+            if on_id is not None:
+                on_id(current)
+            db.fill_scratch_paywalled(scratch, current)
+            try:
+                _push_confirmed(
+                    scratch,
+                    current,
+                    ingest_url,
+                    token,
+                    library_dir,
+                    transport=transport,
+                )
+                return current
+            except PushRejected as exc:
+                if not _id_collision(exc) or _attempt + 1 == _ALLOC_TRIES:
+                    raise
+                release_dell_id(current)
+                reserved = ""
+                scratch_taken = scratch_contains(scratch)
+
+                def taken(candidate: str, _scratch_taken=scratch_taken) -> bool:
+                    return _scratch_taken(candidate) or db.job_id_taken(candidate)
+
+                fresh = allocate_dell_id(library_dir, scratch_has=taken)
+                reserved = fresh
+                if on_id is not None:
+                    on_id(fresh)
+                try:
+                    _retarget_scratch(scratch, current, fresh)
+                except Exception:
+                    shutil.rmtree(scratch / "snaps" / fresh, ignore_errors=True)
+                    raise
+                current = fresh
+    finally:
+        if reserved:
+            release_dell_id(reserved)
 
 
 def _id_collision(exc: PushRejected) -> bool:
