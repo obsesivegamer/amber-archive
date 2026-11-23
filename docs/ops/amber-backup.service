@@ -1,5 +1,6 @@
 [Unit]
 Description=Amber daily backup to boxj
+OnFailure=amber-backup-failed.service
 
 [Service]
 Type=oneshot
@@ -9,5 +10,9 @@ Environment=AMBER_APP_STATE=%h/.local/share/amber/web-state
 Environment=AMBER_BACKUP_STAGING=%h/.local/share/amber/backup-staging
 Environment=AMBER_BACKUP_DEST=boxj:amber-backups
 Environment=AMBER_BACKUP_KEEP=30
+# Local user-space rsync on Dell.
 Environment=AMBER_RSYNC=%h/bin/rsync
+# boxj user-space rsync. sync-boxj.sh is not in this repo; this is the
+# remote binary that script runs via --rsync-path. Override if it differs.
+Environment=AMBER_RSYNC_PATH=$HOME/bin/rsync
 ExecStart=%h/apps/amber-archive/scripts/backup-amber.sh

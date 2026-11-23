@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Compare the latest backup with live data. Live files are opened read-only.
-# Nothing here writes the live library or the live app-state directory.
+# Check the latest complete backup against the manifest written at backup time,
+# then start a reader on a temp copy and fetch the same articles.
+# Live library and app-state paths are never written.
 set -euo pipefail
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
@@ -15,86 +16,188 @@ else
   # shellcheck disable=SC2206
   SSH=(${AMBER_BACKUP_SSH})
 fi
-WORK="${AMBER_RESTORE_WORK:-$(mktemp -d)}"
-SKIP_SERVER="${AMBER_RESTORE_SKIP_SERVER:-0}"
+RSYNC_BIN="${AMBER_RSYNC:-rsync}"
+RSYNC_PATH="${AMBER_RSYNC_PATH:-\$HOME/bin/rsync}"
+own_work=0
+if [[ -z "${AMBER_RESTORE_WORK:-}" ]]; then
+  WORK="$(mktemp -d)"
+  own_work=1
+else
+  WORK="$AMBER_RESTORE_WORK"
+fi
+reader_pid=""
+cleanup() {
+  if [[ -n "$reader_pid" ]]; then
+    kill "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+  fi
+  if [[ "$own_work" -eq 1 ]]; then
+    rm -rf "$WORK"
+  fi
+}
+trap cleanup EXIT
+
+refuse_live() {
+  local path="$1"
+  local real live_library live_state
+  real="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+  live_library="$(readlink -f "$LIBRARY" 2>/dev/null || printf '%s' "$LIBRARY")"
+  live_state="$(readlink -f "$STATE" 2>/dev/null || printf '%s' "$STATE")"
+  case "$real" in
+    "$live_library"|"$live_library"/*|"$live_state"|"$live_state"/*)
+      die "refusing to use live path $path"
+      ;;
+  esac
+}
 
 remote=0
 case "$DEST" in
   *:*) remote=1 ;;
 esac
+if [[ "$remote" -eq 1 && ${#SSH[@]} -eq 0 ]]; then
+  die "AMBER_BACKUP_DEST is remote but AMBER_BACKUP_SSH is empty"
+fi
 
 if [[ "$remote" -eq 0 ]]; then
+  [[ -d "$DEST" ]] || die "no backup destination $DEST"
   latest="$(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -n 1)"
-  [[ -n "$latest" ]] || die "no dated backup under $DEST"
+    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | while read -r name; do
+        [[ -f "$DEST/$name/.complete" ]] && printf '%s\n' "$name"
+      done | sort | tail -n 1)"
+  [[ -n "$latest" ]] || die "no complete backup under $DEST"
   copy="$DEST/$latest"
+  refuse_live "$copy"
 else
   host="${DEST%%:*}"
   path="${DEST#*:}"
-  latest="$("${SSH[@]}" "$host" "ls -1 $(printf '%q' "$path")" \
-    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -n 1)"
-  [[ -n "$latest" ]] || die "no dated backup under $DEST"
+  if ! listing="$("${SSH[@]}" "$host" "ls -1 $(printf '%q' "$path")")"; then
+    die "could not list $DEST"
+  fi
+  names=()
+  while IFS= read -r name; do
+    [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    set +e
+    "${SSH[@]}" "$host" "test -f $(printf '%q' "$path/$name/.complete")"
+    code=$?
+    set -e
+    if [[ "$code" -eq 0 ]]; then
+      names+=("$name")
+    elif [[ "$code" -ne 1 ]]; then
+      die "could not check $DEST/$name"
+    fi
+  done <<<"$listing"
+  latest=""
+  if ((${#names[@]})); then
+    latest="$(printf '%s\n' "${names[@]}" | sort | tail -n 1)"
+  fi
+  [[ -n "$latest" ]] || die "no complete backup under $DEST"
   copy="$WORK/nas"
+  refuse_live "$copy"
   mkdir -p "$copy"
-  rsync -a -e "${SSH[*]}" "$DEST/$latest/" "$copy/"
+  "$RSYNC_BIN" -a --exclude 'blobs/' --exclude 'blobs' -e "${SSH[*]}" --rsync-path="$RSYNC_PATH" \
+    "$DEST/$latest/" "$copy/" || die "could not copy $latest"
 fi
 
-live_db="file:${LIBRARY}/amber.sqlite3?mode=ro"
-[[ -f "$LIBRARY/amber.sqlite3" ]] || die "live library database missing"
-[[ -f "$copy/amber.sqlite3" ]] || die "backup library database missing"
-live_snaps="$(sqlite3 "$live_db" 'SELECT COUNT(*) FROM snapshots;')"
-bak_snaps="$(sqlite3 "$copy/amber.sqlite3" 'SELECT COUNT(*) FROM snapshots;')"
-[[ "$live_snaps" == "$bak_snaps" ]] || die "snapshot counts differ live=$live_snaps backup=$bak_snaps"
-log "snapshot count $live_snaps"
+[[ -f "$copy/manifest.json" ]] || die "backup $latest has no manifest"
+[[ -f "$copy/.complete" ]] || die "backup $latest is not marked complete"
+python3 - "$copy" <<'PY' || die "backup does not match its manifest"
+import hashlib, json, sqlite3, sys
+from pathlib import Path
+copy = Path(sys.argv[1])
+manifest = json.loads((copy / "manifest.json").read_text(encoding="utf-8"))
+db = sqlite3.connect(f"file:{copy / 'amber.sqlite3'}?mode=ro", uri=True)
+count = db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+if count != manifest["snapshots"]:
+    raise SystemExit(f"snapshot count {count} != manifest {manifest['snapshots']}")
+state = sqlite3.connect(f"file:{copy / 'state' / 'app.sqlite3'}?mode=ro", uri=True)
+candidates = state.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+if candidates != manifest["candidates"]:
+    raise SystemExit(f"candidate count {candidates} != manifest {manifest['candidates']}")
+sources = json.loads((copy / "state" / "sources.json").read_text(encoding="utf-8"))
+if len(sources.get("sources", [])) != manifest["sources"]:
+    raise SystemExit("source count does not match the manifest")
+for item in manifest["articles"]:
+    path = copy / "snaps" / item["id"] / "article.txt"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != item["sha256"]:
+        raise SystemExit(f"article {item['id']} hash does not match the manifest")
+print(f"manifest ok snapshots={count} candidates={candidates} articles={len(manifest['articles'])}", flush=True)
+PY
+log "manifest matched for $latest"
+if [[ -f "$LIBRARY/amber.sqlite3" ]]; then
+  live="$(sqlite3 "file:${LIBRARY}/amber.sqlite3?mode=ro" "SELECT COUNT(*) FROM snapshots" 2>/dev/null || true)"
+  if [[ -n "$live" ]]; then
+    log "live snapshot count (not checked): $live"
+  fi
+fi
 
-mapfile -t ids < <(sqlite3 "$live_db" "SELECT id FROM snapshots WHERE status = 'complete' ORDER BY id LIMIT 5;")
-((${#ids[@]} > 0)) || die "live library has no complete snapshots"
-for sid in "${ids[@]}"; do
-  live_file="$LIBRARY/snaps/$sid/article.txt"
-  bak_file="$copy/snaps/$sid/article.txt"
-  [[ -f "$live_file" && -f "$bak_file" ]] || die "article.txt missing for $sid"
-  live_hash="$(sha256sum "$live_file" | awk '{print $1}')"
-  bak_hash="$(sha256sum "$bak_file" | awk '{print $1}')"
-  [[ "$live_hash" == "$bak_hash" ]] || die "article hash differs for $sid"
-  log "article $sid $live_hash"
-done
-
-[[ -f "$STATE/app.sqlite3" && -f "$copy/state/app.sqlite3" ]] || die "app-state database missing"
-live_state="file:${STATE}/app.sqlite3?mode=ro"
-live_cands="$(sqlite3 "$live_state" 'SELECT COUNT(*) FROM candidates;')"
-bak_cands="$(sqlite3 "$copy/state/app.sqlite3" 'SELECT COUNT(*) FROM candidates;')"
-[[ "$live_cands" == "$bak_cands" ]] || die "candidate counts differ live=$live_cands backup=$bak_cands"
-live_sources="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["sources"]))' "$STATE/sources.json")"
-bak_sources="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["sources"]))' "$copy/state/sources.json")"
-[[ "$live_sources" == "$bak_sources" ]] || die "source counts differ live=$live_sources backup=$bak_sources"
-log "candidates $live_cands sources $live_sources"
-
-if [[ "$SKIP_SERVER" == "1" ]]; then
-  log "skipped amber-reader server start"
+if [[ "${AMBER_RESTORE_SKIP_SERVER:-0}" == "1" ]]; then
+  log "skipped reader server start"
   exit 0
 fi
-[[ -n "${AMBER_READER_DIR:-}" ]] || die "set AMBER_READER_DIR to start amber-reader, or AMBER_RESTORE_SKIP_SERVER=1"
 port="${AMBER_RESTORE_PORT:-18081}"
 reader_copy="$WORK/reader-data"
+refuse_live "$reader_copy"
 mkdir -p "$reader_copy"
 cp -a "$copy/amber.sqlite3" "$reader_copy/amber.sqlite3"
 if [[ -d "$copy/snaps" ]]; then
   cp -a "$copy/snaps" "$reader_copy/snaps"
 fi
-(
-  cd "$AMBER_READER_DIR"
-  AMBER_DATA_DIR="$reader_copy" AMBER_HOST=127.0.0.1 AMBER_PORT="$port" \
-    "${AMBER_READER_PYTHON:-python3}" -m uvicorn app.main:app --host 127.0.0.1 --port "$port"
-) &
+# env replaces itself with the server, so the recorded pid is the server.
+cmd=()
+if [[ -n "${AMBER_READER_CMD:-}" ]]; then
+  # shellcheck disable=SC2206
+  cmd=(${AMBER_READER_CMD})
+else
+  reader_dir="${AMBER_READER_DIR:-}"
+  [[ -n "$reader_dir" ]] || die "set AMBER_READER_DIR to the amber-reader checkout"
+  cd "$reader_dir"
+  cmd=("${AMBER_READER_PYTHON:-python3}" -m uvicorn app.main:app --host 127.0.0.1 --port "$port")
+fi
+env_args=(env -i "PATH=$PATH" "HOME=$HOME" "AMBER_DATA_DIR=$reader_copy" "AMBER_HOST=127.0.0.1" "AMBER_PORT=$port" "AMBER_ALLOWED_HOSTS=127.0.0.1:${port}")
+if [[ -n "${AMBER_READER_PASSWORD:-}" ]]; then
+  env_args+=("AMBER_READER_PASSWORD=$AMBER_READER_PASSWORD")
+fi
+"${env_args[@]}" "${cmd[@]}" &
 reader_pid=$!
-trap 'kill "$reader_pid" 2>/dev/null || true' EXIT
 ok=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if curl -fsS --max-time 2 "http://127.0.0.1:${port}/healthz" >/dev/null; then
     ok=1
     break
   fi
-  sleep 0.4
+  sleep 0.3
 done
-[[ "$ok" == "1" ]] || die "amber-reader did not answer on $port"
-log "amber-reader answered on $port against the backup copy"
+[[ "$ok" == "1" ]] || die "reader did not answer on $port"
+log "reader answered on $port"
+python3 - "$copy/manifest.json" "$port" <<'PY' || die "reader did not serve the backup"
+import base64, hashlib, json, os, sys, urllib.request
+manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
+port = sys.argv[2]
+base = f"http://127.0.0.1:{port}"
+headers = {}
+password = os.environ.get("AMBER_READER_PASSWORD", "")
+if password:
+    token = base64.b64encode(f"amber:{password}".encode()).decode()
+    headers["Authorization"] = f"Basic {token}"
+count_url = f"{base}/api/snapshots?since_days=3650&limit=200"
+with urllib.request.urlopen(urllib.request.Request(count_url, headers=headers), timeout=5) as response:
+    payload = json.loads(response.read().decode())
+if "count" in payload:
+    if payload["count"] != manifest["snapshots"]:
+        raise SystemExit(f"reader count {payload['count']} != manifest {manifest['snapshots']}")
+    print(f"reader count {payload['count']}", flush=True)
+elif "total_usable" in payload:
+    print(f"reader total_usable {payload['total_usable']}", flush=True)
+else:
+    raise SystemExit("reader did not report a count")
+for item in manifest["articles"]:
+    request = urllib.request.Request(f"{base}/{item['id']}/article.txt", headers=headers)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        body = response.read()
+    digest = hashlib.sha256(body).hexdigest()
+    if digest != item["sha256"]:
+        raise SystemExit(f"served article {item['id']} does not match the manifest")
+print(f"served {len(manifest['articles'])} articles", flush=True)
+PY
+log "served articles match the manifest"

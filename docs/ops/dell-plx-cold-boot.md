@@ -2,48 +2,65 @@
 
 This checklist needs Jeremy's yes before anyone reboots Dell-PLX. The change that added it does not reboot the machine.
 
-The existing S4U scheduled task is what starts the session at boot. This checklist does not replace that task.
+The existing S4U scheduled task is what starts the session at boot. This checklist does not replace that task. amber-web.service must already be enabled, so port 8084 is up after the reboot without a console sign-in. `tailscale serve` for port 443 still points at the reader on 8081 during this check.
+
+Record the evidence in `~/apps/amber-reader/cold-boot-YYYY-MM-DD.txt` on Dell-PLX. Each check gets a UTC timestamp. Every check below has to finish within 5 minutes of `LastBootUpTime`.
 
 ## Before the reboot
 
-Turn off Windows' "use my sign-in info to finish setting up after an update".
+Record the auto-sign-in setting, then turn it off.
 
-Settings, Accounts, Sign-in options. The switch is "Use my sign-in info to automatically finish setting up my device after an update or restart". Set it off.
+Settings, Accounts, Sign-in options. The switch is "Use my sign-in info to automatically finish setting up my device after an update or restart". Write down whether it was on or off, then set it off. Write that down too.
 
 ## Reboot
 
-Reboot Dell-PLX. Do not sign in at the console.
+Reboot Dell-PLX. Do not sign in at the console and do not open Remote Desktop. Either of those starts `explorer.exe` and the check is void.
 
 ## Within 5 minutes
 
-From another tailnet machine:
+On Dell-PLX, over SSH from another tailnet machine into WSL (not a console or RDP session):
 
 ```bash
-curl -fsS -u "amber:$AMBER_READER_PASSWORD" \
-  https://dell-plx-reader.tailf9612a.ts.net/healthz
-curl -fsS http://127.0.0.1:8082/healthz
+powershell.exe -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"
+date -u +%Y-%m-%dT%H:%M:%SZ
 ```
 
-The second command is on Dell-PLX itself, over loopback. amber-web, still on loopback until cutover:
+Write both into the record. The checks that follow use the same `date -u` line so the gap from boot is visible.
+
+From the phone, or from another tailnet device, not from Dell-PLX loopback:
 
 ```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
+curl -fsS -u "amber:$AMBER_READER_PASSWORD" \
+  https://dell-plx-reader.tailf9612a.ts.net/healthz
+date -u +%Y-%m-%dT%H:%M:%SZ
+curl -fsS https://dell-plx-reader.tailf9612a.ts.net:8443/healthz
+```
+
+The first URL is the reader on 8081. The second is ingest on 8082. Paste both bodies and both timestamps into the record.
+
+amber-web is still only on loopback. From the same SSH session on Dell-PLX:
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ
 curl -fsS -u "amber:$AMBER_READER_PASSWORD" http://127.0.0.1:8084/healthz
 ```
 
-Reader is 8081 behind the tailnet name. Ingest is 8082. Import is 8083. amber-web is 8084.
-
 ## No interactive user
 
-On Dell-PLX:
+Stay on the SSH session into WSL. Do not open a Windows desktop.
 
 ```bash
-query user
+query.exe user
+tasklist.exe /FI "IMAGENAME eq explorer.exe"
 ```
 
-The output is empty. `explorer.exe` is not running:
+With nobody signed in, `query.exe user` prints `No User exists for *` and exits 1. `tasklist.exe` prints `INFO: No tasks are running which match the specified criteria.` Paste both into the record.
 
-```bash
-tasklist /FI "IMAGENAME eq explorer.exe"
-```
+A console or RDP sign-in would list a user and an `explorer.exe`. That means the S4U task was not the only session. The check failed.
 
-That lists no explorer.exe. The S4U task is the session that started the user services. A person signed in at the console would show a user in `query user` and an `explorer.exe`.
+## If a check fails
+
+Fix the S4U boot task so the user services start without a desktop session. Restore nothing else yet. Reboot and run this checklist again from "Reboot". Do not treat a later pass as the same boot.
+
+After a pass, if Jeremy wants the auto-sign-in setting back, turn it on and write that in the record. Leave it off if he does not.
