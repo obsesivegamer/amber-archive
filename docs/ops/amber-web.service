@@ -1,0 +1,28 @@
+[Unit]
+Description=Amber web in ingest mode
+# Shipped disabled. Enable it before a cold-boot check of port 8084.
+# Do not point tailscale serve at 8084 until that check has passed.
+# See docs/ops/dell-plx-cutover.md.
+
+[Service]
+# Deploy checkout. ~/apps/amber-archive stays the ingest and import tree.
+WorkingDirectory=%h/apps/amber-web
+# The password file holds only the password, mode 0600. The reader uses
+# the same file. There is no EnvironmentFile, so nothing in a dotenv can
+# replace the settings below.
+Environment=AMBER_READER_PASSWORD_FILE=%h/.config/amber/reader.password
+Environment=PYTHONUNBUFFERED=1
+Environment=AMBER_LIBRARY_MODE=ingest
+Environment=AMBER_DATA_DIR=%h/apps/amber-reader/data
+Environment=AMBER_APP_STATE=%h/.local/share/amber/web-state
+Environment=AMBER_SCRATCH_DIR=%h/.local/share/amber/web-scratch
+Environment=AMBER_INGEST_URL=http://127.0.0.1:8082
+Environment=AMBER_INGEST_TOKEN_FILE=%h/.config/amber/ingest.token
+Environment=AMBER_ALLOWED_HOSTS=dell-plx-reader.tailf9612a.ts.net,127.0.0.1:8084
+Environment=AMBER_HOST=127.0.0.1
+Environment=AMBER_PORT=8084
+ExecStart=%h/apps/amber-web/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8084
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

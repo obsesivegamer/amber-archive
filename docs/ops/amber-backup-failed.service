@@ -1,0 +1,6 @@
+[Unit]
+Description=Log an Amber backup failure
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "backup failed: amber-backup.service" >&2'
